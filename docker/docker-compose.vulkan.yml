@@ -11,6 +11,13 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.vulkan
-    profiles: []
+    ports:
+      - "${SHREW_MODEL_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
     devices:
       - /dev/dri

@@ -12,7 +12,3 @@ services:
       - VLM_CONCURRENCY=${VLM_CONCURRENCY:-4}
       - PIPELINE_CONCURRENCY=${PIPELINE_CONCURRENCY:-3}
 
-  shrew-model:
-    profiles: ["gpu"]
-    ports:
-      - "${SHREW_MODEL_PORT:-8000}:8000"
