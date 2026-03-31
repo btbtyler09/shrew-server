@@ -69,15 +69,21 @@ curl -X POST localhost:8080/v1/convert -F file=@doc.pdf
 ### Docker
 
 ```bash
-cp docker/.env.example docker/.env
-# Edit docker/.env — set VLM_URL and VLM_MODEL
+cd docker
+cp .env.example .env
+# Edit .env — set VLM_URL and VLM_MODEL
 
 # Server only (connects to your external VLM)
-docker compose -f docker/docker-compose.yml up server
+docker compose -f docker-compose.yml up -d --build
 
 # Server + Shrew 2B model on NVIDIA GPU
-docker compose -f docker/docker-compose.yml -f docker/docker-compose.cuda.yml up
+docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
+
+# View logs
+docker compose -f docker-compose.yml -f docker-compose.cuda.yml logs -f
 ```
+
+Other GPU variants: replace `docker-compose.cuda.yml` with `docker-compose.rocm.yml` (AMD) or `docker-compose.vulkan.yml` (Vulkan).
 
 ## Docker deployment
 
