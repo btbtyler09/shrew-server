@@ -140,10 +140,12 @@ def _parse_json_response(text: str) -> dict:
 def _apply_lora(vlm_client, params, task, lora_adapters, lora_format):
     """Apply LoRA adapter selection to VLMClient params.
 
-    Returns (vlm_client, params) — may return a new client for openai format.
+    Returns (vlm_client, params, system_prompt_override).
+    system_prompt_override is the task name when using LoRA (the adapters were
+    trained with the task name as the system message), or None for main VLM.
     """
     if not lora_adapters or task not in lora_adapters:
-        return vlm_client, params
+        return vlm_client, params, None
     if lora_format == "openai":
         vlm_client = VLMClient(base_url=vlm_client.base_url, model=lora_adapters[task])
     elif lora_format == "llamacpp":
@@ -155,7 +157,7 @@ def _apply_lora(vlm_client, params, task, lora_adapters, lora_format):
             for aid in lora_adapters.values()
         ]
         params["extra_params"] = extra
-    return vlm_client, params
+    return vlm_client, params, task
 
 
 def extract_metadata(
@@ -185,7 +187,9 @@ def extract_metadata(
     system_prompt = pipeline["generation_system_prompt"]
 
     params = get_generation_params(vlm_client.model, "structured")
-    vlm_client, params = _apply_lora(vlm_client, params, "extract_metadata", lora_adapters, lora_format)
+    vlm_client, params, sys_override = _apply_lora(vlm_client, params, "extract_metadata", lora_adapters, lora_format)
+    if sys_override:
+        system_prompt = sys_override
     logger.info("Extracting metadata via VLM")
     response = vlm_client.simple_completion(
         system_prompt=system_prompt,
@@ -239,7 +243,9 @@ def generate_summary(
     system_prompt = pipeline["generation_system_prompt"]
 
     params = get_generation_params(vlm_client.model, "structured")
-    vlm_client, params = _apply_lora(vlm_client, params, "summarize_document", lora_adapters, lora_format)
+    vlm_client, params, sys_override = _apply_lora(vlm_client, params, "summarize_document", lora_adapters, lora_format)
+    if sys_override:
+        system_prompt = sys_override
     logger.info("Generating summary via VLM")
     summary = vlm_client.simple_completion(
         system_prompt=system_prompt,
@@ -299,7 +305,9 @@ def semantic_chunk(
                     f"(~{section['token_count']} tokens, next_id={next_chunk_id})")
 
         params = get_generation_params(vlm_client.model, "structured")
-        chunk_client, params = _apply_lora(vlm_client, params, "semantic_chunk", lora_adapters, lora_format)
+        chunk_client, params, sys_override = _apply_lora(vlm_client, params, "semantic_chunk", lora_adapters, lora_format)
+        if sys_override:
+            system_prompt = sys_override
         response = chunk_client.simple_completion(
                 system_prompt=system_prompt,
                 user_content=user_msg,
