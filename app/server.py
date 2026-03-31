@@ -88,7 +88,12 @@ async def lifespan(app: FastAPI):
     global _config, _figure_converter, _vlm_pool, _pipeline_sem, _pipeline_gate
 
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    logging.getLogger("shrew").setLevel(getattr(logging, log_level, logging.INFO))
+    shrew_logger = logging.getLogger("shrew")
+    shrew_logger.setLevel(getattr(logging, log_level, logging.INFO))
+    if not shrew_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(name)s  %(message)s"))
+        shrew_logger.addHandler(handler)
 
     start = time.time()
     _config = ServerConfig.from_env()

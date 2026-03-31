@@ -16,5 +16,7 @@ RUN python -c "from transformers import RTDetrV2ForObjectDetection, RTDetrImageP
     RTDetrV2ForObjectDetection.from_pretrained('ds4sd/docling-layout-heron-101'); \
     RTDetrImageProcessor.from_pretrained('ds4sd/docling-layout-heron-101')"
 
+ENV HF_HUB_OFFLINE=1
+
 EXPOSE 8080
 CMD ["shrew", "serve"]
