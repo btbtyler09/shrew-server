@@ -1,5 +1,5 @@
 services:
-  server:
+  shrew-server:
     build:
       context: ..
       dockerfile: docker/Dockerfile.server

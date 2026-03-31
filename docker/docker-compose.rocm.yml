@@ -1,5 +1,5 @@
 services:
-  server:
+  shrew-server:
     environment:
       - SHREW_VLLM_URL=http://shrew-model:8000
       - SHREW_ASYNC_STAGE3=1
