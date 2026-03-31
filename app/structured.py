@@ -148,7 +148,12 @@ def _apply_lora(vlm_client, params, task, lora_adapters, lora_format):
         vlm_client = VLMClient(base_url=vlm_client.base_url, model=lora_adapters[task])
     elif lora_format == "llamacpp":
         extra = params.get("extra_params") or {}
-        extra["lora"] = [{"id": lora_adapters[task], "scale": 1.0}]
+        # llama.cpp requires all adapters in every request; active at 1.0, others at 0.0
+        active_id = lora_adapters[task]
+        extra["lora"] = [
+            {"id": aid, "scale": 1.0 if aid == active_id else 0.0}
+            for aid in lora_adapters.values()
+        ]
         params["extra_params"] = extra
     return vlm_client, params
 

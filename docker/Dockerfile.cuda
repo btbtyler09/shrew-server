@@ -21,9 +21,7 @@ EXPOSE 8000
 CMD ["--host", "0.0.0.0", "--port", "8000", \
      "--model", "/models/Qwen3.5-2B.gguf", \
      "--lora-init-without-apply", \
-     "--lora", "/models/adapters/extract_metadata.gguf", \
-     "--lora", "/models/adapters/summarize_document.gguf", \
-     "--lora", "/models/adapters/semantic_chunk_beta.gguf", \
+     "--lora", "/models/adapters/extract_metadata.gguf,/models/adapters/summarize_document.gguf,/models/adapters/semantic_chunk_beta.gguf", \
+     "-fa", "on", \
      "--ctx-size", "24576", \
-     "--parallel", "4", \
-     "--reasoning-format", "none"]
+     "--parallel", "4"]

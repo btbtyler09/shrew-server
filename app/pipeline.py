@@ -114,6 +114,12 @@ def _classify_figure_crop(
     ]
 
     params = get_generation_params(vlm.model, "classify_figure")
+
+    # llama.cpp requires LoRA adapters in every request (even at scale 0)
+    if config.shrew_lora_format == "llamacpp" and config.shrew_lora_map:
+        extra = params.get("extra_params") or {}
+        extra["lora"] = [{"id": aid, "scale": 0.0} for aid in config.shrew_lora_map.values()]
+        params["extra_params"] = extra
     try:
         result = vlm.simple_completion(
             system_prompt=FIGURE_CLASSIFY_PROMPT,
