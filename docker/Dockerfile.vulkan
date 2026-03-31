@@ -16,7 +16,7 @@ ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/summarize_document/s
 ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/semantic_chunk_beta/semantic_chunk_beta.gguf \
     /models/adapters/semantic_chunk_beta.gguf
 
-HEALTHCHECK CMD ["wget", "-qO-", "http://localhost:8000/health"]
+HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]
 EXPOSE 8000
 CMD ["--host", "0.0.0.0", "--port", "8000", \
      "--model", "/models/Qwen3.5-2B.gguf", \
