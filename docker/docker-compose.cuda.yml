@@ -1,0 +1,21 @@
+services:
+  server:
+    environment:
+      - SHREW_VLLM_URL=http://shrew-model:8000
+      - SHREW_ASYNC_STAGE3=1
+    depends_on:
+      shrew-model:
+        condition: service_healthy
+
+  shrew-model:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cuda
+    profiles: []
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

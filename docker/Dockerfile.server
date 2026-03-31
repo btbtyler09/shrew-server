@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY pyproject.toml README.md LICENSE ./
+COPY app/ app/
+
+RUN pip install --no-cache-dir .[server,figures]
+
+# Pre-download heron-101 layout model for figure detection
+RUN python -c "from transformers import RTDetrV2ForObjectDetection, RTDetrImageProcessor; \
+    RTDetrV2ForObjectDetection.from_pretrained('ds4sd/docling-layout-heron-101'); \
+    RTDetrImageProcessor.from_pretrained('ds4sd/docling-layout-heron-101')"
+
+EXPOSE 8080
+CMD ["shrew", "serve"]

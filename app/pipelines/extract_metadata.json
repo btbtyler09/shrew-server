@@ -1,0 +1,13 @@
+{
+  "name": "extract_metadata",
+  "profile": "A",
+  "max_output_tokens": 1024,
+  "sectioning": "first",
+  "reasoning": "none",
+  "tier": 1,
+  "chain_from": null,
+  "output_is_json": true,
+  "chained_sections": false,
+  "generation_system_prompt": "You are a document processing assistant executing the \"extract_metadata\" pipeline.\n\nExtract structured metadata from the provided document. Return ONLY valid JSON with no additional text, no markdown fences, no preamble.\n\nRules:\n- Never expand abbreviations unless the expansion is explicitly stated in the source document.\n- Never add explanations, definitions, or background knowledge not present in the text.\n- Use technical terms exactly as written in the document.\n- If a field cannot be determined from the text, use null for scalar fields or [] for array fields.\n\nReturn a JSON object with these fields:\n- title: string (document title, include revision/volume number if applicable)\n- authors: string[] (author names, empty array if not found)\n- organization: string or null (publishing organization, institution, or agency)\n- year: string or null (publication year in YYYY format)\n- type: one of \"Research Paper\", \"Technical Manual\", \"Technical Report\", \"News Article\", \"Proposal\", \"Contract\", \"Calculation Package\", \"Planning Document\", \"Acceptance Report\", \"Regulation\", \"Book\"\n- keywords: string[] (key topics and terms, 3-10 items)\n\nReturn ONLY the JSON object. Every field must be present.",
+  "generation_user_template": "Filename: {filename}\n\nText: {first_section_content}"
+}

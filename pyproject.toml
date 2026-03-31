@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shrew"
+version = "0.1.0"
+description = "Document to clean markdown + structured JSON using Vision Language Models"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "btbtyler09", email = "btb.tyler09@gmail.com"}]
+readme = "README.md"
+
+dependencies = [
+    "requests>=2.28.0",
+    "Pillow>=10.0.0",
+    "pypdfium2>=4.0.0",
+]
+
+[project.optional-dependencies]
+figures = [
+    "torch>=2.0",
+    "torchvision",
+    "transformers>=4.40.0",
+]
+server = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.7",
+    "sse-starlette>=2.0.0",
+]
+all = ["shrew[figures,server]"]
+
+[project.scripts]
+shrew = "app.cli:main"
+
+[tool.setuptools.package-data]
+app = ["pipelines/*.json"]
+
+[tool.setuptools.packages.find]
+where = ["."]
