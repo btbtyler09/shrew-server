@@ -19,9 +19,12 @@ def is_qwen35(model_name: str) -> bool:
 
 
 def _qwen35_flags() -> dict:
-    """Qwen 3.5 specific flags to disable reasoning/thinking."""
+    """Qwen 3.5 specific flags to disable reasoning/thinking.
+
+    chat_template_kwargs works on all backends (OpenRouter, vLLM, llama.cpp).
+    reasoning is OpenRouter-specific but harmless elsewhere.
+    """
     return {
-        "reasoning_format": "none",
         "reasoning": {"enabled": False},
         "chat_template_kwargs": {"enable_thinking": False},
     }
