@@ -1,5 +1,7 @@
 FROM ghcr.io/ggml-org/llama.cpp:server-rocm
 
+ENV LD_LIBRARY_PATH="/app:${LD_LIBRARY_PATH}"
+
 WORKDIR /models
 
 # Qwen3.5-2B base model
