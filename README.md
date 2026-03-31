@@ -168,17 +168,17 @@ Parameters you can adjust in the Dockerfiles for your hardware:
 - `PIPELINE_CONCURRENCY` — How many documents process simultaneously. All pipelines share the same `VLM_CONCURRENCY` pool, so this controls how many documents compete for VLM slots. Default `3`.
 
 **Model container** (`Dockerfile.cuda` / `Dockerfile.rocm` / `Dockerfile.vulkan`):
-- `--ctx-size 24576` — Context window size. The Shrew 2B model needs ~9000 tokens for semantic chunking; `24576` gives margin for ~18k total tokens. If your VRAM is tight, reduce context size and `SECTION_MAX_TOKENS` together.
-- `--parallel 4` — Concurrent request slots in llama.cpp. Each slot reserves `ctx-size` tokens of VRAM. `--parallel 4 --ctx-size 24576` uses ~4x the memory of `--parallel 1`. Reduce if you're tight on VRAM.
+- `--ctx-size 100000` — Total context window shared across all parallel slots. llama.cpp pre-allocates KV cache at startup (unlike vLLM which allocates on demand), so this is divided evenly: `--parallel 4` gives 25000 tokens per slot. The Shrew 2B model needs ~9000 tokens for semantic chunking, so 25k per slot is sufficient.
+- `--parallel 4` — Concurrent request slots in llama.cpp. Each slot gets `ctx-size / parallel` tokens. Reduce if you're tight on VRAM.
 - Base model quantization — The default `Q8_K_XL` (~2.5 GB) is high quality. For smaller VRAM, swap the `ADD` URL for a Q4 quantization from [unsloth/Qwen3.5-2B-GGUF](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF).
 
 **Rough VRAM requirements for the Shrew 2B model container:**
 
 | Config | VRAM |
 |--------|------|
-| `--parallel 1 --ctx-size 8192` (minimal) | ~4 GB |
-| `--parallel 4 --ctx-size 24576` (default) | ~10 GB |
-| `--parallel 8 --ctx-size 32768` (high throughput) | ~14 GB |
+| `--parallel 1 --ctx-size 25000` (minimal) | ~4 GB |
+| `--parallel 4 --ctx-size 100000` (default) | ~7 GB |
+| `--parallel 8 --ctx-size 200000` (high throughput) | ~12 GB |
 
 ## API
 

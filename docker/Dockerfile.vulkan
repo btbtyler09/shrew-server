@@ -26,5 +26,5 @@ CMD ["--host", "0.0.0.0", "--port", "8000", \
      "--lora-init-without-apply", \
      "--lora", "/models/adapters/extract_metadata.gguf,/models/adapters/summarize_document.gguf,/models/adapters/semantic_chunk.gguf", \
      "-fa", "on", \
-     "--ctx-size", "24576", \
+     "--ctx-size", "100000", \
      "--parallel", "4"]
