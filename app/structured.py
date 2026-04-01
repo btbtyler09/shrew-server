@@ -327,9 +327,23 @@ def semantic_chunk(
             result = _parse_json_response(response)
             chunks = result.get("semantic_chunks", [])
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse chunks JSON for section {i}: {e}")
+            logger.warning(f"Failed to parse chunks JSON for section {i}: {e}")
             logger.debug(f"Raw response: {response[:500]}")
-            chunks = []
+            # Retry once — model is stochastic, second attempt often produces clean JSON
+            logger.info(f"Retrying section {i}...")
+            try:
+                response = chunk_client.simple_completion(
+                    system_prompt=system_prompt,
+                    user_content=user_msg,
+                    max_tokens=pipeline.get("max_output_tokens", 16384),
+                    timeout=600,
+                    **params,
+                )
+                result = _parse_json_response(response)
+                chunks = result.get("semantic_chunks", [])
+            except (json.JSONDecodeError, Exception) as e2:
+                logger.error(f"Retry also failed for section {i}: {e2}")
+                chunks = []
 
         if chunks:
             # Renumber chunk IDs sequentially
