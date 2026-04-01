@@ -117,7 +117,14 @@ def _parse_json_response(text: str) -> dict:
         pass
 
     # Repair attempt: fix common model output issues
-    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+    repaired = text
+    # Fix unescaped backslashes (LaTeX in JSON strings: \alpha, \epsilon, etc.)
+    # Escape any \ not followed by a valid JSON escape char: " \ / b f n r t u
+    repaired = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', repaired)
+    # Fix \u not followed by 4 hex digits (e.g., \underset → \\underset)
+    repaired = re.sub(r'\\u(?![0-9a-fA-F]{4})', r'\\\\u', repaired)
+    # Remove trailing commas before } or ]
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
     # Close unclosed structures
     open_braces = repaired.count("{") - repaired.count("}")
     open_brackets = repaired.count("[") - repaired.count("]")
