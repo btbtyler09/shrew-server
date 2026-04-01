@@ -421,6 +421,31 @@ def run_pipeline(
         from .postprocess import postprocess_markdown
         clean_markdown = postprocess_markdown(clean_markdown)
 
+        # VLM-based heading hierarchy fix
+        if not config.skip_stage3:
+            from .structured import fix_heading_hierarchy
+            if not config.accurate and config.shrew_vllm_url:
+                heading_vlm = VLMClient(
+                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B-shrew",
+                )
+                heading_fallback = VLMClient(
+                    base_url=config.vlm_url, model=config.vlm_model,
+                    api_key=config.api_key,
+                )
+            else:
+                heading_vlm = VLMClient(
+                    base_url=config.vlm_url, model=config.vlm_model,
+                    api_key=config.api_key,
+                )
+                heading_fallback = None
+            clean_markdown = fix_heading_hierarchy(
+                clean_markdown,
+                vlm_client=heading_vlm,
+                fallback_vlm_client=heading_fallback,
+                lora_adapters=config.shrew_lora_map,
+                lora_format=config.shrew_lora_format,
+            )
+
         clean_path = os.path.join(output_dir, "clean.md")
         with open(clean_path, "w", encoding="utf-8") as f:
             f.write(clean_markdown)

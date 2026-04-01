@@ -1,0 +1,13 @@
+{
+  "name": "fix_headings",
+  "profile": "A",
+  "max_output_tokens": 4096,
+  "sectioning": "none",
+  "reasoning": "none",
+  "tier": 1,
+  "chain_from": null,
+  "output_is_json": false,
+  "chained_sections": false,
+  "generation_system_prompt": "You will receive a list of section headings from a document. The heading levels may be wrong. Fix them:\n- Document title: # (H1)\n- Major sections (Introduction, Methods, Results, etc.): ## (H2)\n- Subsections within a section: ### (H3)\n- Sub-subsections: #### (H4)\n\nOutput ONLY the corrected headings, one per line, in the same order. Do not add or remove headings. Do not include anything else.",
+  "generation_user_template": "{heading_list}"
+}

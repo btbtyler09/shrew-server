@@ -40,7 +40,7 @@ def postprocess_markdown(text: str, dedup: bool = False) -> str:
     text = _normalize_sub_superscripts(text)
     text = _normalize_equation_tags(text)
     text = _fix_math_headings(text)
-    text = _normalize_heading_hierarchy(text)
+    text = _remove_vlm_image_placeholders(text)
     text = _rejoin_hyphenated_words(text)
     text = _normalize_whitespace(text)
 
@@ -700,6 +700,30 @@ def _normalize_heading_hierarchy(text: str) -> str:
         logger.info(f"Heading hierarchy: demoted {changes} H1 headings to H2")
 
     return "\n".join(lines)
+
+
+# ── Pass 6b: Remove VLM image placeholders ────────────────────────────────────
+
+def _remove_vlm_image_placeholders(text: str) -> str:
+    """Remove VLM-hallucinated image references, keep our img:N references.
+
+    The VLM sometimes generates its own image markdown (e.g. ![Figure 1](image_url))
+    while the pipeline separately adds proper ![caption](img:N) references.
+    """
+    lines = text.split("\n")
+    result = []
+    removals = 0
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^!\[.*?\]\((?!img:).+?\)$", stripped):
+            removals += 1
+            continue
+        result.append(line)
+
+    if removals:
+        logger.info(f"Removed {removals} VLM-generated image placeholders")
+
+    return "\n".join(result)
 
 
 # ── Pass 7: Whitespace Normalization ─────────────────────────────────────────

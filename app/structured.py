@@ -336,5 +336,138 @@ def semantic_chunk(
         else:
             logger.warning(f"  No chunks returned for section {i + 1}")
 
+    all_chunks = _dedup_consecutive_chunks(all_chunks)
     logger.info(f"Semantic chunking complete: {len(all_chunks)} total chunks")
     return all_chunks
+
+
+# ─── Chunk deduplication ───────────────────────────────────────────────────
+
+def _dedup_consecutive_chunks(
+    chunks: list[dict], threshold: float = 0.6,
+) -> list[dict]:
+    """Remove near-duplicate consecutive chunks from section boundary overlap."""
+    if len(chunks) < 2:
+        return chunks
+
+    result = [chunks[0]]
+    for i in range(1, len(chunks)):
+        prev_words = set(result[-1].get("content", "").split())
+        curr_words = set(chunks[i].get("content", "").split())
+        if not prev_words or not curr_words:
+            result.append(chunks[i])
+            continue
+        jaccard = len(prev_words & curr_words) / len(prev_words | curr_words)
+        if jaccard > threshold:
+            # Keep the longer chunk
+            if len(curr_words) > len(prev_words):
+                result[-1] = chunks[i]
+            logger.info(f"Chunk dedup: dropped chunk (jaccard={jaccard:.2f})")
+        else:
+            result.append(chunks[i])
+
+    # Renumber sequentially
+    for i, chunk in enumerate(result):
+        chunk["chunk_id"] = str(i + 1)
+
+    if len(result) < len(chunks):
+        logger.info(f"Chunk dedup: {len(chunks)} -> {len(result)} chunks")
+    return result
+
+
+# ─── Heading hierarchy fix ─────────────────────────────────────────────────
+
+def fix_heading_hierarchy(
+    clean_markdown: str,
+    vlm_client: VLMClient,
+    fallback_vlm_client: Optional[VLMClient] = None,
+    lora_adapters: Optional[dict] = None,
+    lora_format: str = "none",
+) -> str:
+    """Fix heading levels using VLM understanding of document structure.
+
+    Extracts headings, sends them to the model as plain markdown,
+    parses the corrected headings, and reinserts them.
+    Falls back to the fallback client if the primary fails.
+    """
+    pipeline = _load_pipeline("fix_headings")
+
+    # Extract headings with line positions
+    lines = clean_markdown.split("\n")
+    headings = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(#{1,6})\s+(.+)$", line)
+        if m:
+            headings.append({"line_idx": i, "level": len(m.group(1)), "text": m.group(2)})
+
+    if len(headings) < 3:
+        return clean_markdown
+
+    # Format as plain markdown headings
+    heading_md = "\n".join("#" * h["level"] + " " + h["text"] for h in headings)
+    user_msg = pipeline["generation_user_template"].replace("{heading_list}", heading_md)
+    system_prompt = pipeline["generation_system_prompt"]
+
+    # Try primary client, then fallback
+    for client in [vlm_client, fallback_vlm_client]:
+        if client is None:
+            continue
+        params = get_generation_params(client.model, "structured")
+        # Apply LoRA scale 0 for llamacpp (no adapter for this task)
+        if lora_format == "llamacpp" and lora_adapters:
+            extra = params.get("extra_params") or {}
+            extra["lora"] = [{"id": aid, "scale": 0.0} for aid in lora_adapters.values()]
+            params["extra_params"] = extra
+
+        try:
+            response = client.simple_completion(
+                system_prompt=system_prompt,
+                user_content=user_msg,
+                max_tokens=4096,
+                **params,
+            )
+
+            # Parse response: extract heading lines
+            fixed = []
+            for rline in response.strip().split("\n"):
+                rline = rline.strip()
+                m = re.match(r"^(?:\d+\.\s*)?(#{1,6})\s+(.+)$", rline)
+                if m:
+                    fixed.append({"level": len(m.group(1)), "text": m.group(2)})
+
+            # Match back to input by text — handles hallucinated extras
+            if len(fixed) == len(headings):
+                # Exact count match — apply in order
+                changes = 0
+                for orig, fix in zip(headings, fixed):
+                    new_level = fix["level"]
+                    if 1 <= new_level <= 6 and new_level != orig["level"]:
+                        lines[orig["line_idx"]] = "#" * new_level + " " + orig["text"]
+                        changes += 1
+                logger.info(f"Heading fix: {changes} changes via {client.model}")
+                return "\n".join(lines)
+
+            # Count mismatch — try matching by text content
+            fix_map = {}
+            for f in fixed:
+                fix_map.setdefault(f["text"].strip(), f["level"])
+
+            changes = 0
+            for orig in headings:
+                new_level = fix_map.get(orig["text"].strip())
+                if new_level and 1 <= new_level <= 6 and new_level != orig["level"]:
+                    lines[orig["line_idx"]] = "#" * new_level + " " + orig["text"]
+                    changes += 1
+
+            if changes > 0:
+                logger.info(f"Heading fix: {changes} changes via {client.model} (text-matched)")
+                return "\n".join(lines)
+
+            logger.warning(f"Heading fix: no usable changes from {client.model}")
+
+        except Exception as e:
+            logger.warning(f"Heading fix failed with {client.model}: {e}")
+            continue
+
+    logger.warning("Heading hierarchy fix failed on all models, returning original")
+    return clean_markdown
