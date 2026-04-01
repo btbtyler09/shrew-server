@@ -22,6 +22,7 @@ HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]
 EXPOSE 8000
 CMD ["--host", "0.0.0.0", "--port", "8000", \
      "--model", "/models/Qwen3.5-2B.gguf", \
+     "--alias", "Qwen3.5-2B", \
      "--mmproj", "/models/mmproj.gguf", \
      "--lora-init-without-apply", \
      "--lora", "/models/adapters/extract_metadata.gguf,/models/adapters/summarize_document.gguf,/models/adapters/semantic_chunk.gguf", \

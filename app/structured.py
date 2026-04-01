@@ -208,12 +208,24 @@ def extract_metadata(
     try:
         metadata = _parse_json_response(response)
     except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse metadata JSON: {e}")
+        logger.warning(f"Failed to parse metadata JSON: {e}")
         logger.debug(f"Raw response: {response[:500]}")
-        metadata = {
-            "title": None, "authors": [], "organization": None,
-            "year": None, "type": None, "keywords": [],
-        }
+        # Retry once — model is stochastic, second attempt often produces clean JSON
+        logger.info("Retrying metadata extraction...")
+        try:
+            response = vlm_client.simple_completion(
+                system_prompt=system_prompt,
+                user_content=user_msg,
+                max_tokens=4096,
+                **params,
+            )
+            metadata = _parse_json_response(response)
+        except (json.JSONDecodeError, Exception) as e2:
+            logger.error(f"Metadata retry also failed: {e2}")
+            metadata = {
+                "title": None, "authors": [], "organization": None,
+                "year": None, "type": None, "keywords": [],
+            }
 
     # Add computed fields
     sha = hashlib.sha256()

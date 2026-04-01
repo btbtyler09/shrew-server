@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,121 @@ class CancelledException(Exception):
     pass
 
 
+# ── Adaptive repetition loop detection ─────────────────────────────────────
+
+_METRICS_PATH = Path(__file__).parent / "page_metrics.json"
+
+
+class PageMetrics:
+    """Persistent per-page VLM metrics with adaptive thresholds.
+
+    Persists max_time and max_chars across documents in a JSON file.
+    Thresholds linearly tighten from generous defaults to learned values
+    over the first 10 documents.
+    """
+
+    INITIAL_TIMEOUT = 60.0       # seconds, used for doc 1
+    INITIAL_CHAR_LIMIT = 10_000  # chars, used for doc 1
+    MARGIN = 1.5                 # multiplier above learned max
+    RAMP_DOCS = 10               # docs to fully tighten thresholds
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # Persistent state (loaded from / saved to disk)
+        self.docs_processed: int = 0
+        self.pages_processed: int = 0
+        self.max_time_s: float = 0.0
+        self.max_chars: int = 0
+        # Per-document session state (not persisted)
+        self._session_times: list[float] = []
+        self._session_sizes: list[int] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if _METRICS_PATH.exists():
+                data = json.loads(_METRICS_PATH.read_text())
+                self.docs_processed = data.get("docs_processed", 0)
+                self.pages_processed = data.get("pages_processed", 0)
+                self.max_time_s = data.get("max_time_s", 0.0)
+                self.max_chars = data.get("max_chars", 0)
+                logger.info(
+                    f"Loaded page metrics: {self.docs_processed} docs, "
+                    f"max_time={self.max_time_s:.1f}s, max_chars={self.max_chars}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load page metrics: {e}")
+
+    def _save(self) -> None:
+        try:
+            data = {
+                "docs_processed": self.docs_processed,
+                "pages_processed": self.pages_processed,
+                "max_time_s": round(self.max_time_s, 2),
+                "max_chars": self.max_chars,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _METRICS_PATH.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.warning(f"Failed to save page metrics: {e}")
+
+    def _lerp(self, initial: float, learned: float) -> float:
+        if self.docs_processed >= self.RAMP_DOCS or learned <= 0:
+            return learned if learned > 0 else initial
+        t = self.docs_processed / self.RAMP_DOCS
+        return initial + (learned - initial) * t
+
+    @property
+    def timeout(self) -> float:
+        with self._lock:
+            if self.max_time_s <= 0:
+                return self.INITIAL_TIMEOUT
+            learned = self.max_time_s * self.MARGIN
+            return max(30.0, self._lerp(self.INITIAL_TIMEOUT, learned))
+
+    @property
+    def char_threshold(self) -> int:
+        with self._lock:
+            if self.max_chars <= 0:
+                return self.INITIAL_CHAR_LIMIT
+            learned = int(self.max_chars * self.MARGIN)
+            return max(5000, int(self._lerp(self.INITIAL_CHAR_LIMIT, learned)))
+
+    def record_page(self, elapsed: float, chars: int) -> None:
+        with self._lock:
+            self._session_times.append(elapsed)
+            self._session_sizes.append(chars)
+
+    def is_outlier(self, chars: int) -> bool:
+        return chars > self.char_threshold
+
+    def finish_document(self) -> None:
+        with self._lock:
+            if not self._session_times:
+                return
+            session_max_time = max(self._session_times)
+            session_max_chars = max(self._session_sizes)
+            self.max_time_s = max(self.max_time_s, session_max_time)
+            self.max_chars = max(self.max_chars, session_max_chars)
+            self.docs_processed += 1
+            self.pages_processed += len(self._session_times)
+            self._session_times.clear()
+            self._session_sizes.clear()
+            self._save()
+            logger.info(
+                f"Updated page metrics: {self.docs_processed} docs, "
+                f"max_time={self.max_time_s:.1f}s, max_chars={self.max_chars}"
+            )
+
+
+def _has_repetition_loop(text: str, window: int = 200, min_repeats: int = 3) -> bool:
+    """Detect repetitive text loops in VLM output."""
+    if len(text) < window * min_repeats:
+        return False
+    tail = text[-window:]
+    return text.count(tail) >= min_repeats
+
+
 # ── Per-page helpers ────────────────────────────────────────────────────────
 
 
@@ -49,8 +165,13 @@ def _vlm_transcribe_one_page(
     hires_path: Path,
     total_pages: int,
     config: PipelineConfig,
-) -> str:
-    """Transcribe one page directly from its image via VLM."""
+    timeout: int | None = None,
+    max_tokens: int = 16384,
+) -> tuple[str, float]:
+    """Transcribe one page directly from its image via VLM.
+
+    Returns (text, elapsed_seconds).
+    """
     logger.info(f"VLM transcribe: starting page {page_no}")
     vlm = VLMClient(
         base_url=config.vlm_url,
@@ -64,11 +185,13 @@ def _vlm_transcribe_one_page(
     ]
 
     params = get_generation_params(config.vlm_model, "transcribe")
+    start = time.time()
     try:
         result = vlm.simple_completion(
             system_prompt=DIRECT_CONVERT_PROMPT,
             user_content=user_content,
-            max_tokens=16384,
+            max_tokens=max_tokens,
+            timeout=timeout,
             **params,
         )
         # Strip markdown fences if the VLM wrapped its output
@@ -80,12 +203,14 @@ def _vlm_transcribe_one_page(
         if text.endswith("```"):
             text = text[:-3].strip()
 
-        logger.info(f"VLM transcribe: page {page_no} -> {len(text)} chars")
-        return text
+        elapsed = time.time() - start
+        logger.info(f"VLM transcribe: page {page_no} -> {len(text)} chars in {elapsed:.1f}s")
+        return text, elapsed
 
     except Exception as e:
-        logger.error(f"VLM transcribe failed on page {page_no}: {e}")
-        return ""
+        elapsed = time.time() - start
+        logger.error(f"VLM transcribe failed on page {page_no} after {elapsed:.1f}s: {e}")
+        return "", elapsed
 
 
 def _classify_figure_crop(
@@ -100,7 +225,7 @@ def _classify_figure_crop(
 
     # Use Shrew 2B when available, fall back to main VLM
     if not config.accurate and config.shrew_vllm_url:
-        vlm = VLMClient(base_url=config.shrew_vllm_url, model="Qwen3.5-2B-shrew")
+        vlm = VLMClient(base_url=config.shrew_vllm_url, model="Qwen3.5-2B")
     else:
         vlm = VLMClient(
             base_url=config.vlm_url,
@@ -217,6 +342,7 @@ def _process_one_page(
     config: PipelineConfig,
     figure_converter,
     output_dir: str,
+    metrics: PageMetrics | None = None,
 ) -> tuple[int, str, list[dict]]:
     """Process a single page: parallel VLM transcription + figure detection.
 
@@ -224,11 +350,12 @@ def _process_one_page(
     """
     figures = []
     markdown = ""
+    timeout = int(metrics.timeout) if metrics else None
 
     with ThreadPoolExecutor(max_workers=2) as mini_pool:
         vlm_future = mini_pool.submit(
             _vlm_transcribe_one_page, page_no, hires_path,
-            total_pages, config,
+            total_pages, config, timeout=timeout,
         )
 
         if figure_converter is not None:
@@ -236,7 +363,7 @@ def _process_one_page(
         else:
             fig_future = None
 
-        markdown = vlm_future.result()
+        markdown, elapsed = vlm_future.result()
         if fig_future is not None:
             try:
                 figures = fig_future.result()
@@ -244,6 +371,37 @@ def _process_one_page(
                 logger.warning(f"Page {page_no}: figure detection failed: {e}")
                 figures = []
 
+    # ── Repetition loop detection and retry ────────────────────────────────
+    is_loop = _has_repetition_loop(markdown)
+    is_outlier = metrics.is_outlier(len(markdown)) if metrics else False
+
+    if markdown and (is_loop or is_outlier):
+        reason = "repetition loop" if is_loop else (
+            f"size outlier ({len(markdown)} > {metrics.char_threshold})"
+        )
+        logger.warning(
+            f"Page {page_no}: {reason} detected "
+            f"({len(markdown)} chars, {elapsed:.1f}s). Retrying..."
+        )
+        retry_text, retry_elapsed = _vlm_transcribe_one_page(
+            page_no, hires_path, total_pages, config,
+            timeout=timeout, max_tokens=4096,
+        )
+        if retry_text and len(retry_text) < len(markdown):
+            logger.info(
+                f"Page {page_no}: retry shorter "
+                f"({len(retry_text)} vs {len(markdown)} chars), using retry"
+            )
+            markdown, elapsed = retry_text, retry_elapsed
+        else:
+            logger.info(
+                f"Page {page_no}: keeping original ({len(markdown)} chars)"
+            )
+        # Don't record outlier stats — keep baseline clean
+    elif metrics:
+        metrics.record_page(elapsed, len(markdown))
+
+    # ── Figure cropping and image tag insertion ────────────────────────────
     page_images = _crop_and_filter_figures(
         display_path, figures, page_no, config, output_dir,
     )
@@ -353,6 +511,7 @@ def run_pipeline(
         page_results: dict[int, tuple[str, list[dict]]] = {}
         n_pages = len(page_numbers)
         skip_stage3 = config.skip_stage3
+        metrics = PageMetrics()
 
         if progress:
             progress.emit(5, f"Transcribing pages (0/{n_pages})...")
@@ -366,7 +525,7 @@ def run_pipeline(
             dims = page_dims.get(pno, (612.0, 792.0))
             fut = vlm_pool.submit(
                 _process_one_page, pno, display_path, hires_path, dims,
-                total_pages, config, figure_converter, output_dir,
+                total_pages, config, figure_converter, output_dir, metrics,
             )
             futures[fut] = pno
 
@@ -387,6 +546,7 @@ def run_pipeline(
                 if progress.is_cancelled():
                     raise CancelledException()
 
+        metrics.finish_document()
         process_time = time.time() - process_start
         logger.info(f"Page processing complete: {process_time:.1f}s")
 
@@ -426,7 +586,7 @@ def run_pipeline(
             from .structured import fix_heading_hierarchy
             if not config.accurate and config.shrew_vllm_url:
                 heading_vlm = VLMClient(
-                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B-shrew",
+                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B",
                 )
                 heading_fallback = VLMClient(
                     base_url=config.vlm_url, model=config.vlm_model,
@@ -490,7 +650,7 @@ def run_pipeline(
             if not config.accurate and config.shrew_vllm_url:
                 logger.info("Structured extraction: fast mode via Shrew vLLM")
                 stage3_vlm = VLMClient(
-                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B-shrew",
+                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B",
                 )
                 s3_lora = config.shrew_lora_map
                 s3_lora_fmt = config.shrew_lora_format

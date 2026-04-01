@@ -9,3 +9,4 @@ build/
 venv/
 env/
 *.log
+app/page_metrics.json

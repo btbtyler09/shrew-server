@@ -33,7 +33,7 @@ def _qwen35_flags() -> dict:
 _STAGE_PARAMS = {
     "transcribe": {
         "temperature": 0.3,
-        "extra": {"top_p": 0.8, "top_k": 20},
+        "extra": {"top_p": 0.8, "top_k": 20, "repetition_penalty": 1.1},
     },
     "classify_figure": {
         "temperature": 0.7,
