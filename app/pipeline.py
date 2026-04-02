@@ -42,6 +42,13 @@ class CancelledException(Exception):
     pass
 
 
+class VLMTranscriptionError(Exception):
+    """Retryable VLM transcription failure."""
+    def __init__(self, message: str, elapsed: float):
+        super().__init__(message)
+        self.elapsed = elapsed
+
+
 # ── Adaptive repetition loop detection ─────────────────────────────────────
 
 _METRICS_PATH = Path(__file__).parent / "page_metrics.json"
@@ -130,6 +137,11 @@ class PageMetrics:
     def is_outlier(self, chars: int) -> bool:
         return chars > self.char_threshold
 
+    def is_time_outlier(self, elapsed: float) -> bool:
+        if self.max_time_s <= 0:
+            return False
+        return elapsed > self.max_time_s * self.MARGIN
+
     def finish_document(self) -> None:
         with self._lock:
             if not self._session_times:
@@ -210,7 +222,7 @@ def _vlm_transcribe_one_page(
     except Exception as e:
         elapsed = time.time() - start
         logger.error(f"VLM transcribe failed on page {page_no} after {elapsed:.1f}s: {e}")
-        return "", elapsed
+        raise VLMTranscriptionError(str(e), elapsed) from e
 
 
 def _classify_figure_crop(
@@ -348,8 +360,14 @@ def _process_one_page(
 
     Returns (page_no, markdown, images_list).
     """
+    MAX_ERROR_RETRIES = 2
+    RETRY_BACKOFF = 2.0  # seconds
+    OUTLIER_CONFIRM_RATIO = 0.7  # retry >= 70% of original = confirmed valid
+
     figures = []
     markdown = ""
+    elapsed = 0.0
+    error_type = None
     timeout = int(metrics.timeout) if metrics else None
 
     with ThreadPoolExecutor(max_workers=2) as mini_pool:
@@ -363,7 +381,12 @@ def _process_one_page(
         else:
             fig_future = None
 
-        markdown, elapsed = vlm_future.result()
+        try:
+            markdown, elapsed = vlm_future.result()
+        except VLMTranscriptionError as e:
+            markdown, elapsed = "", e.elapsed
+            error_type = type(e).__name__
+
         if fig_future is not None:
             try:
                 figures = fig_future.result()
@@ -371,34 +394,77 @@ def _process_one_page(
                 logger.warning(f"Page {page_no}: figure detection failed: {e}")
                 figures = []
 
-    # ── Repetition loop detection and retry ────────────────────────────────
+    # ── Error retry (timeout / bad response / etc) ────────────────────────
+    if error_type is not None:
+        for attempt in range(1, MAX_ERROR_RETRIES + 1):
+            time.sleep(RETRY_BACKOFF * attempt)
+            retry_timeout = int(timeout * 1.5) if timeout else None
+            logger.info(
+                f"Page {page_no}: error retry {attempt}/{MAX_ERROR_RETRIES} "
+                f"(reason: {error_type})"
+            )
+            try:
+                markdown, elapsed = _vlm_transcribe_one_page(
+                    page_no, hires_path, total_pages, config,
+                    timeout=retry_timeout,
+                )
+                error_type = None
+                break
+            except VLMTranscriptionError as e:
+                markdown, elapsed = "", e.elapsed
+                error_type = type(e).__name__
+                logger.warning(f"Page {page_no}: retry {attempt} failed: {e}")
+        if error_type is not None:
+            logger.error(
+                f"Page {page_no}: all {MAX_ERROR_RETRIES} retries exhausted"
+            )
+
+    # ── Repetition loop / outlier detection and retry ─────────────────────
     is_loop = _has_repetition_loop(markdown)
     is_outlier = metrics.is_outlier(len(markdown)) if metrics else False
+    is_slow = metrics.is_time_outlier(elapsed) if metrics else False
 
-    if markdown and (is_loop or is_outlier):
-        reason = "repetition loop" if is_loop else (
-            f"size outlier ({len(markdown)} > {metrics.char_threshold})"
+    if markdown and (is_loop or is_outlier or is_slow):
+        reason = (
+            "repetition loop" if is_loop
+            else f"size outlier ({len(markdown)} > {metrics.char_threshold})" if is_outlier
+            else f"time outlier ({elapsed:.1f}s > {metrics.max_time_s * metrics.MARGIN:.1f}s)"
         )
         logger.warning(
             f"Page {page_no}: {reason} detected "
             f"({len(markdown)} chars, {elapsed:.1f}s). Retrying..."
         )
-        retry_text, retry_elapsed = _vlm_transcribe_one_page(
-            page_no, hires_path, total_pages, config,
-            timeout=timeout, max_tokens=4096,
-        )
-        if retry_text and len(retry_text) < len(markdown):
-            logger.info(
-                f"Page {page_no}: retry shorter "
-                f"({len(retry_text)} vs {len(markdown)} chars), using retry"
+        try:
+            retry_text, retry_elapsed = _vlm_transcribe_one_page(
+                page_no, hires_path, total_pages, config,
+                timeout=timeout, max_tokens=4096,
             )
-            markdown, elapsed = retry_text, retry_elapsed
+        except VLMTranscriptionError as e:
+            logger.warning(f"Page {page_no}: outlier retry failed: {e}")
+            retry_text, retry_elapsed = "", e.elapsed
+        if retry_text and len(retry_text) < len(markdown):
+            if len(retry_text) >= len(markdown) * OUTLIER_CONFIRM_RATIO:
+                # Retry is similar length — page is genuinely dense, not a glitch
+                logger.info(
+                    f"Page {page_no}: retry similar size "
+                    f"({len(retry_text)} vs {len(markdown)} chars), "
+                    f"confirmed valid — keeping original"
+                )
+                if metrics:
+                    metrics.record_page(elapsed, len(markdown))
+            else:
+                # Retry is significantly shorter — original was a glitch
+                logger.info(
+                    f"Page {page_no}: retry shorter "
+                    f"({len(retry_text)} vs {len(markdown)} chars), using retry"
+                )
+                markdown, elapsed = retry_text, retry_elapsed
         else:
             logger.info(
                 f"Page {page_no}: keeping original ({len(markdown)} chars)"
             )
-        # Don't record outlier stats — keep baseline clean
-    elif metrics:
+        # Don't record outlier stats unless confirmed valid (handled above)
+    elif metrics and error_type is None:
         metrics.record_page(elapsed, len(markdown))
 
     # ── Figure cropping and image tag insertion ────────────────────────────
