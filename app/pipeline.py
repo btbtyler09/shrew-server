@@ -62,9 +62,9 @@ class PageMetrics:
     over the first 10 documents.
     """
 
-    INITIAL_TIMEOUT = 60.0       # seconds, used for doc 1
+    INITIAL_TIMEOUT = 120.0      # seconds, used for doc 1
     INITIAL_CHAR_LIMIT = 10_000  # chars, used for doc 1
-    MARGIN = 1.5                 # multiplier above learned max
+    MARGIN = float(os.environ.get("VLM_TIMEOUT_MARGIN", "1.5"))
     RAMP_DOCS = 10               # docs to fully tighten thresholds
 
     def __init__(self):
