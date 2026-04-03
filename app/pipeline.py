@@ -67,8 +67,10 @@ class PageMetrics:
     MARGIN = float(os.environ.get("VLM_TIMEOUT_MARGIN", "1.5"))
     RAMP_DOCS = 10               # docs to fully tighten thresholds
 
-    def __init__(self):
+    def __init__(self, vlm_concurrency: int = 4):
         self._lock = threading.Lock()
+        self._vlm_concurrency = vlm_concurrency
+        self._concurrency_changed = False
         # Persistent state (loaded from / saved to disk)
         self.docs_processed: int = 0
         self.pages_processed: int = 0
@@ -87,6 +89,15 @@ class PageMetrics:
                 self.pages_processed = data.get("pages_processed", 0)
                 self.max_time_s = data.get("max_time_s", 0.0)
                 self.max_chars = data.get("max_chars", 0)
+                stored_concurrency = data.get("vlm_concurrency", 4)
+                if stored_concurrency != self._vlm_concurrency and self.max_time_s > 0:
+                    scale = self._vlm_concurrency / stored_concurrency
+                    logger.info(
+                        f"Concurrency changed {stored_concurrency} → {self._vlm_concurrency}, "
+                        f"scaling max_time_s {self.max_time_s:.1f}s → {self.max_time_s * scale:.1f}s"
+                    )
+                    self.max_time_s *= scale
+                    self._concurrency_changed = True
                 logger.info(
                     f"Loaded page metrics: {self.docs_processed} docs, "
                     f"max_time={self.max_time_s:.1f}s, max_chars={self.max_chars}"
@@ -101,6 +112,7 @@ class PageMetrics:
                 "pages_processed": self.pages_processed,
                 "max_time_s": round(self.max_time_s, 2),
                 "max_chars": self.max_chars,
+                "vlm_concurrency": self._vlm_concurrency,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             _METRICS_PATH.write_text(json.dumps(data, indent=2))
@@ -148,7 +160,12 @@ class PageMetrics:
                 return
             session_max_time = max(self._session_times)
             session_max_chars = max(self._session_sizes)
-            self.max_time_s = max(self.max_time_s, session_max_time)
+            if self._concurrency_changed:
+                # First doc at new concurrency — replace time, don't merge
+                self.max_time_s = session_max_time
+                self._concurrency_changed = False
+            else:
+                self.max_time_s = max(self.max_time_s, session_max_time)
             self.max_chars = max(self.max_chars, session_max_chars)
             self.docs_processed += 1
             self.pages_processed += len(self._session_times)
@@ -398,7 +415,8 @@ def _process_one_page(
     if error_type is not None:
         for attempt in range(1, MAX_ERROR_RETRIES + 1):
             time.sleep(RETRY_BACKOFF * attempt)
-            retry_timeout = int(timeout * 1.5) if timeout else None
+            retry_margin = 2.0 * attempt  # attempt 1 → 2x, attempt 2 → 4x
+            retry_timeout = int(timeout * retry_margin) if timeout else None
             logger.info(
                 f"Page {page_no}: error retry {attempt}/{MAX_ERROR_RETRIES} "
                 f"(reason: {error_type})"
@@ -577,7 +595,7 @@ def run_pipeline(
         page_results: dict[int, tuple[str, list[dict]]] = {}
         n_pages = len(page_numbers)
         skip_stage3 = config.skip_stage3
-        metrics = PageMetrics()
+        metrics = PageMetrics(vlm_concurrency=config.vlm_concurrency)
 
         if progress:
             progress.emit(5, f"Transcribing pages (0/{n_pages})...")
