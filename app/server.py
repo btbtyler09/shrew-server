@@ -30,6 +30,7 @@ from .models import PipelineConfig, PipelineResult
 from .pipeline import CancelledException, run_pipeline
 from .rasterizer import IMAGE_EXTENSIONS, OFFICE_EXTENSIONS
 from .progress import ProgressReporter
+from .vlm_client import VLMClient
 
 logger = logging.getLogger("shrew.server")
 
