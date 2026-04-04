@@ -20,7 +20,7 @@ logger = logging.getLogger("shrew.vlm")
 # Cross-process VLM concurrency gate.  Created at import time (before
 # uvicorn forks) so all workers share the same POSIX semaphore.
 _VLM_CONCURRENCY = int(os.environ.get("VLM_CONCURRENCY", "4"))
-_vlm_gate: multiprocessing.Semaphore | None = (
+_vlm_gate = (
     multiprocessing.Semaphore(_VLM_CONCURRENCY) if _VLM_CONCURRENCY > 0 else None
 )
 
