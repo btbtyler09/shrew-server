@@ -198,6 +198,19 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
+    unavailable = []
+    vlm = VLMClient(base_url=_config.vlm_url, model=_config.vlm_model, api_key=_config.api_key)
+    if not vlm.health_check():
+        unavailable.append("vlm")
+    if _config.shrew_vllm_url:
+        shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
+        if not shrew_vlm.health_check():
+            unavailable.append("shrew_vlm")
+    if unavailable:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "unavailable": unavailable},
+        )
     return {"status": "ok"}
 
 
@@ -273,6 +286,15 @@ async def convert(
                 status_code=400,
                 detail=f"Invalid page range: {pages}. Use '1-5' or '3'.",
             )
+
+    # Pre-flight VLM health check
+    vlm = VLMClient(base_url=vlm_url, model=vlm_model, api_key=api_key)
+    if not vlm.health_check():
+        return JSONResponse(status_code=503, content={"error": "VLM server unavailable"})
+    if _config.shrew_vllm_url:
+        shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
+        if not shrew_vlm.health_check():
+            return JSONResponse(status_code=503, content={"error": "Shrew VLM server unavailable"})
 
     tmp_path = _save_upload(file)
     try:
@@ -351,6 +373,15 @@ async def convert_stream(
                 status_code=400,
                 detail=f"Invalid page range: {pages}. Use '1-5' or '3'.",
             )
+
+    # Pre-flight VLM health check
+    vlm = VLMClient(base_url=vlm_url, model=vlm_model, api_key=api_key)
+    if not vlm.health_check():
+        raise HTTPException(status_code=503, detail="VLM server unavailable")
+    if _config.shrew_vllm_url:
+        shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
+        if not shrew_vlm.health_check():
+            raise HTTPException(status_code=503, detail="Shrew VLM server unavailable")
 
     tmp_path = _save_upload(file)
     try:

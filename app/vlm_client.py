@@ -172,3 +172,15 @@ class VLMClient:
                     break
 
         return content.strip()
+
+    def health_check(self, timeout: int = 5) -> bool:
+        """Check if the VLM server is reachable."""
+        try:
+            resp = requests.get(
+                f"{self.base_url}/v1/models", timeout=timeout,
+                headers=self._headers(),
+            )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            return False

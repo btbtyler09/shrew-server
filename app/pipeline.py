@@ -505,7 +505,8 @@ def _process_one_page(
     with open(dirty_path, "w", encoding="utf-8") as f:
         f.write(markdown)
 
-    return page_no, markdown, page_images
+    failed = error_type is not None
+    return page_no, markdown, page_images, failed
 
 
 # ── VLM Pipeline ────────────────────────────────────────────────────────────
@@ -614,14 +615,18 @@ def run_pipeline(
             futures[fut] = pno
 
         pages_done = 0
+        failed_pages = []
         for fut in as_completed(futures):
             pno = futures[fut]
             try:
-                _, md, imgs = fut.result()
+                _, md, imgs, failed = fut.result()
                 page_results[pno] = (md, imgs)
+                if failed:
+                    failed_pages.append(pno)
             except Exception as e:
                 logger.error(f"Page {pno} processing failed: {e}")
                 page_results[pno] = ("", [])
+                failed_pages.append(pno)
             pages_done += 1
             if progress:
                 upper = 85 if skip_stage3 else 60
@@ -633,6 +638,13 @@ def run_pipeline(
         metrics.finish_document()
         process_time = time.time() - process_start
         logger.info(f"Page processing complete: {process_time:.1f}s")
+
+        if failed_pages:
+            failed_pages.sort()
+            raise RuntimeError(
+                f"{len(failed_pages)}/{len(page_numbers)} pages failed VLM transcription "
+                f"after all retries (pages: {failed_pages})"
+            )
 
         # ── Step 4: Assemble final document with global image numbering ─────
         all_images: list[dict] = []
