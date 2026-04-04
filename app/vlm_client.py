@@ -7,6 +7,8 @@ Handles multimodal messages with base64-encoded images.
 import base64
 import json
 import logging
+import multiprocessing
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -14,6 +16,13 @@ from typing import Optional
 import requests
 
 logger = logging.getLogger("shrew.vlm")
+
+# Cross-process VLM concurrency gate.  Created at import time (before
+# uvicorn forks) so all workers share the same POSIX semaphore.
+_VLM_CONCURRENCY = int(os.environ.get("VLM_CONCURRENCY", "4"))
+_vlm_gate: multiprocessing.Semaphore | None = (
+    multiprocessing.Semaphore(_VLM_CONCURRENCY) if _VLM_CONCURRENCY > 0 else None
+)
 
 
 def _encode_image(image_path: Path | str, format: str = "png") -> str:
@@ -92,6 +101,11 @@ class VLMClient:
         t = timeout or self.default_timeout
         start = time.time()
 
+        gate = _vlm_gate
+        if gate is not None:
+            if not gate.acquire(block=False):
+                logger.debug("VLM gate full, waiting for slot...")
+                gate.acquire()
         try:
             resp = requests.post(
                 f"{self.base_url}/v1/chat/completions",
@@ -120,6 +134,9 @@ class VLMClient:
         except requests.RequestException as e:
             logger.error(f"VLM request failed: {e}")
             raise
+        finally:
+            if gate is not None:
+                gate.release()
 
     def simple_completion(
         self,

@@ -141,10 +141,11 @@ Configure in `docker/.env` or pass with `-e`:
 | `VLM_URL` | URL of your main VLM for page transcription | `http://localhost:8000` |
 | `VLM_MODEL` | Model name at VLM_URL (auto-detected if not set) | — |
 | `VLM_API_KEY` | API key for VLM endpoint (needed for OpenRouter) | — |
-| `VLM_CONCURRENCY` | Max concurrent VLM calls per pipeline | `4` |
+| `VLM_CONCURRENCY` | Max concurrent VLM calls across all workers (cross-process gate) | `4` |
 | `PIPELINE_CONCURRENCY` | Max concurrent document pipelines | `3` |
 | `SHREW_VLLM_URL` | URL of Shrew 2B model (set automatically by compose) | — |
 | `SHREW_ASYNC_STAGE3` | Run extraction tasks in parallel (set automatically by compose) | — |
+| `VLM_TIMEOUT_MARGIN` | Multiplier for adaptive timeout threshold (e.g. `1.5` = 50% above observed max) | `1.5` |
 | `SECTION_MAX_TOKENS` | Max tokens per section for semantic chunking | `9000` |
 | `DOCLING_DEVICE` | Figure detection accelerator: `auto`, `cpu`, `cuda` | `auto` |
 | `SHREW_HOST` | Server bind address | `0.0.0.0` |
@@ -164,8 +165,9 @@ VLM_API_KEY=sk-or-...
 Parameters you can adjust in the Dockerfiles for your hardware:
 
 **Server container** (`Dockerfile.server`):
-- `VLM_CONCURRENCY` — Max concurrent VLM calls across all pipelines (shared thread pool). Higher = faster but more VRAM pressure on your VLM server. Default `4`, increase to `8-16` if your VLM has headroom.
-- `PIPELINE_CONCURRENCY` — How many documents process simultaneously. All pipelines share the same `VLM_CONCURRENCY` pool, so this controls how many documents compete for VLM slots. Default `3`.
+- `VLM_CONCURRENCY` — Max concurrent VLM calls across all workers. This is a cross-process semaphore: even with multiple uvicorn workers (`SHREW_WORKERS`), the total in-flight VLM requests never exceeds this number. Higher = faster but more VRAM pressure on your VLM server. Default `4`, increase to `8-20` if your VLM has headroom.
+- `PIPELINE_CONCURRENCY` — How many documents process simultaneously per worker. All pipelines share the global `VLM_CONCURRENCY` gate, so this controls how many documents compete for VLM slots. Default `3`.
+- `VLM_TIMEOUT_MARGIN` — Multiplier for the adaptive timeout. Shrew tracks per-page VLM response times and flags pages that exceed `max_observed * margin` as outliers for retry. Default `1.5` (50% above max). Increase if your VLM has high latency variance under load.
 
 **Model container** (`Dockerfile.cuda` / `Dockerfile.rocm` / `Dockerfile.vulkan`):
 - `--ctx-size 100000` — Total context window shared across all parallel slots. llama.cpp pre-allocates KV cache at startup (unlike vLLM which allocates on demand), so this is divided evenly: `--parallel 4` gives 25000 tokens per slot. The Shrew 2B model needs ~9000 tokens for semantic chunking, so 25k per slot is sufficient.
@@ -239,7 +241,12 @@ data: {"percent": 100, "result": { ... full response ... }}
 
 ### `GET /health`
 
-Returns `{"status": "ok"}`.
+Returns `{"status": "ok"}` when all VLM backends are reachable. Returns `503` with details when a backend is down:
+```json
+{"status": "unhealthy", "unavailable": ["vlm"]}
+```
+
+Both `/v1/convert` and `/v1/convert/stream` also run a pre-flight VLM health check and return `503` if the VLM is unreachable.
 
 ## CLI
 
