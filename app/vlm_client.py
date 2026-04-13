@@ -190,14 +190,39 @@ class VLMClient:
 
         return content.strip()
 
-    def health_check(self, timeout: int = 5) -> bool:
-        """Check if the VLM server is reachable."""
+    def health_check(self, timeout: int = 10) -> bool:
+        """Check that the VLM server is reachable and the model can run inference."""
         try:
+            # 1. Verify the configured model is listed
             resp = requests.get(
                 f"{self.base_url}/v1/models", timeout=timeout,
                 headers=self._headers(),
             )
             resp.raise_for_status()
+            data = resp.json()
+            model_ids = {
+                item.get("id")
+                for item in data.get("data", [])
+                if isinstance(item, dict)
+            }
+            if self.model and self.model not in model_ids:
+                logger.warning(f"Health check: model '{self.model}' not in {model_ids}")
+                return False
+
+            # 2. Tiny inference to prove the model is actually working
+            resp = requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=self._headers(),
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Health check failed: {e}")
             return False
