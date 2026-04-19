@@ -179,10 +179,17 @@ class VLMClient:
             if reasoning:
                 content = reasoning
 
-        # Strip thinking blocks that some providers inline in content
-        if content.startswith("Thinking Process") or content.startswith("<think>"):
+        # Strip thinking blocks that some providers inline in content.
+        # A trailing </think> indicates thinking leaked into the content
+        # field; drop everything up to and including it regardless of how
+        # the response started. Fall back to startswith-based markers for
+        # providers that emit "Thinking Process" / "Answer:" style headers.
+        end_think = content.rfind("</think>")
+        if end_think >= 0:
+            content = content[end_think + len("</think>"):]
+        elif content.startswith("Thinking Process") or content.startswith("<think>"):
             for marker in ["\n\n---\n\n", "\n\nAnswer:\n", "\n\nSummary:\n",
-                          "</think>\n", "\n\n**Summary"]:
+                          "\n\n**Summary"]:
                 idx = content.find(marker)
                 if idx > 0:
                     content = content[idx + len(marker):]
