@@ -167,6 +167,28 @@ def _apply_lora(vlm_client, params, task, lora_adapters, lora_format):
     return vlm_client, params, task
 
 
+def _call_metadata_vlm(
+    client: VLMClient,
+    base_system_prompt: str,
+    user_msg: str,
+    lora_adapters: Optional[dict],
+    lora_format: str,
+) -> dict:
+    """One metadata VLM call + parse. Raises JSONDecodeError on bad output."""
+    params = get_generation_params(client.model, "structured")
+    client, params, sys_override = _apply_lora(
+        client, params, "extract_metadata", lora_adapters, lora_format,
+    )
+    effective_system = sys_override or base_system_prompt
+    response = client.simple_completion(
+        system_prompt=effective_system,
+        user_content=user_msg,
+        max_tokens=4096,
+        **params,
+    )
+    return _parse_json_response(response)
+
+
 def extract_metadata(
     clean_markdown: str,
     filename: str,
@@ -175,8 +197,14 @@ def extract_metadata(
     num_pages: int = 0,
     lora_adapters: Optional[dict] = None,
     lora_format: str = "none",
+    fallback_vlm_client: Optional[VLMClient] = None,
+    fallback_lora_adapters: Optional[dict] = None,
+    fallback_lora_format: str = "none",
 ) -> dict:
-    """Extract document metadata via VLM."""
+    """Extract document metadata via VLM.
+
+    Order of attempts: primary → primary retry → fallback (if provided).
+    """
     pipeline = _load_pipeline("extract_metadata")
 
     # Use first section only (metadata is in the front matter)
@@ -190,42 +218,53 @@ def extract_metadata(
     ).replace(
         "{section_content}", first_section
     )
+    base_system_prompt = pipeline["generation_system_prompt"]
 
-    system_prompt = pipeline["generation_system_prompt"]
-
-    params = get_generation_params(vlm_client.model, "structured")
-    vlm_client, params, sys_override = _apply_lora(vlm_client, params, "extract_metadata", lora_adapters, lora_format)
-    if sys_override:
-        system_prompt = sys_override
     logger.info("Extracting metadata via VLM")
-    response = vlm_client.simple_completion(
-        system_prompt=system_prompt,
-        user_content=user_msg,
-        max_tokens=4096,
-        **params,
-    )
-
+    metadata: Optional[dict] = None
     try:
-        metadata = _parse_json_response(response)
+        metadata = _call_metadata_vlm(
+            vlm_client, base_system_prompt, user_msg, lora_adapters, lora_format,
+        )
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to parse metadata JSON: {e}")
-        logger.debug(f"Raw response: {response[:500]}")
-        # Retry once — model is stochastic, second attempt often produces clean JSON
-        logger.info("Retrying metadata extraction...")
+        logger.info("Retrying metadata (primary)...")
         try:
-            response = vlm_client.simple_completion(
-                system_prompt=system_prompt,
-                user_content=user_msg,
-                max_tokens=4096,
-                **params,
+            metadata = _call_metadata_vlm(
+                vlm_client, base_system_prompt, user_msg, lora_adapters, lora_format,
             )
-            metadata = _parse_json_response(response)
         except (json.JSONDecodeError, Exception) as e2:
-            logger.error(f"Metadata retry also failed: {e2}")
-            metadata = {
-                "title": None, "authors": [], "organization": None,
-                "year": None, "type": None, "keywords": [],
-            }
+            logger.warning(f"Metadata primary retry failed: {e2}")
+            if fallback_vlm_client is not None:
+                logger.warning(
+                    f"Falling back to main VLM ({fallback_vlm_client.model}) for metadata"
+                )
+                try:
+                    metadata = _call_metadata_vlm(
+                        fallback_vlm_client, base_system_prompt, user_msg,
+                        fallback_lora_adapters, fallback_lora_format,
+                    )
+                except (json.JSONDecodeError, Exception) as e3:
+                    logger.error(f"Metadata fallback also failed: {e3}")
+    except Exception as e:
+        logger.warning(f"Metadata call failed: {e}")
+        if fallback_vlm_client is not None:
+            logger.warning(
+                f"Falling back to main VLM ({fallback_vlm_client.model}) for metadata"
+            )
+            try:
+                metadata = _call_metadata_vlm(
+                    fallback_vlm_client, base_system_prompt, user_msg,
+                    fallback_lora_adapters, fallback_lora_format,
+                )
+            except Exception as e3:
+                logger.error(f"Metadata fallback also failed: {e3}")
+
+    if metadata is None:
+        metadata = {
+            "title": None, "authors": [], "organization": None,
+            "year": None, "type": None, "keywords": [],
+        }
 
     # Add computed fields
     sha = hashlib.sha256()
@@ -244,13 +283,42 @@ def extract_metadata(
 
 # ─── Generate summary ────────────────────────────────────────────────────────
 
+def _call_summary_vlm(
+    client: VLMClient,
+    base_system_prompt: str,
+    user_msg: str,
+    lora_adapters: Optional[dict],
+    lora_format: str,
+) -> str:
+    """One summary VLM call. Raises on error; no JSON parse."""
+    params = get_generation_params(client.model, "structured")
+    client, params, sys_override = _apply_lora(
+        client, params, "summarize_document", lora_adapters, lora_format,
+    )
+    effective_system = sys_override or base_system_prompt
+    return client.simple_completion(
+        system_prompt=effective_system,
+        user_content=user_msg,
+        max_tokens=4096,
+        **params,
+    )
+
+
 def generate_summary(
     clean_markdown: str,
     vlm_client: VLMClient,
     lora_adapters: Optional[dict] = None,
     lora_format: str = "none",
+    fallback_vlm_client: Optional[VLMClient] = None,
+    fallback_lora_adapters: Optional[dict] = None,
+    fallback_lora_format: str = "none",
 ) -> str:
-    """Generate a concise document summary."""
+    """Generate a concise document summary.
+
+    Order of attempts: primary → primary retry → fallback (if provided).
+    Summary output is free-form text — fallback only triggers if the call
+    itself raises (network, parse, timeout, etc.).
+    """
     pipeline = _load_pipeline("summarize_document")
 
     sections = _section_document(clean_markdown, max_tokens=8000)
@@ -259,19 +327,37 @@ def generate_summary(
     user_msg = pipeline["generation_user_template"].replace(
         "{section_content}", first_section
     )
-    system_prompt = pipeline["generation_system_prompt"]
+    base_system_prompt = pipeline["generation_system_prompt"]
 
-    params = get_generation_params(vlm_client.model, "structured")
-    vlm_client, params, sys_override = _apply_lora(vlm_client, params, "summarize_document", lora_adapters, lora_format)
-    if sys_override:
-        system_prompt = sys_override
     logger.info("Generating summary via VLM")
-    summary = vlm_client.simple_completion(
-        system_prompt=system_prompt,
-        user_content=user_msg,
-        max_tokens=4096,
-        **params,
-    )
+    summary: Optional[str] = None
+    try:
+        summary = _call_summary_vlm(
+            vlm_client, base_system_prompt, user_msg, lora_adapters, lora_format,
+        )
+    except Exception as e:
+        logger.warning(f"Summary primary failed: {e}")
+        logger.info("Retrying summary (primary)...")
+        try:
+            summary = _call_summary_vlm(
+                vlm_client, base_system_prompt, user_msg, lora_adapters, lora_format,
+            )
+        except Exception as e2:
+            logger.warning(f"Summary primary retry failed: {e2}")
+            if fallback_vlm_client is not None:
+                logger.warning(
+                    f"Falling back to main VLM ({fallback_vlm_client.model}) for summary"
+                )
+                try:
+                    summary = _call_summary_vlm(
+                        fallback_vlm_client, base_system_prompt, user_msg,
+                        fallback_lora_adapters, fallback_lora_format,
+                    )
+                except Exception as e3:
+                    logger.error(f"Summary fallback also failed: {e3}")
+
+    if not summary:
+        summary = ""
 
     # Clean up — remove any JSON wrapper or markdown formatting
     summary = summary.strip().strip('"')
@@ -303,6 +389,45 @@ def _truncate_prev_chunk(text: Optional[str]) -> str:
     return "…" + text[-(_MAX_PREV_CHUNK_CHARS - 1):]
 
 
+def _compute_chunk_max_tokens(section: dict, content: str, pipeline: dict) -> int:
+    """Cap chunk output at ~2.5x input so runaway generation ends fast.
+
+    A well-behaved chunker produces ≈1x the input (content preserved + JSON
+    overhead). 2.5x leaves room for reformatting; the configured pipeline
+    ceiling (e.g., 20000) is an absolute upper bound; 2048 is a floor so
+    small sections don't get starved.
+    """
+    section_tokens = section.get("token_count") or _approx_tokens(content)
+    dynamic_cap = int(section_tokens * 2.5)
+    configured_cap = pipeline.get("max_output_tokens", 16384)
+    return max(2048, min(dynamic_cap, configured_cap))
+
+
+def _call_chunk_vlm(
+    client: VLMClient,
+    system_prompt: str,
+    user_msg: str,
+    max_tokens: int,
+    lora_adapters: Optional[dict],
+    lora_format: str,
+) -> list[dict]:
+    """One chunking VLM call + parse. Raises JSONDecodeError on bad output."""
+    params = get_generation_params(client.model, "structured")
+    client, params, sys_override = _apply_lora(
+        client, params, "semantic_chunk", lora_adapters, lora_format,
+    )
+    effective_system = sys_override or system_prompt
+    response = client.simple_completion(
+        system_prompt=effective_system,
+        user_content=user_msg,
+        max_tokens=max_tokens,
+        timeout=600,
+        **params,
+    )
+    result = _parse_json_response(response)
+    return result.get("semantic_chunks", [])
+
+
 def chunk_one_section(
     section: dict,
     is_first: bool,
@@ -313,11 +438,18 @@ def chunk_one_section(
     lora_format: str = "none",
     pipeline: Optional[dict] = None,
     section_label: Optional[str] = None,
+    fallback_vlm_client: Optional[VLMClient] = None,
+    fallback_lora_adapters: Optional[dict] = None,
+    fallback_lora_format: str = "none",
 ) -> tuple[list[dict], int, Optional[str]]:
     """Chunk one section via VLM. Returns (chunks, new_next_chunk_id, last_chunk_content).
 
-    If chunking fails, returns ([], next_chunk_id, last_chunk_content) — caller decides
-    whether to abort.
+    Order of attempts:
+      1. Primary (shrew) call
+      2. Retry primary once on JSON parse failure
+      3. If fallback_vlm_client is set, one call against the main VLM
+
+    If all attempts fail, returns ([], next_chunk_id, last_chunk_content).
     """
     if pipeline is None:
         pipeline = _load_pipeline("semantic_chunk")
@@ -340,47 +472,54 @@ def chunk_one_section(
             "{section_content}", content
         )
 
+    max_tokens = _compute_chunk_max_tokens(section, content, pipeline)
     logger.info(
         f"Chunking {label} (~{section.get('token_count', '?')} tokens, "
-        f"next_id={next_chunk_id})"
+        f"max_out={max_tokens}, next_id={next_chunk_id})"
     )
 
-    params = get_generation_params(vlm_client.model, "structured")
-    chunk_client, params, sys_override = _apply_lora(
-        vlm_client, params, "semantic_chunk", lora_adapters, lora_format,
-    )
-    if sys_override:
-        system_prompt = sys_override
-
-    max_tokens = pipeline.get("max_output_tokens", 16384)
-    response = chunk_client.simple_completion(
-        system_prompt=system_prompt,
-        user_content=user_msg,
-        max_tokens=max_tokens,
-        timeout=600,
-        **params,
-    )
-
+    chunks: list[dict] = []
     try:
-        result = _parse_json_response(response)
-        chunks = result.get("semantic_chunks", [])
+        chunks = _call_chunk_vlm(
+            vlm_client, system_prompt, user_msg, max_tokens,
+            lora_adapters, lora_format,
+        )
     except json.JSONDecodeError as e:
         logger.warning(f"Failed to parse chunks JSON for {label}: {e}")
-        logger.debug(f"Raw response: {response[:500]}")
-        logger.info(f"Retrying {label}...")
+        logger.info(f"Retrying {label} (primary)...")
         try:
-            response = chunk_client.simple_completion(
-                system_prompt=system_prompt,
-                user_content=user_msg,
-                max_tokens=max_tokens,
-                timeout=600,
-                **params,
+            chunks = _call_chunk_vlm(
+                vlm_client, system_prompt, user_msg, max_tokens,
+                lora_adapters, lora_format,
             )
-            result = _parse_json_response(response)
-            chunks = result.get("semantic_chunks", [])
         except (json.JSONDecodeError, Exception) as e2:
-            logger.error(f"Retry also failed for {label}: {e2}")
-            chunks = []
+            logger.warning(f"Primary retry failed for {label}: {e2}")
+            if fallback_vlm_client is not None:
+                logger.warning(
+                    f"Falling back to main VLM ({fallback_vlm_client.model}) for {label}"
+                )
+                try:
+                    chunks = _call_chunk_vlm(
+                        fallback_vlm_client, system_prompt, user_msg, max_tokens,
+                        fallback_lora_adapters, fallback_lora_format,
+                    )
+                except (json.JSONDecodeError, Exception) as e3:
+                    logger.error(f"Fallback also failed for {label}: {e3}")
+                    chunks = []
+    except Exception as e:
+        logger.warning(f"Chunk call failed for {label}: {e}")
+        if fallback_vlm_client is not None:
+            logger.warning(
+                f"Falling back to main VLM ({fallback_vlm_client.model}) for {label}"
+            )
+            try:
+                chunks = _call_chunk_vlm(
+                    fallback_vlm_client, system_prompt, user_msg, max_tokens,
+                    fallback_lora_adapters, fallback_lora_format,
+                )
+            except Exception as e3:
+                logger.error(f"Fallback also failed for {label}: {e3}")
+                chunks = []
 
     if chunks:
         for chunk in chunks:
@@ -400,11 +539,16 @@ def semantic_chunk(
     lora_adapters: Optional[dict] = None,
     lora_format: str = "none",
     section_max_tokens: int = 6000,
+    fallback_vlm_client: Optional[VLMClient] = None,
+    fallback_lora_adapters: Optional[dict] = None,
+    fallback_lora_format: str = "none",
 ) -> list[dict]:
     """Split document into semantic chunks.
 
     For long documents, sections the text and processes each section
-    sequentially with continuation context.
+    sequentially with continuation context. If a fallback VLM client is
+    provided, per-section chunking falls back to it when the primary
+    model fails to produce valid JSON.
     """
     pipeline = _load_pipeline("semantic_chunk")
 
@@ -428,6 +572,9 @@ def semantic_chunk(
             lora_format=lora_format,
             pipeline=pipeline,
             section_label=f"section {i + 1}/{len(sections)}",
+            fallback_vlm_client=fallback_vlm_client,
+            fallback_lora_adapters=fallback_lora_adapters,
+            fallback_lora_format=fallback_lora_format,
         )
         all_chunks.extend(chunks)
 

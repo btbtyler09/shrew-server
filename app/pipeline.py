@@ -696,6 +696,7 @@ def run_pipeline(
         s3_kwargs: dict = {}
         chunk_pipeline_cfg = None
 
+        main_vlm_fallback: Optional[VLMClient] = None
         if not skip_stage3:
             # Build the Stage 3 client once — used by streaming workers and
             # by the non-streaming fallback path below.
@@ -706,13 +707,24 @@ def run_pipeline(
                 )
                 s3_lora = config.shrew_lora_map
                 s3_lora_fmt = config.shrew_lora_format
+                # Fallback to the main VLM when shrew can't produce valid output
+                main_vlm_fallback = VLMClient(
+                    base_url=config.vlm_url, model=config.vlm_model,
+                    api_key=config.api_key,
+                )
             else:
                 logger.info("Structured extraction: main VLM")
                 stage3_vlm = VLMClient(
                     base_url=config.vlm_url, model=config.vlm_model,
                     api_key=config.api_key,
                 )
+                # Already using main VLM — no fallback needed
             s3_kwargs = dict(lora_adapters=s3_lora, lora_format=s3_lora_fmt)
+            s3_fallback_kwargs = dict(
+                fallback_vlm_client=main_vlm_fallback,
+                fallback_lora_adapters=None,
+                fallback_lora_format="none",
+            )
 
         if streaming_active:
             chunk_pipeline_cfg = load_chunk_pipeline()
@@ -788,6 +800,7 @@ def run_pipeline(
                             lora_format=s3_lora_fmt,
                             pipeline=chunk_pipeline_cfg,
                             section_label=f"section {idx + 1} (streaming)",
+                            fallback_vlm_client=main_vlm_fallback,
                         )
                         with chunk_lock:
                             all_chunks.extend(chunks)
@@ -802,7 +815,7 @@ def run_pipeline(
                 try:
                     metadata_result_holder[0] = extract_metadata(
                         first_section_text_holder[0], basename, input_path,
-                        stage3_vlm, n_pages, **s3_kwargs,
+                        stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs,
                     )
                 except Exception as e:
                     logger.error(f"Streaming metadata worker failed: {e}")
@@ -813,7 +826,8 @@ def run_pipeline(
                     return
                 try:
                     summary_result_holder[0] = generate_summary(
-                        first_section_text_holder[0], stage3_vlm, **s3_kwargs,
+                        first_section_text_holder[0], stage3_vlm,
+                        **s3_kwargs, **s3_fallback_kwargs,
                     )
                 except Exception as e:
                     logger.error(f"Streaming summary worker failed: {e}")
@@ -1064,9 +1078,9 @@ def run_pipeline(
 
                 logger.info("Structured extraction: running metadata + summary + chunking in parallel")
                 with ThreadPoolExecutor(max_workers=3) as s3_exec:
-                    meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs)
-                    summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs)
-                    chunk_f = s3_exec.submit(semantic_chunk, clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs)
+                    meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs)
+                    summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
+                    chunk_f = s3_exec.submit(semantic_chunk, clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
                     metadata = meta_f.result()
                     summary = summ_f.result()
                     chunks = chunk_f.result()
@@ -1076,21 +1090,21 @@ def run_pipeline(
                     if progress.is_cancelled():
                         raise CancelledException()
 
-                metadata = extract_metadata(clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs)
+                metadata = extract_metadata(clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs)
 
                 if progress:
                     progress.emit(80, "Generating summary...")
                     if progress.is_cancelled():
                         raise CancelledException()
 
-                summary = generate_summary(clean_markdown, stage3_vlm, **s3_kwargs)
+                summary = generate_summary(clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
 
                 if progress:
                     progress.emit(90, "Chunking document...")
                     if progress.is_cancelled():
                         raise CancelledException()
 
-                chunks = semantic_chunk(clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs)
+                chunks = semantic_chunk(clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
 
             metadata["num_chunks"] = len(chunks)
             stage3_time = time.time() - stage3_start
