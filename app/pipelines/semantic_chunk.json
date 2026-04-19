@@ -1,7 +1,7 @@
 {
   "name": "semantic_chunk",
   "profile": "C",
-  "max_output_tokens": 65536,
+  "max_output_tokens": 20000,
   "sectioning": "all",
   "reasoning": "none",
   "tier": 1,

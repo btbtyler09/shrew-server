@@ -34,8 +34,6 @@ from .vlm_client import VLMClient
 
 logger = logging.getLogger("shrew.server")
 
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -228,22 +226,11 @@ def _save_upload(upload: UploadFile) -> str:
         )
     fd, path = tempfile.mkstemp(suffix=suffix)
     try:
-        total = 0
         while True:
             chunk = upload.file.read(1024 * 1024)
             if not chunk:
                 break
-            total += len(chunk)
-            if total > MAX_FILE_SIZE:
-                os.close(fd)
-                os.unlink(path)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large (max {MAX_FILE_SIZE // 1024 // 1024} MB)",
-                )
             os.write(fd, chunk)
-    except HTTPException:
-        raise
     except Exception:
         os.close(fd)
         os.unlink(path)
