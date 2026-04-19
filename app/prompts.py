@@ -13,6 +13,7 @@ Rules:
 - Inline citations: use superscript numbers: <sup>1</sup>.
 - Author affiliations: superscript symbols (*, †, ‡, §).
 - Tables: ALWAYS use markdown pipe tables, NEVER LaTeX tabular. Preserve all cell values precisely as shown. Use `| Header 1 | Header 2 |` format with separator row `|---|---|`. Bold row headers if visually distinct: `| **Row Header** | value |`. For multi-line cell values, use `<br>` for line breaks within cells. Use alignment markers if needed: `:---` left, `:---:` center, `---:` right.
+- Tables of contents and indexes: render as a markdown table with appropriate columns (e.g. Section ID, Title, Page). Do NOT transcribe dot leaders, dashes, or fill characters between entries — use the table structure instead.
 - Figures: If the page contains a figure (chart, plot, diagram, photograph), describe it concisely (2-4 sentences). For charts/plots: describe axes, trends, key data points. For diagrams: describe components and relationships. Include the figure caption if visible.
 - Text fidelity: Preserve all text precisely — do not rephrase or omit anything. Fix obvious OCR-style errors (l vs 1, O vs 0) only when clearly wrong. Mark truly illegible portions with [illegible]. Do NOT fabricate content.
 - Lists: proper markdown syntax (-, 1., etc.).
