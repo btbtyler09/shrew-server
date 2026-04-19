@@ -62,7 +62,7 @@ class PageMetrics:
     over the first 10 documents.
     """
 
-    INITIAL_TIMEOUT = 120.0      # seconds, used for doc 1
+    INITIAL_TIMEOUT = 600.0      # seconds, used for doc 1
     INITIAL_CHAR_LIMIT = 10_000  # chars, used for doc 1
     MARGIN = float(os.environ.get("VLM_TIMEOUT_MARGIN", "1.5"))
     RAMP_DOCS = 10               # docs to fully tighten thresholds
@@ -195,7 +195,7 @@ def _vlm_transcribe_one_page(
     total_pages: int,
     config: PipelineConfig,
     timeout: int | None = None,
-    max_tokens: int = 16384,
+    max_tokens: int = 24576,
 ) -> tuple[str, float]:
     """Transcribe one page directly from its image via VLM.
 
@@ -455,7 +455,7 @@ def _process_one_page(
         try:
             retry_text, retry_elapsed = _vlm_transcribe_one_page(
                 page_no, hires_path, total_pages, config,
-                timeout=timeout, max_tokens=4096,
+                timeout=timeout, max_tokens=24576,
             )
         except VLMTranscriptionError as e:
             logger.warning(f"Page {page_no}: outlier retry failed: {e}")
