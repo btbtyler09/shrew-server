@@ -281,12 +281,125 @@ def generate_summary(
 
 # ─── Semantic chunking ───────────────────────────────────────────────────────
 
+# Max chars of previous-chunk context passed to a continuation request.
+# Approx 1k tokens at 4 chars/token; bounds chunk-input growth so the model
+# never exceeds its context window when sections happen to produce one big
+# chunk that would otherwise be re-fed verbatim as continuation context.
+_MAX_PREV_CHUNK_CHARS = 4000
+
+
+def load_chunk_pipeline() -> dict:
+    """Load the semantic_chunk pipeline config (exposed for streaming caller)."""
+    return _load_pipeline("semantic_chunk")
+
+
+def _truncate_prev_chunk(text: Optional[str]) -> str:
+    """Trim previous-chunk context to a safe size for continuation prompts."""
+    if not text:
+        return ""
+    if len(text) <= _MAX_PREV_CHUNK_CHARS:
+        return text
+    # Keep the tail — that's what semantically connects to the next section
+    return "…" + text[-(_MAX_PREV_CHUNK_CHARS - 1):]
+
+
+def chunk_one_section(
+    section: dict,
+    is_first: bool,
+    last_chunk_content: Optional[str],
+    next_chunk_id: int,
+    vlm_client: VLMClient,
+    lora_adapters: Optional[dict] = None,
+    lora_format: str = "none",
+    pipeline: Optional[dict] = None,
+    section_label: Optional[str] = None,
+) -> tuple[list[dict], int, Optional[str]]:
+    """Chunk one section via VLM. Returns (chunks, new_next_chunk_id, last_chunk_content).
+
+    If chunking fails, returns ([], next_chunk_id, last_chunk_content) — caller decides
+    whether to abort.
+    """
+    if pipeline is None:
+        pipeline = _load_pipeline("semantic_chunk")
+    content = section["content"]
+    label = section_label or f"section {section.get('section_index', '?')}"
+
+    if is_first:
+        system_prompt = pipeline["generation_system_prompt"]
+        user_msg = pipeline["generation_user_template"].replace(
+            "{section_content}", content
+        )
+    else:
+        system_prompt = pipeline["continuation_system_prompt"]
+        prev_for_prompt = _truncate_prev_chunk(last_chunk_content)
+        user_msg = pipeline["continuation_user_template"].replace(
+            "{previous_chunk}", prev_for_prompt
+        ).replace(
+            "{next_chunk_id}", str(next_chunk_id)
+        ).replace(
+            "{section_content}", content
+        )
+
+    logger.info(
+        f"Chunking {label} (~{section.get('token_count', '?')} tokens, "
+        f"next_id={next_chunk_id})"
+    )
+
+    params = get_generation_params(vlm_client.model, "structured")
+    chunk_client, params, sys_override = _apply_lora(
+        vlm_client, params, "semantic_chunk", lora_adapters, lora_format,
+    )
+    if sys_override:
+        system_prompt = sys_override
+
+    max_tokens = pipeline.get("max_output_tokens", 16384)
+    response = chunk_client.simple_completion(
+        system_prompt=system_prompt,
+        user_content=user_msg,
+        max_tokens=max_tokens,
+        timeout=600,
+        **params,
+    )
+
+    try:
+        result = _parse_json_response(response)
+        chunks = result.get("semantic_chunks", [])
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse chunks JSON for {label}: {e}")
+        logger.debug(f"Raw response: {response[:500]}")
+        logger.info(f"Retrying {label}...")
+        try:
+            response = chunk_client.simple_completion(
+                system_prompt=system_prompt,
+                user_content=user_msg,
+                max_tokens=max_tokens,
+                timeout=600,
+                **params,
+            )
+            result = _parse_json_response(response)
+            chunks = result.get("semantic_chunks", [])
+        except (json.JSONDecodeError, Exception) as e2:
+            logger.error(f"Retry also failed for {label}: {e2}")
+            chunks = []
+
+    if chunks:
+        for chunk in chunks:
+            chunk["chunk_id"] = str(next_chunk_id)
+            next_chunk_id += 1
+        last_chunk_content = chunks[-1].get("content", "") or last_chunk_content
+        logger.info(f"  Got {len(chunks)} chunks from {label}")
+    else:
+        logger.warning(f"  No chunks returned for {label}")
+
+    return chunks, next_chunk_id, last_chunk_content
+
+
 def semantic_chunk(
     clean_markdown: str,
     vlm_client: VLMClient,
     lora_adapters: Optional[dict] = None,
     lora_format: str = "none",
-    section_max_tokens: int = 9000,
+    section_max_tokens: int = 6000,
 ) -> list[dict]:
     """Split document into semantic chunks.
 
@@ -295,7 +408,9 @@ def semantic_chunk(
     """
     pipeline = _load_pipeline("semantic_chunk")
 
-    sections = _section_document(clean_markdown, max_tokens=section_max_tokens, overlap_tokens=1000)
+    sections = _section_document(
+        clean_markdown, max_tokens=section_max_tokens, overlap_tokens=1000,
+    )
     all_chunks = []
     last_chunk_content = None
     next_chunk_id = 1
@@ -303,71 +418,18 @@ def semantic_chunk(
     logger.info(f"Semantic chunking: {len(sections)} sections")
 
     for i, section in enumerate(sections):
-        content = section["content"]
-
-        if i == 0:
-            system_prompt = pipeline["generation_system_prompt"]
-            user_msg = pipeline["generation_user_template"].replace(
-                "{section_content}", content
-            )
-        else:
-            system_prompt = pipeline["continuation_system_prompt"]
-            user_msg = pipeline["continuation_user_template"].replace(
-                "{previous_chunk}", last_chunk_content or ""
-            ).replace(
-                "{next_chunk_id}", str(next_chunk_id)
-            ).replace(
-                "{section_content}", content
-            )
-
-        logger.info(f"Chunking section {i + 1}/{len(sections)} "
-                    f"(~{section['token_count']} tokens, next_id={next_chunk_id})")
-
-        params = get_generation_params(vlm_client.model, "structured")
-        chunk_client, params, sys_override = _apply_lora(vlm_client, params, "semantic_chunk", lora_adapters, lora_format)
-        if sys_override:
-            system_prompt = sys_override
-        response = chunk_client.simple_completion(
-                system_prompt=system_prompt,
-                user_content=user_msg,
-                max_tokens=pipeline.get("max_output_tokens", 16384),
-                timeout=600,
-                **params,
-            )
-
-        try:
-            result = _parse_json_response(response)
-            chunks = result.get("semantic_chunks", [])
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse chunks JSON for section {i}: {e}")
-            logger.debug(f"Raw response: {response[:500]}")
-            # Retry once — model is stochastic, second attempt often produces clean JSON
-            logger.info(f"Retrying section {i}...")
-            try:
-                response = chunk_client.simple_completion(
-                    system_prompt=system_prompt,
-                    user_content=user_msg,
-                    max_tokens=pipeline.get("max_output_tokens", 16384),
-                    timeout=600,
-                    **params,
-                )
-                result = _parse_json_response(response)
-                chunks = result.get("semantic_chunks", [])
-            except (json.JSONDecodeError, Exception) as e2:
-                logger.error(f"Retry also failed for section {i}: {e2}")
-                chunks = []
-
-        if chunks:
-            # Renumber chunk IDs sequentially
-            for chunk in chunks:
-                chunk["chunk_id"] = str(next_chunk_id)
-                next_chunk_id += 1
-
-            all_chunks.extend(chunks)
-            last_chunk_content = chunks[-1].get("content", "")
-            logger.info(f"  Got {len(chunks)} chunks from section {i + 1}")
-        else:
-            logger.warning(f"  No chunks returned for section {i + 1}")
+        chunks, next_chunk_id, last_chunk_content = chunk_one_section(
+            section,
+            is_first=(i == 0),
+            last_chunk_content=last_chunk_content,
+            next_chunk_id=next_chunk_id,
+            vlm_client=vlm_client,
+            lora_adapters=lora_adapters,
+            lora_format=lora_format,
+            pipeline=pipeline,
+            section_label=f"section {i + 1}/{len(sections)}",
+        )
+        all_chunks.extend(chunks)
 
     all_chunks = _dedup_consecutive_chunks(all_chunks)
     logger.info(f"Semantic chunking complete: {len(all_chunks)} total chunks")
@@ -416,12 +478,18 @@ def fix_heading_hierarchy(
     fallback_vlm_client: Optional[VLMClient] = None,
     lora_adapters: Optional[dict] = None,
     lora_format: str = "none",
-) -> str:
+    return_changes: bool = False,
+):
     """Fix heading levels using VLM understanding of document structure.
 
     Extracts headings, sends them to the model as plain markdown,
     parses the corrected headings, and reinserts them.
     Falls back to the fallback client if the primary fails.
+
+    By default returns the corrected markdown string. If return_changes=True,
+    returns (markdown, changes_map) where changes_map maps stripped heading
+    text → new_level. Streaming callers use this map to patch chunk content
+    after the fact.
     """
     pipeline = _load_pipeline("fix_headings")
 
@@ -433,8 +501,11 @@ def fix_heading_hierarchy(
         if m:
             headings.append({"line_idx": i, "level": len(m.group(1)), "text": m.group(2)})
 
+    def _ret(md: str, changes: dict) -> object:
+        return (md, changes) if return_changes else md
+
     if len(headings) < 3:
-        return clean_markdown
+        return _ret(clean_markdown, {})
 
     # Format as plain markdown headings
     heading_md = "\n".join("#" * h["level"] + " " + h["text"] for h in headings)
@@ -468,6 +539,8 @@ def fix_heading_hierarchy(
                 if m:
                     fixed.append({"level": len(m.group(1)), "text": m.group(2)})
 
+            changes_map: dict[str, int] = {}
+
             # Match back to input by text — handles hallucinated extras
             if len(fixed) == len(headings):
                 # Exact count match — apply in order
@@ -476,9 +549,10 @@ def fix_heading_hierarchy(
                     new_level = fix["level"]
                     if 1 <= new_level <= 6 and new_level != orig["level"]:
                         lines[orig["line_idx"]] = "#" * new_level + " " + orig["text"]
+                        changes_map[orig["text"].strip()] = new_level
                         changes += 1
                 logger.info(f"Heading fix: {changes} changes via {client.model}")
-                return "\n".join(lines)
+                return _ret("\n".join(lines), changes_map)
 
             # Count mismatch — try matching by text content
             fix_map = {}
@@ -490,11 +564,12 @@ def fix_heading_hierarchy(
                 new_level = fix_map.get(orig["text"].strip())
                 if new_level and 1 <= new_level <= 6 and new_level != orig["level"]:
                     lines[orig["line_idx"]] = "#" * new_level + " " + orig["text"]
+                    changes_map[orig["text"].strip()] = new_level
                     changes += 1
 
             if changes > 0:
                 logger.info(f"Heading fix: {changes} changes via {client.model} (text-matched)")
-                return "\n".join(lines)
+                return _ret("\n".join(lines), changes_map)
 
             logger.warning(f"Heading fix: no usable changes from {client.model}")
 
@@ -503,4 +578,32 @@ def fix_heading_hierarchy(
             continue
 
     logger.warning("Heading hierarchy fix failed on all models, returning original")
-    return clean_markdown
+    return _ret(clean_markdown, {})
+
+
+def patch_chunk_headings(chunks: list[dict], changes_map: dict) -> int:
+    """Apply heading-level changes to chunk content. Returns number of edits."""
+    if not changes_map or not chunks:
+        return 0
+    edits = 0
+    pat = re.compile(r"^(#{1,6})\s+(.+)$")
+    for chunk in chunks:
+        content = chunk.get("content", "")
+        if not content or "#" not in content:
+            continue
+        new_lines = []
+        changed = False
+        for line in content.split("\n"):
+            m = pat.match(line)
+            if m:
+                text = m.group(2).strip()
+                new_level = changes_map.get(text)
+                if new_level and 1 <= new_level <= 6 and new_level != len(m.group(1)):
+                    new_lines.append("#" * new_level + " " + m.group(2))
+                    changed = True
+                    edits += 1
+                    continue
+            new_lines.append(line)
+        if changed:
+            chunk["content"] = "\n".join(new_lines)
+    return edits

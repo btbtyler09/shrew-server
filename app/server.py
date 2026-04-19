@@ -307,7 +307,7 @@ async def convert(
                 shrew_lora_map=_shrew_lora_map,
                 shrew_lora_format=_shrew_lora_format,
                 shrew_async_stage3=os.environ.get("SHREW_ASYNC_STAGE3", "").lower() in ("1", "true", "yes"),
-                section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "9000")),
+                section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
             )
 
             def _run():
@@ -396,7 +396,7 @@ async def convert_stream(
                 shrew_lora_map=_shrew_lora_map,
                 shrew_lora_format=_shrew_lora_format,
                 shrew_async_stage3=os.environ.get("SHREW_ASYNC_STAGE3", "").lower() in ("1", "true", "yes"),
-                section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "9000")),
+                section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
             )
 
             result = run_pipeline(

@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,8 +25,19 @@ from .docling_client import create_figure_converter, detect_figures
 from .models import PipelineConfig, PipelineResult
 from .prompts import DIRECT_CONVERT_PROMPT, FIGURE_CLASSIFY_PROMPT
 from .rasterizer import prepare_pages
-from .structured import extract_metadata, generate_summary, semantic_chunk
+from .structured import (
+    _approx_tokens,
+    chunk_one_section,
+    extract_metadata,
+    generate_summary,
+    load_chunk_pipeline,
+    patch_chunk_headings,
+    semantic_chunk,
+)
 from .vlm_client import VLMClient, make_image_content, make_text_content
+
+
+_STREAM_STAGE3 = os.environ.get("SHREW_STREAM_STAGE3", "true").lower() in ("true", "1", "yes")
 
 logger = logging.getLogger("shrew.pipeline")
 
@@ -184,6 +196,72 @@ def _has_repetition_loop(text: str, window: int = 200, min_repeats: int = 3) -> 
         return False
     tail = text[-window:]
     return text.count(tail) >= min_repeats
+
+
+class _StreamingSectioner:
+    """Incremental version of structured._section_document.
+
+    Pages arrive in order. We accumulate paragraphs until adding the next
+    paragraph would exceed `max_tokens`, then emit a section and seed the
+    next section with `overlap_tokens` worth of trailing paragraphs.
+    Final partial section is returned by `flush()`.
+    """
+
+    def __init__(self, max_tokens: int = 9000, overlap_tokens: int = 1000):
+        self.max_tokens = max_tokens
+        self.overlap_tokens = overlap_tokens
+        self._paras: list[str] = []
+        self._tokens: int = 0
+
+    def _emit_current(self) -> dict:
+        content = "\n\n".join(self._paras)
+        section = {
+            "content": content,
+            "section_index": -1,  # caller assigns
+            "total_sections": -1,
+            "token_count": self._tokens,
+        }
+        # Seed next section with overlap from end of current
+        overlap_paras: list[str] = []
+        overlap_tok = 0
+        for p in reversed(self._paras):
+            pt = _approx_tokens(p)
+            if overlap_tok + pt > self.overlap_tokens:
+                break
+            overlap_paras.insert(0, p)
+            overlap_tok += pt
+        self._paras = overlap_paras
+        self._tokens = overlap_tok
+        return section
+
+    def add_text(self, text: str) -> list[dict]:
+        """Append text to the buffer; return any sections that became complete."""
+        emitted: list[dict] = []
+        for para in text.split("\n\n"):
+            para = para.strip()
+            if not para:
+                continue
+            para_tokens = _approx_tokens(para)
+            if self._tokens + para_tokens > self.max_tokens and self._paras:
+                emitted.append(self._emit_current())
+            self._paras.append(para)
+            self._tokens += para_tokens
+        return emitted
+
+    def flush(self) -> list[dict]:
+        """Return any remaining buffered text as a final section."""
+        if not self._paras:
+            return []
+        content = "\n\n".join(self._paras)
+        section = {
+            "content": content,
+            "section_index": -1,
+            "total_sections": -1,
+            "token_count": self._tokens,
+        }
+        self._paras = []
+        self._tokens = 0
+        return [section]
 
 
 # ── Per-page helpers ────────────────────────────────────────────────────────
@@ -585,7 +663,7 @@ def run_pipeline(
         if progress.is_cancelled():
             raise CancelledException()
 
-    # ── Step 3: Process pages concurrently ──────────────────────────────────
+    # ── Step 3: Process pages concurrently (with optional streaming Stage 3) ──
     _local_pool = None
     try:
         if vlm_pool is None:
@@ -593,10 +671,159 @@ def run_pipeline(
             vlm_pool = _local_pool
         process_start = time.time()
 
-        page_results: dict[int, tuple[str, list[dict]]] = {}
+        page_results: dict[int, tuple[str, list[dict], bool]] = {}
         n_pages = len(page_numbers)
         skip_stage3 = config.skip_stage3
         metrics = PageMetrics(vlm_concurrency=config.vlm_concurrency)
+
+        # ── Streaming Stage 3 setup ────────────────────────────────────────
+        streaming_active = _STREAM_STAGE3 and not skip_stage3
+        page_completed = threading.Condition()
+        cancel_event = threading.Event()
+        section_queue: queue.Queue = queue.Queue()
+        chunk_lock = threading.Lock()
+        all_chunks: list[dict] = []
+        sections_chunked = [0]
+        sections_emitted_total = [0]
+        first_section_event = threading.Event()
+        first_section_text_holder = [""]
+        metadata_result_holder: list = [None]
+        summary_result_holder: list = [None]
+        streamer_threads: list[threading.Thread] = []
+        stage3_vlm = None
+        s3_lora = None
+        s3_lora_fmt = "none"
+        s3_kwargs: dict = {}
+        chunk_pipeline_cfg = None
+
+        if not skip_stage3:
+            # Build the Stage 3 client once — used by streaming workers and
+            # by the non-streaming fallback path below.
+            if not config.accurate and config.shrew_vllm_url:
+                logger.info("Structured extraction: fast mode via Shrew vLLM")
+                stage3_vlm = VLMClient(
+                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B",
+                )
+                s3_lora = config.shrew_lora_map
+                s3_lora_fmt = config.shrew_lora_format
+            else:
+                logger.info("Structured extraction: main VLM")
+                stage3_vlm = VLMClient(
+                    base_url=config.vlm_url, model=config.vlm_model,
+                    api_key=config.api_key,
+                )
+            s3_kwargs = dict(lora_adapters=s3_lora, lora_format=s3_lora_fmt)
+
+        if streaming_active:
+            chunk_pipeline_cfg = load_chunk_pipeline()
+
+            def _emit_section(section_dict: dict) -> None:
+                idx = sections_emitted_total[0]
+                section_dict["section_index"] = idx
+                section_queue.put((idx, section_dict))
+                sections_emitted_total[0] = idx + 1
+                if idx == 0:
+                    first_section_text_holder[0] = section_dict["content"]
+                    first_section_event.set()
+
+            def page_streamer() -> None:
+                sectioner = _StreamingSectioner(
+                    max_tokens=config.section_max_tokens,
+                    overlap_tokens=1000,
+                )
+                global_img_offset_local = 0
+                try:
+                    for pno in page_numbers:
+                        if pno not in page_images:
+                            continue
+                        if cancel_event.is_set():
+                            return
+                        with page_completed:
+                            while pno not in page_results and not cancel_event.is_set():
+                                page_completed.wait(timeout=1.0)
+                            entry = page_results.get(pno)
+                        if cancel_event.is_set() or entry is None:
+                            return
+                        md, page_imgs, failed = entry
+                        if failed:
+                            cancel_event.set()
+                            return
+                        if page_imgs:
+                            for local_idx in range(len(page_imgs)):
+                                md = md.replace(
+                                    f"(img:{local_idx})",
+                                    f"(img:{global_img_offset_local + local_idx})",
+                                )
+                            global_img_offset_local += len(page_imgs)
+                        page_text = f"<page {pno}>\n{md}\n</page {pno}>\n\n"
+                        for section in sectioner.add_text(page_text):
+                            _emit_section(section)
+                    if not cancel_event.is_set():
+                        for section in sectioner.flush():
+                            _emit_section(section)
+                finally:
+                    # Always unblock metadata/summary workers, then sentinel-close
+                    if not first_section_event.is_set():
+                        first_section_event.set()
+                    section_queue.put(None)
+
+            def chunk_worker() -> None:
+                next_chunk_id = 1
+                last_chunk_content: Optional[str] = None
+                while True:
+                    item = section_queue.get()
+                    if item is None:
+                        break
+                    if cancel_event.is_set():
+                        continue
+                    idx, section = item
+                    try:
+                        chunks, next_chunk_id, last_chunk_content = chunk_one_section(
+                            section,
+                            is_first=(idx == 0),
+                            last_chunk_content=last_chunk_content,
+                            next_chunk_id=next_chunk_id,
+                            vlm_client=stage3_vlm,
+                            lora_adapters=s3_lora,
+                            lora_format=s3_lora_fmt,
+                            pipeline=chunk_pipeline_cfg,
+                            section_label=f"section {idx + 1} (streaming)",
+                        )
+                        with chunk_lock:
+                            all_chunks.extend(chunks)
+                            sections_chunked[0] += 1
+                    except Exception as e:
+                        logger.error(f"Streaming chunk worker failed on section {idx}: {e}")
+
+            def metadata_worker() -> None:
+                first_section_event.wait()
+                if cancel_event.is_set() or not first_section_text_holder[0]:
+                    return
+                try:
+                    metadata_result_holder[0] = extract_metadata(
+                        first_section_text_holder[0], basename, input_path,
+                        stage3_vlm, n_pages, **s3_kwargs,
+                    )
+                except Exception as e:
+                    logger.error(f"Streaming metadata worker failed: {e}")
+
+            def summary_worker() -> None:
+                first_section_event.wait()
+                if cancel_event.is_set() or not first_section_text_holder[0]:
+                    return
+                try:
+                    summary_result_holder[0] = generate_summary(
+                        first_section_text_holder[0], stage3_vlm, **s3_kwargs,
+                    )
+                except Exception as e:
+                    logger.error(f"Streaming summary worker failed: {e}")
+
+            for tgt in (page_streamer, chunk_worker, metadata_worker, summary_worker):
+                t = threading.Thread(target=tgt, name=f"shrew_{tgt.__name__}", daemon=True)
+                t.start()
+                streamer_threads.append(t)
+
+            logger.info("Streaming Stage 3: workers spawned")
 
         if progress:
             progress.emit(5, f"Transcribing pages (0/{n_pages})...")
@@ -614,25 +841,53 @@ def run_pipeline(
             )
             futures[fut] = pno
 
+        # Populate page_results immediately on completion so the streamer
+        # can advance — independent of the as_completed loop below, which
+        # exists primarily to drive progress and detect failures.
+        def _on_page_done(fut):
+            pno = futures[fut]
+            try:
+                _, md, imgs, failed = fut.result()
+            except Exception as e:
+                logger.error(f"Page {pno} done_callback caught: {e}")
+                md, imgs, failed = "", [], True
+            with page_completed:
+                page_results[pno] = (md, imgs, failed)
+                page_completed.notify_all()
+
+        for fut in futures:
+            fut.add_done_callback(_on_page_done)
+
         pages_done = 0
         failed_pages = []
         for fut in as_completed(futures):
             pno = futures[fut]
-            try:
-                _, md, imgs, failed = fut.result()
-                page_results[pno] = (md, imgs)
-                if failed:
-                    failed_pages.append(pno)
-            except Exception as e:
-                logger.error(f"Page {pno} processing failed: {e}")
-                page_results[pno] = ("", [])
+            # Wait for the done_callback to populate page_results — there's a small
+            # race window between "future done" and "callback fired."
+            with page_completed:
+                while pno not in page_results:
+                    page_completed.wait(timeout=1.0)
+                entry = page_results[pno]
+            if entry[2]:
                 failed_pages.append(pno)
             pages_done += 1
             if progress:
-                upper = 85 if skip_stage3 else 60
-                pct = 5 + int((upper - 5) * pages_done / n_pages)
+                if streaming_active:
+                    page_pct = pages_done / n_pages
+                    est_sections = max(
+                        sections_emitted_total[0],
+                        sections_chunked[0],
+                        1,
+                    )
+                    chunk_pct = sections_chunked[0] / est_sections if est_sections else 0
+                    combined = page_pct * 0.7 + chunk_pct * 0.3
+                    pct = 5 + int(85 * min(combined, 1.0))
+                else:
+                    upper = 85 if skip_stage3 else 60
+                    pct = 5 + int((upper - 5) * pages_done / n_pages)
                 progress.emit(pct, f"Transcribing pages ({pages_done}/{n_pages})...")
                 if progress.is_cancelled():
+                    cancel_event.set()
                     raise CancelledException()
 
         metrics.finish_document()
@@ -640,10 +895,25 @@ def run_pipeline(
         logger.info(f"Page processing complete: {process_time:.1f}s")
 
         if failed_pages:
+            cancel_event.set()
+            section_queue.put(None)  # ensure chunk worker exits
+            for t in streamer_threads:
+                t.join(timeout=10)
             failed_pages.sort()
             raise RuntimeError(
                 f"{len(failed_pages)}/{len(page_numbers)} pages failed VLM transcription "
                 f"after all retries (pages: {failed_pages})"
+            )
+
+        # Wait for streaming workers to drain
+        if streaming_active:
+            if progress:
+                progress.emit(85, "Finishing structured extraction...")
+            for t in streamer_threads:
+                t.join()
+            logger.info(
+                f"Streaming Stage 3 drained: {len(all_chunks)} chunks across "
+                f"{sections_emitted_total[0]} sections"
             )
 
         # ── Step 4: Assemble final document with global image numbering ─────
@@ -652,7 +922,8 @@ def run_pipeline(
         parts = []
 
         for pno in page_numbers:
-            md, page_imgs = page_results.get(pno, ("", []))
+            entry = page_results.get(pno, ("", [], False))
+            md, page_imgs = entry[0], entry[1]
 
             if page_imgs:
                 for local_idx, img_info in enumerate(page_imgs):
@@ -678,7 +949,8 @@ def run_pipeline(
         clean_markdown = postprocess_markdown(clean_markdown)
 
         # VLM-based heading hierarchy fix
-        if not config.skip_stage3:
+        heading_changes: dict = {}
+        if not skip_stage3:
             from .structured import fix_heading_hierarchy
             if not config.accurate and config.shrew_vllm_url:
                 heading_vlm = VLMClient(
@@ -694,13 +966,23 @@ def run_pipeline(
                     api_key=config.api_key,
                 )
                 heading_fallback = None
-            clean_markdown = fix_heading_hierarchy(
-                clean_markdown,
-                vlm_client=heading_vlm,
-                fallback_vlm_client=heading_fallback,
-                lora_adapters=config.shrew_lora_map,
-                lora_format=config.shrew_lora_format,
-            )
+            if streaming_active:
+                clean_markdown, heading_changes = fix_heading_hierarchy(
+                    clean_markdown,
+                    vlm_client=heading_vlm,
+                    fallback_vlm_client=heading_fallback,
+                    lora_adapters=config.shrew_lora_map,
+                    lora_format=config.shrew_lora_format,
+                    return_changes=True,
+                )
+            else:
+                clean_markdown = fix_heading_hierarchy(
+                    clean_markdown,
+                    vlm_client=heading_vlm,
+                    fallback_vlm_client=heading_fallback,
+                    lora_adapters=config.shrew_lora_map,
+                    lora_format=config.shrew_lora_format,
+                )
 
         clean_path = os.path.join(output_dir, "clean.md")
         with open(clean_path, "w", encoding="utf-8") as f:
@@ -708,7 +990,8 @@ def run_pipeline(
 
         dirty_parts = []
         for pno in page_numbers:
-            md, _ = page_results.get(pno, ("", []))
+            entry = page_results.get(pno, ("", [], False))
+            md = entry[0]
             dirty_parts.append(f"<page {pno}>\n{md}\n</page {pno}>")
         with open(os.path.join(output_dir, "dirty.md"), "w", encoding="utf-8") as f:
             f.write("\n\n".join(dirty_parts))
@@ -716,7 +999,8 @@ def run_pipeline(
         pages_dir = os.path.join(output_dir, "pages")
         os.makedirs(pages_dir, exist_ok=True)
         for pno in page_numbers:
-            md, _ = page_results.get(pno, ("", []))
+            entry = page_results.get(pno, ("", [], False))
+            md = entry[0]
             clean_page_path = os.path.join(pages_dir, f"page_{pno:04d}_clean.md")
             with open(clean_page_path, "w", encoding="utf-8") as f:
                 f.write(md)
@@ -730,36 +1014,49 @@ def run_pipeline(
             if progress.is_cancelled():
                 raise CancelledException()
 
-        # ── Step 5: Structured extraction ───────────────────────────────────
+        # ── Step 5: Structured extraction (finalize or run) ─────────────────
         structured_json: dict = {}
         stage3_time = 0.0
 
         if all_images:
             structured_json["images"] = all_images
 
-        if not config.skip_stage3:
+        if not skip_stage3:
             stage3_start = time.time()
 
-            s3_lora = None
-            s3_lora_fmt = "none"
-
-            if not config.accurate and config.shrew_vllm_url:
-                logger.info("Structured extraction: fast mode via Shrew vLLM")
-                stage3_vlm = VLMClient(
-                    base_url=config.shrew_vllm_url, model="Qwen3.5-2B",
+            if streaming_active:
+                from .structured import _dedup_consecutive_chunks
+                if heading_changes and all_chunks:
+                    edits = patch_chunk_headings(all_chunks, heading_changes)
+                    if edits:
+                        logger.info(
+                            f"Patched {edits} heading levels in chunk content "
+                            f"after final fix_heading_hierarchy"
+                        )
+                chunks = _dedup_consecutive_chunks(list(all_chunks))
+                metadata = metadata_result_holder[0] or {
+                    "title": None, "authors": [], "organization": None,
+                    "year": None, "type": None, "keywords": [],
+                }
+                summary = summary_result_holder[0] or ""
+                # Streaming metadata is computed from first section only —
+                # backfill the document-level fields the existing extract_metadata
+                # adds (id, source_pages) in case the worker fell back to defaults.
+                if not metadata.get("id"):
+                    import hashlib as _hashlib
+                    sha = _hashlib.sha256()
+                    with open(input_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            sha.update(chunk)
+                    metadata["id"] = sha.hexdigest()[:16]
+                if not metadata.get("source_pages"):
+                    metadata["source_pages"] = n_pages
+                logger.info(
+                    f"Streaming Stage 3: {len(chunks)} chunks, "
+                    f"metadata={'ok' if metadata_result_holder[0] else 'fallback'}, "
+                    f"summary={'ok' if summary_result_holder[0] else 'fallback'}"
                 )
-                s3_lora = config.shrew_lora_map
-                s3_lora_fmt = config.shrew_lora_format
-            else:
-                logger.info("Structured extraction: main VLM")
-                stage3_vlm = VLMClient(
-                    base_url=config.vlm_url, model=config.vlm_model, api_key=config.api_key,
-                )
-
-            num_pages = len(page_numbers)
-            s3_kwargs = dict(lora_adapters=s3_lora, lora_format=s3_lora_fmt)
-
-            if config.shrew_async_stage3:
+            elif config.shrew_async_stage3:
                 if progress:
                     progress.emit(70, "Running structured extraction (async)...")
                     if progress.is_cancelled():
@@ -767,7 +1064,7 @@ def run_pipeline(
 
                 logger.info("Structured extraction: running metadata + summary + chunking in parallel")
                 with ThreadPoolExecutor(max_workers=3) as s3_exec:
-                    meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, num_pages, **s3_kwargs)
+                    meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs)
                     summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs)
                     chunk_f = s3_exec.submit(semantic_chunk, clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs)
                     metadata = meta_f.result()
@@ -779,7 +1076,7 @@ def run_pipeline(
                     if progress.is_cancelled():
                         raise CancelledException()
 
-                metadata = extract_metadata(clean_markdown, basename, input_path, stage3_vlm, num_pages, **s3_kwargs)
+                metadata = extract_metadata(clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs)
 
                 if progress:
                     progress.emit(80, "Generating summary...")

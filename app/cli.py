@@ -147,7 +147,7 @@ def main():
     )
     convert_parser.add_argument("--async-stage3", action="store_true", help="Run structured extraction tasks concurrently")
     convert_parser.add_argument("--skip-stage3", action="store_true", help="Skip structured extraction")
-    convert_parser.add_argument("--section-max-tokens", type=int, default=9000, help="Max tokens per section for chunking (default: 9000)")
+    convert_parser.add_argument("--section-max-tokens", type=int, default=6000, help="Max tokens per section for chunking (default: 6000)")
     convert_parser.add_argument("--pages", type=str, default=None, help="Page range (e.g., '1-5' or '3')")
     convert_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
 
