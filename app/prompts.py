@@ -8,6 +8,7 @@ Rules:
 - Headings: # for document title, ## for sections, ### for subsections. Determine level from visual weight.
 - Separate paragraphs with blank lines.
 - Preserve all text precisely — do not rephrase or omit anything.
+- Filler characters: runs of 3+ identical characters used as visual layout (dot leaders `. . . .`, dashes `-----`, underscores `_____`) carry no meaning. NEVER transcribe them. Use markdown table structure or whitespace to convey the relationship between elements they were padding. This rule does NOT apply to em/en dashes (— –), single hyphens in compound words, underscores in code/identifiers, or markdown horizontal rules used as section breaks.
 - Math: Use LaTeX for ALL math. $...$ for inline, $$...$$ for display equations. Use standard LaTeX: \\alpha, \\beta, \\epsilon for Greek letters. Subscripts: $x_{i}$, superscripts: $x^{2}$. Fractions: $\\frac{a}{b}$. Matrices: $\\begin{pmatrix}...\\end{pmatrix}$. Display equations with numbers: $$E = mc^2 \\tag{1}$$. No tags on inline math. ALL subscripts and superscripts in LaTeX, even in prose: $J_n$, $a_0$, $e^2$, $10^{-6}$. Preserve ALL symbols, operators, and notation precisely.
 - Chemical formulas: use Unicode subscripts (H₂O, CO₂).
 - Inline citations: use superscript numbers: <sup>1</sup>.
