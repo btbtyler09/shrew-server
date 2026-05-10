@@ -143,7 +143,7 @@ def main():
     convert_parser.add_argument(
         "--shrew-vllm-url",
         default=os.environ.get("SHREW_VLLM_URL"),
-        help="Shrew vLLM/llama.cpp URL for structured extraction (env: SHREW_VLLM_URL)",
+        help="Doc Processing model vLLM/llama.cpp URL for structured extraction (env: SHREW_VLLM_URL)",
     )
     convert_parser.add_argument("--async-stage3", action="store_true", help="Run structured extraction tasks concurrently")
     convert_parser.add_argument("--skip-stage3", action="store_true", help="Skip structured extraction")

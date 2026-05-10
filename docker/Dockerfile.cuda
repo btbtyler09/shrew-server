@@ -10,13 +10,9 @@ ADD https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q8
 ADD https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-BF16.gguf \
     /models/mmproj.gguf
 
-# Shrew LoRA adapters
-ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/extract_metadata/extract_metadata.gguf \
-    /models/adapters/extract_metadata.gguf
-ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/summarize_document/summarize_document.gguf \
-    /models/adapters/summarize_document.gguf
-ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/semantic_chunk/semantic_chunk.gguf \
-    /models/adapters/semantic_chunk.gguf
+# Document Processing LoRA adapter (unified)
+ADD https://huggingface.co/btbtyler09/shrew-2b/resolve/main/doc_processing/doc_processing.gguf \
+    /models/adapters/doc_processing.gguf
 
 HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]
 EXPOSE 8000
@@ -25,7 +21,7 @@ CMD ["--host", "0.0.0.0", "--port", "8000", \
      "--alias", "Qwen3.5-2B", \
      "--mmproj", "/models/mmproj.gguf", \
      "--lora-init-without-apply", \
-     "--lora", "/models/adapters/extract_metadata.gguf,/models/adapters/summarize_document.gguf,/models/adapters/semantic_chunk.gguf", \
+     "--lora", "/models/adapters/doc_processing.gguf", \
      "-fa", "on", \
      "--ctx-size", "100000", \
      "--parallel", "4"]

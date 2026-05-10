@@ -43,7 +43,7 @@ _STAGE_PARAMS = {
     },
     "structured": {
         # Match Qwen 3.x instruct-general-tasks recommendation. Running the
-        # shrew 2B outside this distribution (low temp, no top_p/k) was a
+        # 2B model outside this distribution (low temp, no top_p/k) was a
         # major source of malformed JSON from the chunking adapter.
         "temperature": 0.7,
         "extra": {"top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},

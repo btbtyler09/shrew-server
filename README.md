@@ -31,7 +31,7 @@ graph LR
     Client["Client"]
     Server["Shrew Server :8080<br><small>FastAPI · Heron-101 · LibreOffice</small>"]
     VLM["External VLM<br>Qwen3.5-35B, OpenRouter, etc."]
-    Model["Shrew Model :8000 (optional)<br><small>llama.cpp · Qwen3.5-2B · LoRA adapters</small>"]
+    Model["Doc Processing Model :8000 (optional)<br><small>llama.cpp · Qwen3.5-2B · doc_processing LoRA</small>"]
 
     Client -- "document" --> Server
     Server -- "page images" --> VLM
@@ -42,7 +42,7 @@ graph LR
 ```
 
 - **External VLM** (required) — A large VLM like Qwen3.5-35B for page transcription. You provide this (vLLM, llama.cpp, OpenRouter, etc.).
-- **Shrew Model** (optional) — A small Qwen3.5-2B with fine-tuned LoRA adapters for structured extraction (metadata, summary, chunking). Runs locally via llama.cpp. If not available, the main VLM handles extraction instead. *Note: semantic chunking is currently in beta.*
+- **Doc Processing Model** (optional) — A small Qwen3.5-2B with a fine-tuned `doc_processing` LoRA adapter for structured extraction (metadata, summary, chunking). Runs locally via llama.cpp. If not available, the main VLM handles extraction instead. *Note: semantic chunking is currently in beta.*
 
 ## Quick start
 
@@ -76,7 +76,7 @@ cp .env.example .env
 # Server only (connects to your external VLM)
 docker compose -f docker-compose.yml up -d --build
 
-# Server + Shrew 2B model on NVIDIA GPU
+# Server + Doc Processing model on NVIDIA GPU
 docker compose -f docker-compose.yml -f docker-compose.cuda.yml up -d --build
 
 # View logs
@@ -92,11 +92,11 @@ Other GPU variants: replace `docker-compose.cuda.yml` with `docker-compose.rocm.
 | Variant | Dockerfile | Base image | Purpose |
 |---------|-----------|------------|---------|
 | **server** | `Dockerfile.server` | `python:3.12-slim` | Shrew API + figure detection + LibreOffice |
-| **cuda** | `Dockerfile.cuda` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Shrew 2B model on NVIDIA GPU |
-| **rocm** | `Dockerfile.rocm` | `ghcr.io/ggml-org/llama.cpp:server-rocm` | Shrew 2B model on AMD GPU |
-| **vulkan** | `Dockerfile.vulkan` | `ghcr.io/ggml-org/llama.cpp:server-vulkan` | Shrew 2B model on any Vulkan GPU |
+| **cuda** | `Dockerfile.cuda` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Doc Processing model on NVIDIA GPU |
+| **rocm** | `Dockerfile.rocm` | `ghcr.io/ggml-org/llama.cpp:server-rocm` | Doc Processing model on AMD GPU |
+| **vulkan** | `Dockerfile.vulkan` | `ghcr.io/ggml-org/llama.cpp:server-vulkan` | Doc Processing model on any Vulkan GPU |
 
-The **server** container always runs. Pick one GPU variant for the Shrew 2B model, or skip it to use your main VLM for everything.
+The **server** container always runs. Pick one GPU variant for the Doc Processing model, or skip it to use your main VLM for everything.
 
 ### Running with Docker Compose
 
@@ -104,7 +104,7 @@ The **server** container always runs. Pick one GPU variant for the Shrew 2B mode
 # Copy environment template
 cp docker/.env.example docker/.env
 
-# Server only — no local Shrew model, main VLM handles everything
+# Server only — no local Doc Processing model, main VLM handles everything
 docker compose -f docker/docker-compose.yml up server
 
 # NVIDIA GPU
@@ -127,9 +127,9 @@ docker run -p 8080:8080 \
   -e VLM_MODEL=Qwen/Qwen3.5-35B \
   shrew-server
 
-# Build and run Shrew model separately (CUDA example)
-docker build -f docker/Dockerfile.cuda -t shrew-model .
-docker run -p 8000:8000 --gpus all shrew-model
+# Build and run Doc Processing model separately (CUDA example)
+docker build -f docker/Dockerfile.cuda -t doc-processing .
+docker run -p 8000:8000 --gpus all doc-processing
 ```
 
 ### Environment variables
@@ -143,7 +143,7 @@ Configure in `docker/.env` or pass with `-e`:
 | `VLM_API_KEY` | API key for VLM endpoint (needed for OpenRouter) | — |
 | `VLM_CONCURRENCY` | Max concurrent VLM calls across all workers (cross-process gate) | `4` |
 | `PIPELINE_CONCURRENCY` | Max concurrent document pipelines | `3` |
-| `SHREW_VLLM_URL` | URL of Shrew 2B model (set automatically by compose) | — |
+| `SHREW_VLLM_URL` | URL of Doc Processing model (set automatically by compose) | — |
 | `SHREW_ASYNC_STAGE3` | Run extraction tasks in parallel (set automatically by compose) | — |
 | `VLM_TIMEOUT_MARGIN` | Multiplier for adaptive timeout threshold (e.g. `1.5` = 50% above observed max) | `1.5` |
 | `SECTION_MAX_TOKENS` | Max tokens per section for semantic chunking | `9000` |
@@ -169,12 +169,12 @@ Parameters you can adjust in the Dockerfiles for your hardware:
 - `PIPELINE_CONCURRENCY` — How many documents process simultaneously per worker. All pipelines share the global `VLM_CONCURRENCY` gate, so this controls how many documents compete for VLM slots. Default `3`.
 - `VLM_TIMEOUT_MARGIN` — Multiplier for the adaptive timeout. Shrew tracks per-page VLM response times and flags pages that exceed `max_observed * margin` as outliers for retry. Default `1.5` (50% above max). Increase if your VLM has high latency variance under load.
 
-**Model container** (`Dockerfile.cuda` / `Dockerfile.rocm` / `Dockerfile.vulkan`):
-- `--ctx-size 100000` — Total context window shared across all parallel slots. llama.cpp pre-allocates KV cache at startup (unlike vLLM which allocates on demand), so this is divided evenly: `--parallel 4` gives 25000 tokens per slot. The Shrew 2B model needs ~9000 tokens for semantic chunking, so 25k per slot is sufficient.
+**Doc Processing model container** (`Dockerfile.cuda` / `Dockerfile.rocm` / `Dockerfile.vulkan`):
+- `--ctx-size 100000` — Total context window shared across all parallel slots. llama.cpp pre-allocates KV cache at startup (unlike vLLM which allocates on demand), so this is divided evenly: `--parallel 4` gives 25000 tokens per slot. The Doc Processing model needs ~9000 tokens for semantic chunking, so 25k per slot is sufficient.
 - `--parallel 4` — Concurrent request slots in llama.cpp. Each slot gets `ctx-size / parallel` tokens. Reduce if you're tight on VRAM.
 - Base model quantization — The default `Q8_K_XL` (~2.5 GB) is high quality. For smaller VRAM, swap the `ADD` URL for a Q4 quantization from [unsloth/Qwen3.5-2B-GGUF](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF).
 
-**Rough VRAM requirements for the Shrew 2B model container:**
+**Rough VRAM requirements for the Doc Processing model container:**
 
 | Config | VRAM |
 |--------|------|
@@ -271,7 +271,7 @@ shrew convert scan.tiff -o output/ --vlm-model Qwen/Qwen3.5-35B
 # Specific pages, skip structured extraction
 shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B --skip-stage3 --pages 1-5
 
-# With Shrew 2B model for structured extraction
+# With Doc Processing model for structured extraction
 shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B \
   --shrew-vllm-url http://localhost:8000 --async-stage3
 ```

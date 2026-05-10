@@ -35,6 +35,22 @@ from .vlm_client import VLMClient
 logger = logging.getLogger("shrew.server")
 
 
+# ── Adapter constants ───────────────────────────────────────────────────────
+
+UNIFIED_ADAPTER_NAMES = ("doc_processing", "shrew")
+STAGE3_TASKS = ("extract_metadata", "summarize_document", "semantic_chunk")
+
+
+def _normalize_unified_adapter(adapter_map: dict) -> Optional[tuple[dict, str]]:
+    """Expand a unified adapter (one entry named `doc_processing` or `shrew`)
+    into a per-task map. Returns (expanded_map, detected_name) or None."""
+    for name in UNIFIED_ADAPTER_NAMES:
+        if name in adapter_map:
+            expanded = {task: adapter_map[name] for task in STAGE3_TASKS}
+            return expanded, name
+    return None
+
+
 # ── Configuration ────────────────────────────────────────────────────────────
 
 
@@ -166,10 +182,20 @@ async def lifespan(app: FastAPI):
                 pass
 
         if _shrew_lora_map:
-            logger.info(f"Shrew vLLM: {_config.shrew_vllm_url} ({_shrew_lora_format} format)")
+            logger.info(f"Doc Processing model: {_config.shrew_vllm_url} ({_shrew_lora_format} format)")
             logger.info(f"  Adapters: {list(_shrew_lora_map.keys())}")
+            normalized = _normalize_unified_adapter(_shrew_lora_map)
+            if normalized is not None:
+                _shrew_lora_map, detected = normalized
+                logger.info(f"  Unified adapter detected: {detected} → routing all Stage 3 tasks")
+            else:
+                logger.warning(
+                    f"  No unified adapter ({' or '.join(UNIFIED_ADAPTER_NAMES)}) "
+                    f"found among {list(_shrew_lora_map.keys())} — falling back to main VLM"
+                )
+                _shrew_lora_map = None
         else:
-            logger.warning(f"Shrew vLLM: {_config.shrew_vllm_url} — no adapters found")
+            logger.warning(f"Doc Processing model: {_config.shrew_vllm_url} — no adapters found")
 
     startup_time = time.time() - start
     logger.info(f"Server ready in {startup_time:.1f}s")

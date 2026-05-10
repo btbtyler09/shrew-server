@@ -330,7 +330,7 @@ def _classify_figure_crop(
     b64_data = base64.b64encode(buf.getvalue()).decode("utf-8")
     data_uri = f"data:image/png;base64,{b64_data}"
 
-    # Use Shrew 2B when available, fall back to main VLM
+    # Use Doc Processing model when available, fall back to main VLM
     if not config.accurate and config.shrew_vllm_url:
         vlm = VLMClient(base_url=config.shrew_vllm_url, model="Qwen3.5-2B")
     else:
