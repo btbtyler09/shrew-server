@@ -306,7 +306,13 @@ output/
 | GIF | `.gif` | First frame only |
 | Word | `.docx`, `.doc` | Converted to PDF via LibreOffice |
 | PowerPoint | `.pptx`, `.ppt` | One slide per page |
-| OpenDocument | `.odt`, `.odp` | Converted to PDF via LibreOffice |
+| OpenDocument text/presentation | `.odt`, `.odp` | Converted to PDF via LibreOffice |
+| Excel / OpenDocument spreadsheet | `.xlsx`, `.xls`, `.ods` | One sheet per page (LibreOffice `SinglePageSheets`); transcribed to markdown tables; semantic chunking skipped |
+| CSV | `.csv` | Rendered directly as a markdown table; no transcription; semantic chunking skipped |
+| Plain text | `.txt` | Read directly; no transcription |
+| Markdown | `.md` | Read directly; no transcription |
+| RTF | `.rtf` | Converted to plain text via LibreOffice; no transcription |
+| HTML | `.html`, `.htm` | Parsed with BeautifulSoup (scripts/styles stripped), converted to markdown; no transcription |
 
 ## License
 

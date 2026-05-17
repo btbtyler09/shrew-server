@@ -24,7 +24,8 @@ from PIL import Image
 from .docling_client import create_figure_converter, detect_figures
 from .models import PipelineConfig, PipelineResult
 from .prompts import DIRECT_CONVERT_PROMPT, FIGURE_CLASSIFY_PROMPT
-from .rasterizer import prepare_pages
+from .rasterizer import classify_file, prepare_pages
+from .text_extract import extract_text
 from .structured import (
     _approx_tokens,
     chunk_one_section,
@@ -590,6 +591,157 @@ def _process_one_page(
 # ── VLM Pipeline ────────────────────────────────────────────────────────────
 
 
+def _build_stage3_client(config: PipelineConfig):
+    """Build (stage3_vlm, s3_kwargs, s3_fallback_kwargs) for Stage 3 calls.
+
+    Mirrors the setup used by the main pipeline path.
+    """
+    main_vlm_fallback: Optional[VLMClient] = None
+    if not config.accurate and config.shrew_vllm_url:
+        logger.info("Structured extraction: fast mode via Shrew vLLM")
+        stage3_vlm = VLMClient(
+            base_url=config.shrew_vllm_url, model="Qwen3.5-2B",
+        )
+        s3_lora = config.shrew_lora_map
+        s3_lora_fmt = config.shrew_lora_format
+        main_vlm_fallback = VLMClient(
+            base_url=config.vlm_url, model=config.vlm_model,
+            api_key=config.api_key,
+        )
+    else:
+        logger.info("Structured extraction: main VLM")
+        stage3_vlm = VLMClient(
+            base_url=config.vlm_url, model=config.vlm_model,
+            api_key=config.api_key,
+        )
+        s3_lora = None
+        s3_lora_fmt = "none"
+    s3_kwargs = dict(lora_adapters=s3_lora, lora_format=s3_lora_fmt)
+    s3_fallback_kwargs = dict(
+        fallback_vlm_client=main_vlm_fallback,
+        fallback_lora_adapters=None,
+        fallback_lora_format="none",
+    )
+    return stage3_vlm, s3_kwargs, s3_fallback_kwargs
+
+
+def _run_text_pipeline(
+    input_path: str,
+    output_dir: str,
+    config: PipelineConfig,
+    input_class: str,
+    start_time: float,
+    basename: str,
+    progress=None,
+) -> PipelineResult:
+    """Pipeline for text-family inputs (txt/md/rtf/html/csv/eml/msg/xlsx/xls/ods).
+
+    Bypasses rasterization and VLM transcription. Reads the source directly
+    into clean_markdown and runs Stage 3 (skipping semantic_chunk for tabular
+    classes — csv and spreadsheet — via config.skip_chunking).
+    """
+    if progress:
+        progress.emit(10, f"Reading {input_class} input...")
+
+    extract_start = time.time()
+    clean_markdown = extract_text(input_path, input_class, output_dir)
+    extract_time = time.time() - extract_start
+    logger.info(
+        f"Text extraction complete: {input_class}, "
+        f"{len(clean_markdown)} chars ({extract_time:.2f}s)"
+    )
+
+    md_out_path = os.path.join(output_dir, "clean.md")
+    with open(md_out_path, "w", encoding="utf-8") as f:
+        f.write(clean_markdown)
+
+    structured_json: dict = {}
+    stage3_time = 0.0
+    n_pages = 1
+
+    if not config.skip_stage3:
+        if progress:
+            progress.emit(30, "Running structured extraction...")
+
+        stage3_start = time.time()
+        stage3_vlm, s3_kwargs, s3_fallback_kwargs = _build_stage3_client(config)
+
+        metadata = extract_metadata(
+            clean_markdown, basename, input_path, stage3_vlm, n_pages,
+            **s3_kwargs, **s3_fallback_kwargs,
+        )
+        if progress:
+            progress.emit(60, "Generating summary...")
+        summary = generate_summary(
+            clean_markdown, stage3_vlm,
+            **s3_kwargs, **s3_fallback_kwargs,
+        )
+
+        if config.skip_chunking:
+            logger.info("semantic_chunk: SKIPPED (skip_chunking)")
+            chunks: list = []
+        else:
+            if progress:
+                progress.emit(85, "Chunking document...")
+            chunks = semantic_chunk(
+                clean_markdown, stage3_vlm,
+                section_max_tokens=config.section_max_tokens,
+                **s3_kwargs, **s3_fallback_kwargs,
+            )
+
+        metadata["num_chunks"] = len(chunks)
+        stage3_time = time.time() - stage3_start
+        logger.info(
+            f"Structured extraction complete: {len(chunks)} chunks, "
+            f"{stage3_time:.1f}s"
+        )
+
+        structured_json.update({
+            "metadata": metadata,
+            "summary": summary,
+            "semantic_chunks": chunks,
+        })
+
+        json_out_path = os.path.join(output_dir, "structured.json")
+        with open(json_out_path, "w", encoding="utf-8") as f:
+            json.dump(structured_json, f, indent=2)
+    else:
+        logger.info("Structured extraction: SKIPPED (--skip-stage3)")
+
+    total_time = time.time() - start_time
+    processing_log = {
+        "input_file": input_path,
+        "output_dir": output_dir,
+        "total_pages": n_pages,
+        "total_figures": 0,
+        "raster_time_seconds": 0.0,
+        "figure_init_seconds": 0.0,
+        "process_time_seconds": extract_time,
+        "stage3_time_seconds": stage3_time,
+        "total_time_seconds": total_time,
+        "config": {
+            "vlm_url": config.vlm_url,
+            "vlm_model": config.vlm_model,
+            "high_dpi": config.high_dpi,
+            "vlm_concurrency": config.vlm_concurrency,
+        },
+    }
+    log_path = os.path.join(output_dir, "processing_log.json")
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(processing_log, f, indent=2)
+
+    logger.info(f"{'=' * 60}")
+    logger.info(f"PIPELINE COMPLETE: {basename} ({input_class})")
+    logger.info(f"  Time: {total_time:.1f}s")
+    logger.info(f"{'=' * 60}")
+
+    return PipelineResult(
+        clean_markdown=clean_markdown,
+        structured_json=structured_json,
+        processing_log=processing_log,
+    )
+
+
 def run_pipeline(
     input_path: str,
     output_dir: str,
@@ -620,6 +772,17 @@ def run_pipeline(
     logger.info(f"{'=' * 60}")
     logger.info(f"SHREW PIPELINE: {basename}")
     logger.info(f"{'=' * 60}")
+
+    # ── Text-family early branch: bypass rasterize + transcribe ─────────────
+    input_class = classify_file(input_path)
+    if input_class in {"text", "csv", "spreadsheet"}:
+        return _run_text_pipeline(
+            input_path, output_dir, config,
+            input_class=input_class,
+            start_time=start_time,
+            basename=basename,
+            progress=progress,
+        )
 
     # ── Step 1: Prepare page images ─────────────────────────────────────────
     if progress:
@@ -677,7 +840,9 @@ def run_pipeline(
         metrics = PageMetrics(vlm_concurrency=config.vlm_concurrency)
 
         # ── Streaming Stage 3 setup ────────────────────────────────────────
-        streaming_active = _STREAM_STAGE3 and not skip_stage3
+        streaming_active = (
+            _STREAM_STAGE3 and not skip_stage3 and not config.skip_chunking
+        )
         page_completed = threading.Condition()
         cancel_event = threading.Event()
         section_queue: queue.Queue = queue.Queue()
@@ -1040,14 +1205,18 @@ def run_pipeline(
 
             if streaming_active:
                 from .structured import _dedup_consecutive_chunks
-                if heading_changes and all_chunks:
-                    edits = patch_chunk_headings(all_chunks, heading_changes)
-                    if edits:
-                        logger.info(
-                            f"Patched {edits} heading levels in chunk content "
-                            f"after final fix_heading_hierarchy"
-                        )
-                chunks = _dedup_consecutive_chunks(list(all_chunks))
+                if config.skip_chunking:
+                    logger.info("semantic_chunk: SKIPPED (skip_chunking, streaming)")
+                    chunks: list = []
+                else:
+                    if heading_changes and all_chunks:
+                        edits = patch_chunk_headings(all_chunks, heading_changes)
+                        if edits:
+                            logger.info(
+                                f"Patched {edits} heading levels in chunk content "
+                                f"after final fix_heading_hierarchy"
+                            )
+                    chunks = _dedup_consecutive_chunks(list(all_chunks))
                 metadata = metadata_result_holder[0] or {
                     "title": None, "authors": [], "organization": None,
                     "year": None, "type": None, "keywords": [],
@@ -1076,14 +1245,23 @@ def run_pipeline(
                     if progress.is_cancelled():
                         raise CancelledException()
 
-                logger.info("Structured extraction: running metadata + summary + chunking in parallel")
-                with ThreadPoolExecutor(max_workers=3) as s3_exec:
-                    meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs)
-                    summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
-                    chunk_f = s3_exec.submit(semantic_chunk, clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
-                    metadata = meta_f.result()
-                    summary = summ_f.result()
-                    chunks = chunk_f.result()
+                if config.skip_chunking:
+                    logger.info("Structured extraction: running metadata + summary in parallel (chunking skipped)")
+                    with ThreadPoolExecutor(max_workers=2) as s3_exec:
+                        meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs)
+                        summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
+                        metadata = meta_f.result()
+                        summary = summ_f.result()
+                        chunks = []
+                else:
+                    logger.info("Structured extraction: running metadata + summary + chunking in parallel")
+                    with ThreadPoolExecutor(max_workers=3) as s3_exec:
+                        meta_f = s3_exec.submit(extract_metadata, clean_markdown, basename, input_path, stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs)
+                        summ_f = s3_exec.submit(generate_summary, clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
+                        chunk_f = s3_exec.submit(semantic_chunk, clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
+                        metadata = meta_f.result()
+                        summary = summ_f.result()
+                        chunks = chunk_f.result()
             else:
                 if progress:
                     progress.emit(70, "Extracting metadata...")
@@ -1099,12 +1277,16 @@ def run_pipeline(
 
                 summary = generate_summary(clean_markdown, stage3_vlm, **s3_kwargs, **s3_fallback_kwargs)
 
-                if progress:
-                    progress.emit(90, "Chunking document...")
-                    if progress.is_cancelled():
-                        raise CancelledException()
+                if config.skip_chunking:
+                    logger.info("semantic_chunk: SKIPPED (skip_chunking)")
+                    chunks = []
+                else:
+                    if progress:
+                        progress.emit(90, "Chunking document...")
+                        if progress.is_cancelled():
+                            raise CancelledException()
 
-                chunks = semantic_chunk(clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
+                    chunks = semantic_chunk(clean_markdown, stage3_vlm, section_max_tokens=config.section_max_tokens, **s3_kwargs, **s3_fallback_kwargs)
 
             metadata["num_chunks"] = len(chunks)
             stage3_time = time.time() - stage3_start

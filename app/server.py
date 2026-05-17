@@ -28,7 +28,14 @@ from sse_starlette.sse import EventSourceResponse
 from .cli import parse_page_range
 from .models import PipelineConfig, PipelineResult
 from .pipeline import CancelledException, run_pipeline
-from .rasterizer import IMAGE_EXTENSIONS, OFFICE_EXTENSIONS
+from .rasterizer import (
+    CSV_EXTENSION,
+    IMAGE_EXTENSIONS,
+    OFFICE_EXTENSIONS,
+    SPREADSHEET_EXTENSIONS,
+    TEXT_EXTENSIONS,
+    classify_file,
+)
 from .progress import ProgressReporter
 from .vlm_client import VLMClient
 
@@ -239,7 +246,11 @@ async def health():
     return {"status": "ok"}
 
 
-_SUPPORTED_EXTENSIONS = {".pdf"} | IMAGE_EXTENSIONS | OFFICE_EXTENSIONS
+_SUPPORTED_EXTENSIONS = (
+    {".pdf"} | IMAGE_EXTENSIONS | OFFICE_EXTENSIONS
+    | SPREADSHEET_EXTENSIONS | TEXT_EXTENSIONS | {CSV_EXTENSION}
+)
+_SKIP_CHUNKING_CLASSES = {"spreadsheet", "csv"}
 
 
 def _save_upload(upload: UploadFile) -> str:
@@ -317,6 +328,8 @@ async def convert(
         os.unlink(tmp_path)
         raise
 
+    skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
+
     async with _pipeline_sem:
         try:
             loop = asyncio.get_running_loop()
@@ -327,6 +340,7 @@ async def convert(
                 high_dpi=high_dpi,
                 vlm_concurrency=_config.vlm_concurrency,
                 skip_stage3=skip_stage3,
+                skip_chunking=skip_chunking,
                 page_range=page_range,
                 accurate=not _config.shrew_vllm_url,
                 shrew_vllm_url=_config.shrew_vllm_url,
@@ -404,6 +418,8 @@ async def convert_stream(
         os.unlink(tmp_path)
         raise
 
+    skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
+
     progress = ProgressReporter()
 
     def run_in_thread():
@@ -416,6 +432,7 @@ async def convert_stream(
                 high_dpi=high_dpi,
                 vlm_concurrency=_config.vlm_concurrency,
                 skip_stage3=skip_stage3,
+                skip_chunking=skip_chunking,
                 page_range=page_range,
                 accurate=not _config.shrew_vllm_url,
                 shrew_vllm_url=_config.shrew_vllm_url,

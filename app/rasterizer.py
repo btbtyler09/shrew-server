@@ -1,9 +1,12 @@
 """Document page rasterization and format conversion.
 
-Supports three input categories:
+Supports three input categories that need page images:
 - PDF: rasterize via pypdfium2 (two resolutions per page)
 - Images: create page structure directly via Pillow (multi-page TIFF supported)
 - Office docs: convert to PDF via LibreOffice headless, then rasterize
+
+Text-family inputs (txt/md/rtf/html/csv/eml/msg, plus spreadsheets) bypass
+this module entirely — see text_extract.py and spreadsheet_extract.py.
 """
 
 import logging
@@ -18,6 +21,9 @@ logger = logging.getLogger("shrew.rasterizer")
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".doc", ".ppt", ".odt", ".odp"}
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".ods"}
+TEXT_EXTENSIONS = {".txt", ".md", ".rtf", ".html", ".htm", ".eml", ".msg"}
+CSV_EXTENSION = ".csv"
 
 # Cap image dimensions to prevent OOM
 MAX_IMAGE_DIM = 10000
@@ -26,7 +32,7 @@ MAX_IMAGE_DIM = 10000
 def classify_file(file_path: str) -> str:
     """Classify input file by extension.
 
-    Returns 'pdf', 'image', or 'office'.
+    Returns 'pdf', 'image', 'office', 'spreadsheet', 'text', or 'csv'.
     Raises ValueError for unsupported extensions.
     """
     ext = os.path.splitext(file_path)[1].lower()
@@ -36,11 +42,18 @@ def classify_file(file_path: str) -> str:
         return "image"
     if ext in OFFICE_EXTENSIONS:
         return "office"
+    if ext in SPREADSHEET_EXTENSIONS:
+        return "spreadsheet"
+    if ext in TEXT_EXTENSIONS:
+        return "text"
+    if ext == CSV_EXTENSION:
+        return "csv"
     raise ValueError(f"Unsupported file type: {ext}")
 
 
 def convert_office_to_pdf(office_path: str, output_dir: str) -> str:
-    """Convert an office document to PDF using LibreOffice headless.
+    """Convert an office document (docx/pptx/odt/odp/doc/ppt) to PDF
+    using LibreOffice headless.
 
     Returns path to the converted PDF file.
     Raises RuntimeError if LibreOffice is not installed or conversion fails.
@@ -184,8 +197,13 @@ def prepare_pages(
 
     if file_type == "office":
         file_path = convert_office_to_pdf(file_path, output_dir)
+    elif file_type in {"text", "csv", "spreadsheet"}:
+        raise ValueError(
+            f"Text/CSV/spreadsheet input should bypass prepare_pages "
+            f"(file_type={file_type})"
+        )
 
-    # PDF path (original or converted from office)
+    # PDF path (original or converted from office/spreadsheet)
     total_pages, page_dims = get_page_count_and_dims(file_path)
     page_images = rasterize_pages(file_path, output_dir, low_dpi, high_dpi, page_range)
     return page_images, total_pages, page_dims

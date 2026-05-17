@@ -53,6 +53,7 @@ class PipelineConfig:
     shrew_lora_format: str = "none"
     shrew_async_stage3: bool = False
     skip_stage3: bool = False
+    skip_chunking: bool = False
     section_max_tokens: int = 6000
     vlm_concurrency: int = 4
     page_range: Optional[tuple[int, int]] = None
