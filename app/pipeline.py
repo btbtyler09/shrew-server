@@ -854,6 +854,8 @@ def run_pipeline(
         first_section_text_holder = [""]
         metadata_result_holder: list = [None]
         summary_result_holder: list = [None]
+        metadata_done_event = threading.Event()
+        summary_done_event = threading.Event()
         streamer_threads: list[threading.Thread] = []
         stage3_vlm = None
         s3_lora = None
@@ -974,28 +976,34 @@ def run_pipeline(
                         logger.error(f"Streaming chunk worker failed on section {idx}: {e}")
 
             def metadata_worker() -> None:
-                first_section_event.wait()
-                if cancel_event.is_set() or not first_section_text_holder[0]:
-                    return
                 try:
-                    metadata_result_holder[0] = extract_metadata(
-                        first_section_text_holder[0], basename, input_path,
-                        stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs,
-                    )
-                except Exception as e:
-                    logger.error(f"Streaming metadata worker failed: {e}")
+                    first_section_event.wait()
+                    if cancel_event.is_set() or not first_section_text_holder[0]:
+                        return
+                    try:
+                        metadata_result_holder[0] = extract_metadata(
+                            first_section_text_holder[0], basename, input_path,
+                            stage3_vlm, n_pages, **s3_kwargs, **s3_fallback_kwargs,
+                        )
+                    except Exception as e:
+                        logger.error(f"Streaming metadata worker failed: {e}")
+                finally:
+                    metadata_done_event.set()
 
             def summary_worker() -> None:
-                first_section_event.wait()
-                if cancel_event.is_set() or not first_section_text_holder[0]:
-                    return
                 try:
-                    summary_result_holder[0] = generate_summary(
-                        first_section_text_holder[0], stage3_vlm,
-                        **s3_kwargs, **s3_fallback_kwargs,
-                    )
-                except Exception as e:
-                    logger.error(f"Streaming summary worker failed: {e}")
+                    first_section_event.wait()
+                    if cancel_event.is_set() or not first_section_text_holder[0]:
+                        return
+                    try:
+                        summary_result_holder[0] = generate_summary(
+                            first_section_text_holder[0], stage3_vlm,
+                            **s3_kwargs, **s3_fallback_kwargs,
+                        )
+                    except Exception as e:
+                        logger.error(f"Streaming summary worker failed: {e}")
+                finally:
+                    summary_done_event.set()
 
             for tgt in (page_streamer, chunk_worker, metadata_worker, summary_worker):
                 t = threading.Thread(target=tgt, name=f"shrew_{tgt.__name__}", daemon=True)
@@ -1060,7 +1068,9 @@ def run_pipeline(
                     )
                     chunk_pct = sections_chunked[0] / est_sections if est_sections else 0
                     combined = page_pct * 0.7 + chunk_pct * 0.3
-                    pct = 5 + int(85 * min(combined, 1.0))
+                    # Cap at 80 to leave 80-90 for the per-task drain phase
+                    # (metadata/summary/chunking section X/N).
+                    pct = 5 + int(75 * min(combined, 1.0))
                 else:
                     upper = 85 if skip_stage3 else 60
                     pct = 5 + int((upper - 5) * pages_done / n_pages)
@@ -1084,12 +1094,40 @@ def run_pipeline(
                 f"after all retries (pages: {failed_pages})"
             )
 
-        # Wait for streaming workers to drain
+        # Drain streaming workers with per-task progress.
+        # Workers ran in parallel with transcription; whatever's still alive
+        # now is the trailing tail — surface it as discrete progress messages
+        # instead of one opaque "Finishing structured extraction".
         if streaming_active:
-            if progress:
-                progress.emit(85, "Finishing structured extraction...")
+            last_emitted: Optional[tuple] = None
+
+            def _drain_emit(pct: int, msg: str) -> None:
+                nonlocal last_emitted
+                key = (pct, msg)
+                if key != last_emitted and progress:
+                    progress.emit(pct, msg)
+                    last_emitted = key
+
+            while any(t.is_alive() for t in streamer_threads):
+                if progress and progress.is_cancelled():
+                    cancel_event.set()
+                    raise CancelledException()
+                if not metadata_done_event.is_set():
+                    _drain_emit(80, "Extracting metadata...")
+                elif not summary_done_event.is_set():
+                    _drain_emit(83, "Generating summary...")
+                else:
+                    n = sections_emitted_total[0]
+                    x = min(sections_chunked[0] + 1, n) if n else 0
+                    if n > 0:
+                        pct = 83 + int(7 * sections_chunked[0] / n)
+                        _drain_emit(pct, f"Chunking section {x}/{n}...")
+                    else:
+                        _drain_emit(89, "Finalizing chunks...")
+                time.sleep(0.25)
+
             for t in streamer_threads:
-                t.join()
+                t.join(timeout=5)
             logger.info(
                 f"Streaming Stage 3 drained: {len(all_chunks)} chunks across "
                 f"{sections_emitted_total[0]} sections"
