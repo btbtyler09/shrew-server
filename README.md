@@ -307,7 +307,7 @@ output/
 | Word | `.docx`, `.doc` | Converted to PDF via LibreOffice |
 | PowerPoint | `.pptx`, `.ppt` | One slide per page |
 | OpenDocument text/presentation | `.odt`, `.odp` | Converted to PDF via LibreOffice |
-| Excel / OpenDocument spreadsheet | `.xlsx`, `.xls`, `.ods` | One sheet per page (LibreOffice `SinglePageSheets`); transcribed to markdown tables; semantic chunking skipped |
+| Excel / OpenDocument spreadsheet | `.xlsx`, `.xlsm`, `.xls`, `.ods` | Extracted deterministically via openpyxl (per-sheet markdown tables + chart metadata); no transcription; semantic chunking skipped |
 | CSV | `.csv` | Rendered directly as a markdown table; no transcription; semantic chunking skipped |
 | Plain text | `.txt` | Read directly; no transcription |
 | Markdown | `.md` | Read directly; no transcription |

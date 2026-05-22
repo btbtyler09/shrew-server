@@ -21,7 +21,7 @@ logger = logging.getLogger("shrew.rasterizer")
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".doc", ".ppt", ".odt", ".odp"}
-SPREADSHEET_EXTENSIONS = {".xlsx", ".xls", ".ods"}
+SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm", ".xls", ".ods"}
 TEXT_EXTENSIONS = {".txt", ".md", ".rtf", ".html", ".htm", ".eml", ".msg"}
 CSV_EXTENSION = ".csv"
 

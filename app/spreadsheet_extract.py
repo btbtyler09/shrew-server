@@ -1,11 +1,12 @@
-"""Spreadsheet (xlsx/xls/ods) extraction.
+"""Spreadsheet (xlsx/xlsm/xls/ods) extraction.
 
 Reads workbooks deterministically via openpyxl, emitting per-sheet markdown:
 - Data sheets become GFM tables (merged cells flattened by value-repetition).
 - Chart sheets become text blocks describing title, type, axis labels, and series.
 - Mixed sheets emit both.
 
-Non-xlsx inputs (.xls, .ods) are converted to .xlsx via LibreOffice first.
+.xlsx and .xlsm load directly (same OOXML container); legacy .xls and .ods
+are converted to .xlsx via LibreOffice first.
 """
 
 import logging
@@ -385,12 +386,15 @@ def _classify_sheet(ws) -> str:
 
 
 def extract_spreadsheet(path: str, output_dir: str) -> str:
-    """Extract a spreadsheet (.xlsx/.xls/.ods) to per-sheet markdown."""
+    """Extract a spreadsheet (.xlsx/.xlsm/.xls/.ods) to per-sheet markdown."""
     from openpyxl import load_workbook
 
     ext = os.path.splitext(path)[1].lower()
     work_path = path
-    if ext != ".xlsx":
+    # .xlsm is the same OOXML container as .xlsx (plus a VBA macro part that
+    # openpyxl ignores on read), so both load directly. Only legacy .xls and
+    # .ods need a LibreOffice round-trip.
+    if ext not in {".xlsx", ".xlsm"}:
         work_path = _convert_to_xlsx(path, output_dir)
 
     try:

@@ -1,6 +1,6 @@
 """Text-family input extraction.
 
-Reads txt/md/rtf/html/csv/eml/msg/xlsx/xls/ods into a markdown string for
+Reads txt/md/rtf/html/csv/eml/msg/xlsx/xlsm/xls/ods into a markdown string for
 the Stage 3 pipeline, bypassing rasterization and VLM transcription.
 """
 
@@ -232,7 +232,7 @@ def extract_text(path: str, file_type: str, output_dir: str) -> str:
         return extract_eml(path)
     if ext == ".msg":
         return extract_msg(path)
-    if ext in {".xlsx", ".xls", ".ods"}:
+    if ext in {".xlsx", ".xlsm", ".xls", ".ods"}:
         from .spreadsheet_extract import extract_spreadsheet
         return extract_spreadsheet(path, output_dir)
     raise ValueError(f"extract_text: unsupported extension {ext}")
