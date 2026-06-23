@@ -184,29 +184,25 @@ def extract_eml(path: str) -> str:
 
 def extract_msg(path: str) -> str:
     """Parse a .msg Outlook message into a markdown preamble + body."""
-    from msg_parser import MsOxMessage
+    from .msg_extract import read_msg
 
-    msg = MsOxMessage(path)
+    fields = read_msg(path)
 
-    recipients_to = msg.to
-    if not recipients_to and msg.recipients:
+    recipients_to = fields["to"]
+    if not recipients_to and fields["recipients"]:
         recipients_to = ", ".join(
-            r.EmailAddress or r.DisplayName or ""
-            for r in msg.recipients
-            if (getattr(r, "RecipientType", None) or "TO") == "TO"
+            r["email"] or r["name"] or "" for r in fields["recipients"]
         ).strip(", ")
 
-    attachments = [
-        a.Filename for a in (msg.attachments or []) if getattr(a, "Filename", None)
-    ]
-    body = _html_or_text_to_markdown(msg.body or "")
+    body_source = fields["html"] or fields["body"] or ""
+    body = _html_or_text_to_markdown(body_source)
     preamble = _format_email_preamble(
-        msg.subject,
-        msg.sender,
+        fields["subject"],
+        fields["sender"],
         recipients_to,
-        msg.cc,
-        msg.sent_date,
-        attachments,
+        fields["cc"],
+        fields["sent_date"],
+        fields["attachments"],
     )
     return f"{preamble}\n\n{body}".strip() if preamble else body
 
