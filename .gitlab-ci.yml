@@ -2,16 +2,21 @@ stages:
   - test
 
 variables:
-  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 pytest:
   stage: test
-  image: python:3.12-slim
-  cache:
-    key: pip-py312
-    paths:
-      - .cache/pip
+  # The instance runner is a shell executor on a host with PEP-668-managed
+  # Python. Install into a per-job venv so we don't fight system Python.
+  before_script:
+    - python3 -m venv .venv
+    - . .venv/bin/activate
+    - pip install --upgrade pip
   script:
+    - . .venv/bin/activate
     - pip install -e ".[dev]"
     - pytest tests/ -v
+  cache:
+    key: pip-venv
+    paths:
+      - .venv/
