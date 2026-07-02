@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
 
+from . import rasterizer
 from .assembly import assemble_document
 from .models import PipelineResult
 from .preprocess import prepare_image
@@ -143,11 +144,12 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None, cli
     start_time = time.time()
     os.makedirs(output_dir, exist_ok=True)
 
-    page_images, total_pages, page_dims = prepare_pages(
-        file_path, output_dir,
-        low_dpi=config.low_dpi, high_dpi=config.high_dpi,
-        page_range=config.page_range,
-    )
+    with rasterizer.RASTERIZE_LOCK:
+        page_images, total_pages, page_dims = prepare_pages(
+            file_path, output_dir,
+            low_dpi=config.low_dpi, high_dpi=config.high_dpi,
+            page_range=config.page_range,
+        )
 
     client = client or VLMClient(
         base_url=config.vlm_url, model=config.vlm_model, api_key=config.api_key,

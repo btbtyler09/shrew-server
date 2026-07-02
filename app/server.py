@@ -37,6 +37,7 @@ from .rasterizer import (
     classify_file,
 )
 from .progress import ProgressReporter
+from .structured_pipeline import run_structured_pipeline
 from .vlm_client import VLMClient
 
 logger = logging.getLogger("shrew.server")
@@ -251,6 +252,7 @@ _SUPPORTED_EXTENSIONS = (
     | SPREADSHEET_EXTENSIONS | TEXT_EXTENSIONS | {CSV_EXTENSION}
 )
 _SKIP_CHUNKING_CLASSES = {"spreadsheet", "csv"}
+_STRUCTURED_ELIGIBLE_CLASSES = {"pdf", "image", "office"}
 
 
 def _save_upload(upload: UploadFile) -> str:
@@ -285,6 +287,7 @@ def _resolve_model(model_field: Optional[str]) -> tuple[str, str, Optional[str]]
 @app.post("/v1/convert")
 async def convert(
     file: UploadFile = File(...),
+    pipeline_mode: str = Form("structured"),
     model: Optional[str] = Form(None),
     pages: Optional[str] = Form(None),
     skip_stage3: bool = Form(False),
@@ -351,6 +354,8 @@ async def convert(
             )
 
             def _run():
+                if pipeline_mode == "structured" and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
+                    return run_structured_pipeline(tmp_path, output_dir, config)
                 return run_pipeline(
                     tmp_path, output_dir, config,
                     figure_converter=_figure_converter,
@@ -375,6 +380,7 @@ async def convert(
 @app.post("/v1/convert/stream")
 async def convert_stream(
     file: UploadFile = File(...),
+    pipeline_mode: str = Form("structured"),
     model: Optional[str] = Form(None),
     pages: Optional[str] = Form(None),
     skip_stage3: bool = Form(False),
@@ -442,12 +448,15 @@ async def convert_stream(
                 section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
             )
 
-            result = run_pipeline(
-                tmp_path, output_dir, config,
-                figure_converter=_figure_converter,
-                progress=progress,
-                vlm_pool=_vlm_pool,
-            )
+            if pipeline_mode == "structured" and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
+                result = run_structured_pipeline(tmp_path, output_dir, config, progress=progress)
+            else:
+                result = run_pipeline(
+                    tmp_path, output_dir, config,
+                    figure_converter=_figure_converter,
+                    progress=progress,
+                    vlm_pool=_vlm_pool,
+                )
 
             response = _build_response(result, skip_stage3)
             progress.emit_complete(response)
@@ -507,5 +516,6 @@ def _build_response(result: PipelineResult, skip_stage3: bool) -> dict:
         response["metadata"] = result.structured_json.get("metadata", {})
         response["summary"] = result.structured_json.get("summary", "")
         response["semantic_chunks"] = result.structured_json.get("semantic_chunks", [])
+        response["tables"] = result.structured_json.get("tables", [])
 
     return response

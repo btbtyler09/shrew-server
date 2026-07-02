@@ -12,12 +12,18 @@ this module entirely — see text_extract.py and spreadsheet_extract.py.
 import logging
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pypdfium2
 from PIL import Image
 
 logger = logging.getLogger("shrew.rasterizer")
+
+# pypdfium2 uses a C library that is not thread-safe — all rasterization in
+# the process (legacy and structured pipelines alike) must serialize on this
+# single lock.
+RASTERIZE_LOCK = threading.Lock()
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".doc", ".ppt", ".odt", ".odp"}

@@ -24,7 +24,7 @@ from PIL import Image
 from .docling_client import create_figure_converter, detect_figures
 from .models import PipelineConfig, PipelineResult
 from .prompts import DIRECT_CONVERT_PROMPT, FIGURE_CLASSIFY_PROMPT
-from .rasterizer import classify_file, prepare_pages
+from .rasterizer import RASTERIZE_LOCK, classify_file, prepare_pages
 from .text_extract import extract_text
 from .structured import (
     _approx_tokens,
@@ -42,8 +42,10 @@ _STREAM_STAGE3 = os.environ.get("SHREW_STREAM_STAGE3", "true").lower() in ("true
 
 logger = logging.getLogger("shrew.pipeline")
 
-# pypdfium2 uses a C library that is not thread-safe — serialize all rasterization
-_rasterize_lock = threading.Lock()
+# pypdfium2 uses a C library that is not thread-safe — serialize all rasterization.
+# Shared with structured_pipeline.py via rasterizer.RASTERIZE_LOCK so legacy and
+# v2 pipelines can't drive pdfium concurrently.
+_rasterize_lock = RASTERIZE_LOCK
 
 # Padding in pixels added to detected bboxes when cropping figures
 FIGURE_CROP_PAD_X = 15
