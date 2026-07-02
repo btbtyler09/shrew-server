@@ -1,12 +1,56 @@
 """Assemble per-page 5-key VLM extractions into one canonical document record.
 
 This module owns metadata aggregation, doc-summary joining, and
-chunk/table/figure numbering + provenance. Cross-page chunk stitching and
-hires crop population (flat_text for tables, crop_path for tables/figures)
-are filled in by later tasks; the seams are marked below.
+chunk/table/figure numbering + provenance. Cross-page chunk stitching merges
+a page's first prose chunk into the previous page's last chunk when the text
+clearly continues across the page break (assembly-spec §3). Hires crop
+population (flat_text for tables, crop_path for tables/figures) is filled in
+by a later task; that seam is marked below.
 """
 
+import re
 from collections import Counter
+
+_TERMINAL_END = re.compile(r'[.!?:;]["\')\]]*$')
+_LIST_LINE = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s+', re.M)
+
+
+def _is_prose(text: str) -> bool:
+    return len(_LIST_LINE.findall(text)) < 2
+
+
+def _starts_like_continuation(text: str) -> bool:
+    head = text.lstrip()[:1]
+    return bool(head) and (head.islower() or head.isdigit())
+
+
+def stitch_pages(pages_chunks: list[tuple[int, list[dict]]]) -> list[dict]:
+    """Merge a page's first prose chunk into the previous page's last chunk
+    when the content clearly continues across the page break.
+
+    pages_chunks: list of (page, [chunk-dicts for that page]) in ascending
+    page order, chunk dicts already carrying chunk_id/title/content/keywords/
+    section_type/page. Merge conditions (assembly-spec §3): the previous
+    assembled chunk's last page is page-1, both contents are prose (not
+    list-like), the previous content does not end in terminal punctuation,
+    and the next content starts lowercase/digit. Merged chunks keep the
+    earlier chunk_id/title and union keywords (order-preserving).
+    """
+    merged = []
+    for page, chunks in pages_chunks:
+        for i, src in enumerate(chunks):
+            c = {**src, "pages": [page]}
+            prev = merged[-1] if merged else None
+            if (i == 0 and prev is not None and prev["pages"][-1] == page - 1
+                    and _is_prose(prev["content"]) and _is_prose(c["content"])
+                    and not _TERMINAL_END.search(prev["content"].rstrip())
+                    and _starts_like_continuation(c["content"])):
+                prev["content"] = prev["content"].rstrip() + " " + c["content"].lstrip()
+                prev["pages"].append(page)
+                prev["keywords"] = list(dict.fromkeys(prev["keywords"] + c["keywords"]))
+                continue
+            merged.append(c)
+    return merged
 
 
 def aggregate_metadata(page_metas: list[dict]) -> dict:
@@ -66,12 +110,12 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "ok": False,
             })
 
-    # TODO(task5): stitch_pages when stitch=True
-    chunks = []
+    pages_chunks = []
     for pr in ok_pages:
         page = pr["page"]
+        page_chunks = []
         for n, chunk in enumerate(pr["data"]["semantic_chunks"], start=1):
-            chunks.append({
+            page_chunks.append({
                 "chunk_id": f"p{page}_c{n}",
                 "pages": [page],
                 "page": page,
@@ -80,6 +124,12 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "keywords": chunk.get("keywords", []),
                 "section_type": chunk.get("section_type"),
             })
+        pages_chunks.append((page, page_chunks))
+
+    if stitch:
+        chunks = stitch_pages(pages_chunks)
+    else:
+        chunks = [c for _, page_chunks in pages_chunks for c in page_chunks]
 
     tables = []
     for pr in ok_pages:
