@@ -48,6 +48,15 @@ _STAGE_PARAMS = {
         "temperature": 0.7,
         "extra": {"top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},
     },
+    "structured_page": {
+        "temperature": 0.3,
+        "extra": {
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    },
 }
 
 
@@ -56,7 +65,8 @@ def get_generation_params(model_name: str, stage: str) -> dict:
 
     Args:
         model_name: The model being called (used for Qwen 3.5 detection).
-        stage: One of "transcribe", "classify_figure", "structured".
+        stage: One of "transcribe", "classify_figure", "structured",
+               "structured_page".
 
     Returns:
         Dict with "temperature" and "extra_params" keys.
