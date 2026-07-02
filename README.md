@@ -224,6 +224,8 @@ Convert a document to markdown + structured JSON.
 }
 ```
 
+**v2 structured pipeline (default):** `/v1/convert` and `/v1/convert/stream` now route through the v2 single-model structured pipeline by default (`pipeline_mode=structured`). One structured-extraction VLM (`VLM_MODEL`, e.g. `shrew-9b`) is called once per page and returns metadata/summary/semantic_chunks/figures/tables directly — no separate Doc Processing model or docling stage is required. The response shape above still holds, plus a new `tables` key (cropped table images alongside `html`/`flat_text` transcriptions); `images` are now figure crops taken from the hires page render rather than VLM-described images; and each `semantic_chunks` entry carries page provenance (which page(s) it was assembled from) so chunks can be traced back to source pages. The legacy multi-stage pipeline (VLM transcription + docling + editor) is still available by passing `pipeline_mode=vlm` or `pipeline_mode=conventional`.
+
 ### `POST /v1/convert/stream`
 
 Same as `/v1/convert` but returns Server-Sent Events with progress updates:
