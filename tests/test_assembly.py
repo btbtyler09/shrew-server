@@ -1,4 +1,14 @@
-from app.assembly import aggregate_metadata, join_doc_summary, assemble_document
+from pathlib import Path
+
+from PIL import Image
+
+from app.assembly import (
+    aggregate_metadata,
+    join_doc_summary,
+    assemble_document,
+    crop_bbox,
+    table_flat_text,
+)
 
 
 def _page(page, chunks=(), summary="s", meta=None, figures=(), tables=()):
@@ -114,3 +124,54 @@ def test_no_stitch_when_list_like():
                           "content": "1. item one\n2. item two\n3. item three"}]),
     ])
     assert len(doc["chunks"]) == 2
+
+
+def test_crop_scales_from_hires_dims():
+    img = Image.new("RGB", (2000, 1000))
+    out = crop_bbox(img, [100, 200, 600, 700])
+    assert out.size == (1000, 500)          # (600-100)/1000*2000, (700-200)/1000*1000
+
+
+def test_crop_clamps_out_of_bounds():
+    img = Image.new("RGB", (1000, 1000))
+    out = crop_bbox(img, [-50, 0, 1200, 500])
+    assert out.size == (1000, 500)
+
+
+def test_crop_drops_degenerate_and_tiny():
+    img = Image.new("RGB", (1000, 1000))
+    assert crop_bbox(img, [500, 500, 400, 600]) is None      # x1 < x0
+    assert crop_bbox(img, [0, 0, 30, 30]) is None            # 0.09% area
+
+
+def test_flat_text_linearizes_rows():
+    html = "<table><tr><th>Name</th><th>Qty</th></tr><tr><td>bolt</td><td>4</td></tr></table>"
+    assert table_flat_text(html, "Parts list") == "Parts list\nName | Qty\nbolt | 4"
+
+
+def test_assemble_document_produces_crops_and_hires_px(tmp_path):
+    hires_path = tmp_path / "p1.png"
+    Image.new("RGB", (2000, 1000)).save(hires_path)
+
+    doc = assemble_document(
+        "d1", "/f.pdf", "arxiv",
+        [_page(1,
+               tables=[{"bbox": [100, 200, 600, 700], "caption": "Parts list",
+                        "html": "<table><tr><th>Name</th><th>Qty</th></tr>"
+                                "<tr><td>bolt</td><td>4</td></tr></table>"}],
+               figures=[{"bbox": [100, 200, 600, 700], "caption": "A figure"}])],
+        hires_images={1: str(hires_path)},
+        crops_dir=str(tmp_path),
+        stitch=False,
+    )
+
+    assert doc["pages"][0]["hires_px"] == [2000, 1000]
+
+    table = doc["tables"][0]
+    assert table["flat_text"] == "Parts list\nName | Qty\nbolt | 4"
+    assert table["crop_path"] == str(tmp_path / f"{table['table_id']}.png")
+    assert Path(table["crop_path"]).is_file()
+
+    figure = doc["figures"][0]
+    assert figure["crop_path"] == str(tmp_path / f"{figure['figure_id']}.png")
+    assert Path(figure["crop_path"]).is_file()

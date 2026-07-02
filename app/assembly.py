@@ -3,16 +3,64 @@
 This module owns metadata aggregation, doc-summary joining, and
 chunk/table/figure numbering + provenance. Cross-page chunk stitching merges
 a page's first prose chunk into the previous page's last chunk when the text
-clearly continues across the page break (assembly-spec §3). Hires crop
-population (flat_text for tables, crop_path for tables/figures) is filled in
-by a later task; that seam is marked below.
+clearly continues across the page break (assembly-spec §3). When hires page
+images and a crops directory are supplied, figure/table bboxes are cropped
+from the hires render (crop_bbox) and table HTML is linearized to flat_text
+(table_flat_text) for embedding/search.
 """
 
+import os
 import re
 from collections import Counter
 
+from bs4 import BeautifulSoup
+from PIL import Image
+
 _TERMINAL_END = re.compile(r'[.!?:;]["\')\]]*$')
 _LIST_LINE = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s+', re.M)
+_WS = re.compile(r'\s+')
+
+
+def crop_bbox(hires_img, bbox, *, min_area_frac: float = 0.015):
+    """Crop a 0-1000 normalized bbox out of a hires page image.
+
+    Clamps coordinates to [0, 1000], returns None for degenerate boxes
+    (x1<=x0 or y1<=y0 after clamping) or boxes below min_area_frac of the
+    page area (measured in normalized space), otherwise scales the bbox to
+    the hires image's pixel dimensions and returns the cropped image.
+    """
+    x0, y0, x1, y1 = (max(0, min(1000, c)) for c in bbox)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    if ((x1 - x0) * (y1 - y0)) / (1000 * 1000) < min_area_frac:
+        return None
+
+    W, H = hires_img.size
+    left = x0 / 1000 * W
+    right = x1 / 1000 * W
+    upper = y0 / 1000 * H
+    lower = y1 / 1000 * H
+    return hires_img.crop((int(left), int(upper), int(right), int(lower)))
+
+
+def table_flat_text(html: str, caption) -> str:
+    """Linearize a table's HTML (+ optional caption) into plain text.
+
+    First line (if caption is truthy) is the caption; one line per <tr>
+    follows, with th/td cell texts joined by " | ", all whitespace
+    normalized (collapsed internal runs, stripped).
+    """
+    lines = []
+    if caption:
+        lines.append(_WS.sub(" ", caption).strip())
+
+    soup = BeautifulSoup(html, "html.parser")
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["th", "td"])
+        cell_texts = [_WS.sub(" ", cell.get_text()).strip() for cell in cells]
+        lines.append(" | ".join(cell_texts))
+
+    return "\n".join(lines)
 
 
 def _is_prose(text: str) -> bool:
@@ -135,13 +183,14 @@ def assemble_document(doc_id, file_path, source, page_results,
     for pr in ok_pages:
         page = pr["page"]
         for i, table in enumerate(pr["data"]["tables"], start=1):
+            html = table.get("html", "")
             tables.append({
                 "table_id": f"{doc_id}_p{page}_t{i}",
                 "page": page,
                 "bbox": table.get("bbox"),
                 "caption": table.get("caption"),
-                "html": table.get("html", ""),
-                "flat_text": "",
+                "html": html,
+                "flat_text": table_flat_text(html, table.get("caption")),
                 "crop_path": None,
             })
 
@@ -156,6 +205,44 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "caption": figure.get("caption"),
                 "crop_path": None,
             })
+
+    if hires_images and crops_dir:
+        os.makedirs(crops_dir, exist_ok=True)
+        pages_by_no = {p["page"]: p for p in pages}
+        page_tables = {}
+        page_figures = {}
+        for table in tables:
+            page_tables.setdefault(table["page"], []).append(table)
+        for figure in figures:
+            page_figures.setdefault(figure["page"], []).append(figure)
+
+        for pr in ok_pages:
+            page = pr["page"]
+            hires_path = hires_images.get(page)
+            if hires_path is None:
+                continue
+            with Image.open(hires_path) as hires_img:
+                hires_img.load()
+                W, H = hires_img.size
+                pages_by_no[page]["hires_px"] = [W, H]
+
+                for table in page_tables.get(page, []):
+                    if table["bbox"] is None:
+                        continue
+                    crop = crop_bbox(hires_img, table["bbox"])
+                    if crop is not None:
+                        crop_path = os.path.join(crops_dir, f"{table['table_id']}.png")
+                        crop.save(crop_path)
+                        table["crop_path"] = crop_path
+
+                for figure in page_figures.get(page, []):
+                    if figure["bbox"] is None:
+                        continue
+                    crop = crop_bbox(hires_img, figure["bbox"])
+                    if crop is not None:
+                        crop_path = os.path.join(crops_dir, f"{figure['figure_id']}.png")
+                        crop.save(crop_path)
+                        figure["crop_path"] = crop_path
 
     return {
         "doc_id": doc_id,
