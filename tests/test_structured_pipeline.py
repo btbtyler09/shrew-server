@@ -2,10 +2,12 @@ import base64
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from app.assembly import assemble_document
 from app.models import PipelineConfig
+from app.pipeline import CancelledException
 from app.structured_pipeline import (
     build_structured_json,
     run_structured_pipeline,
@@ -93,6 +95,31 @@ def test_run_structured_pipeline_wiring(tmp_path):
     # model input got saved under pages/
     model_pngs = list((out_dir / "pages").glob("*_model.png"))
     assert len(model_pngs) == 1
+
+
+class _CancelledProgress:
+    """A progress reporter that reports the request as already cancelled."""
+
+    def emit(self, percent, message):
+        pass
+
+    def is_cancelled(self):
+        return True
+
+
+def test_run_structured_pipeline_aborts_when_cancelled(tmp_path):
+    doc_path = tmp_path / "doc.png"
+    Image.new("RGB", (1700, 2200), "white").save(doc_path)
+    out_dir = tmp_path / "out"
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    config = _make_config()
+
+    with pytest.raises(CancelledException):
+        run_structured_pipeline(
+            str(doc_path), str(out_dir), config,
+            progress=_CancelledProgress(), client=client,
+        )
 
 
 def test_run_structured_pipeline_failed_page_contributes_nothing(tmp_path):

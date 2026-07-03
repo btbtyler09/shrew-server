@@ -20,6 +20,7 @@ from PIL import Image
 from . import rasterizer
 from .assembly import assemble_document
 from .models import PipelineResult
+from .pipeline import CancelledException
 from .preprocess import prepare_image
 from .rasterizer import classify_file, prepare_pages
 from .structured_page import extract_page
@@ -155,6 +156,9 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None, cli
         base_url=config.vlm_url, model=config.vlm_model, api_key=config.api_key,
     )
 
+    if progress is not None and progress.is_cancelled():
+        raise CancelledException()
+
     page_numbers = sorted(page_images.keys())
     n_pages = len(page_numbers)
 
@@ -177,6 +181,11 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None, cli
             if progress is not None:
                 pct = 5 + int(80 * pages_done / n_pages)
                 progress.emit(pct, f"Extracting pages ({pages_done}/{n_pages})...")
+            # Abort on client disconnect: cancel pending pages and stop.
+            if progress is not None and progress.is_cancelled():
+                for pending in futures:
+                    pending.cancel()
+                raise CancelledException()
 
     # Collect in ascending page order regardless of completion order.
     page_results = [page_results_map[pno] for pno in page_numbers]
