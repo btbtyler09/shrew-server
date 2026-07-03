@@ -100,34 +100,51 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
     }
 
 
+def _by_page(items: list) -> dict:
+    """Bucket units (chunks/tables/figures, each carrying a `page`) by page."""
+    out: dict = {}
+    for it in items:
+        out.setdefault(it["page"], []).append(it)
+    return out
+
+
 def synthesize_markdown(doc: dict) -> str:
-    """Deterministic reconstruction of a document's markdown, page order.
+    """Deterministic reconstruction of a document's markdown, one block per
+    page wrapped in ``<page N> ... </page N>`` tags (matching the legacy
+    pipeline's output shape). Within each page: its chunks as headed sections,
+    then its tables (html verbatim), then a ``![caption](img:index)`` reference
+    per figure. Figure indices are global and match build_structured_json's
+    ``images`` list.
 
-    Chunks (already page-ascending) become headed sections, followed by a
-    Tables section with each table's html verbatim, followed by a Figures
-    section with one `![caption](img:index)` reference per figure — the
-    same indexing build_structured_json uses for `images`.
+    The per-page 5-key model gives no within-page ordering, so a page's
+    chunks/tables/figures are emitted in that fixed order; a chunk stitched
+    across a page break is emitted under its origin page.
     """
-    parts = []
+    fig_index = {f["figure_id"]: i for i, f in enumerate(doc["figures"], start=1)}
+    chunks_by_page = _by_page(doc["chunks"])
+    tables_by_page = _by_page(doc["tables"])
+    figures_by_page = _by_page(doc["figures"])
 
-    for chunk in doc["chunks"]:
-        title = chunk.get("title")
-        if title:
-            parts.append(f"## {title}\n\n")
-        parts.append(f"{chunk.get('content') or ''}\n\n")
-
-    if doc["tables"]:
-        parts.append("## Tables\n\n")
-        for t in doc["tables"]:
-            parts.append(f"{t['html']}\n\n")
-
-    if doc["figures"]:
-        parts.append("## Figures\n\n")
-        for i, f in enumerate(doc["figures"], start=1):
+    blocks = []
+    for page in doc["pages"]:
+        p = page["page"]
+        parts = []
+        for chunk in chunks_by_page.get(p, []):
+            title = chunk.get("title")
+            if title:
+                parts.append(f"## {title}")
+            content = chunk.get("content") or ""
+            if content:
+                parts.append(content)
+        for t in tables_by_page.get(p, []):
+            parts.append(t["html"])
+        for f in figures_by_page.get(p, []):
             caption = f.get("caption") or ""
-            parts.append(f"![{caption}](img:{i})\n\n")
+            parts.append(f"![{caption}](img:{fig_index[f['figure_id']]})")
+        inner = "\n\n".join(parts)
+        blocks.append(f"<page {p}>\n{inner}\n</page {p}>")
 
-    return "".join(parts).strip()
+    return "\n\n".join(blocks).strip()
 
 
 def run_structured_pipeline(file_path, output_dir, config, *, progress=None, client=None) -> PipelineResult:

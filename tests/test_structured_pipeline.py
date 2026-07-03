@@ -210,3 +210,23 @@ def test_synthesize_markdown_contains_chunks_tables_and_figure_refs(tmp_path):
     assert "Result text." in md
     assert "<table>" in md
     assert "![Fig one](img:1)" in md
+
+
+def test_synthesize_markdown_groups_units_under_their_page(tmp_path):
+    doc = _two_page_doc(tmp_path)
+    md = synthesize_markdown(doc)
+
+    # Each page is wrapped in <page N> ... </page N> tags, in order.
+    assert md.index("<page 1>") < md.index("</page 1>") < md.index("<page 2>")
+    assert md.rstrip().endswith("</page 2>")
+
+    # The figure (page 1) is inline in page 1's block; the table (page 2) in
+    # page 2's block — not dumped into trailing sections.
+    page1 = md[md.index("<page 1>"):md.index("</page 1>")]
+    page2 = md[md.index("<page 2>"):md.index("</page 2>")]
+    assert "Intro text." in page1 and "![Fig one](img:1)" in page1
+    assert "<table>" not in page1
+    assert "Result text." in page2 and "<table>" in page2
+    assert "![Fig one]" not in page2
+    # No leftover global sections from the old layout.
+    assert "## Tables" not in md and "## Figures" not in md
