@@ -242,3 +242,23 @@ def test_convert_csv_raw_mode_returns_markdown_only(api_client):
         assert key not in body
     assert "bolt" in body["markdown"]
     assert body["processing_log"]["modality"] == "deterministic"
+
+
+# ── built-in viewer UI ──────────────────────────────────────────────────────
+
+
+def test_ui_page_is_served(api_client):
+    resp = api_client.get("/ui")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    body = resp.text
+    # The page is self-contained: no external scripts/styles to fetch.
+    assert "src=\"http" not in body and "href=\"http" not in body
+    # It drives the real endpoints.
+    assert "v1/convert/stream" in body
+
+
+def test_root_redirects_to_ui(api_client):
+    resp = api_client.get("/", follow_redirects=False)
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/ui"

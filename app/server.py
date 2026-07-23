@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .cli import parse_page_range
@@ -39,6 +39,7 @@ from .rasterizer import (
 from .progress import ProgressReporter
 from .structured_page import EMPTY_200_ALERT_THRESHOLD, empty_200_streak
 from .structured_pipeline import run_structured_pipeline
+from .ui import UI_HTML
 from .vlm_client import VLMClient
 
 logger = logging.getLogger("shrew.server")
@@ -228,6 +229,19 @@ app = FastAPI(
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
+
+
+@app.get("/", include_in_schema=False)
+async def index():
+    return RedirectResponse(url="/ui")
+
+
+@app.get("/ui", include_in_schema=False)
+async def ui():
+    """Built-in conversion viewer: upload a document, watch progress, view
+    the result as rendered document / markdown / JSON. Self-contained page,
+    no external assets."""
+    return HTMLResponse(UI_HTML)
 
 
 @app.get("/health")
