@@ -166,3 +166,79 @@ def test_build_response_skip_stage3_omits_stage3_keys_and_tables():
         assert key in body
     for key in STAGE3_KEYS:
         assert key not in body
+
+
+# ── raw mode / text-family routing ──────────────────────────────────────────
+
+
+def _raw_result():
+    """What run_structured_pipeline returns with raw=True: flat text, no
+    structured_json at all."""
+    return PipelineResult(
+        clean_markdown="# The Title\n\nAuthors: Ada\n\n## Summary\n\ns",
+        structured_json={},
+        processing_log={"total_pages": 2, "total_figures": 0,
+                        "total_time_seconds": 0.1, "modality": "image",
+                        "gates": {"pages": 2, "first_pass_ok": 2}},
+    )
+
+
+def test_build_response_raw_omits_stage3_keys_even_when_not_skipping():
+    """raw ran the model but produced no structured_json — the stage-3 keys
+    must be absent, not present-and-empty, so a caller can't read 'no model
+    output' as 'the model found nothing'."""
+    body = _build_response(_raw_result(), skip_stage3=False)
+    for key in ALWAYS_KEYS:
+        assert key in body
+    for key in STAGE3_KEYS:
+        assert key not in body, f"{key} should be omitted in raw mode"
+    assert body["markdown"].startswith("# The Title")
+
+
+def test_build_response_surfaces_gate_metrics():
+    """§3/§5 health signals have to reach the operator."""
+    body = _build_response(_raw_result(), skip_stage3=False)
+    assert body["processing_log"]["modality"] == "image"
+    assert body["processing_log"]["gates"]["first_pass_ok"] == 2
+
+
+def test_structured_eligible_classes_cover_every_supported_input():
+    """Every class the server accepts must have a modality; otherwise the
+    upload silently falls back to the legacy pipeline."""
+    from app.server import _STRUCTURED_ELIGIBLE_CLASSES
+    assert _STRUCTURED_ELIGIBLE_CLASSES == {
+        "pdf", "image", "office", "text", "csv", "spreadsheet",
+    }
+
+
+def test_raw_is_a_recognized_pipeline_mode():
+    from app.server import _STRUCTURED_MODES
+    assert _STRUCTURED_MODES == {"structured", "raw"}
+
+
+def _upload_csv():
+    import io as _io
+    return {"file": ("data.csv", _io.BytesIO(b"name,qty\nbolt,4\n"), "text/csv")}
+
+
+def test_convert_csv_routes_through_structured_not_legacy(api_client):
+    resp = api_client.post("/v1/convert", files=_upload_csv())
+    assert resp.status_code == 200
+    body = resp.json()
+    for key in (*ALWAYS_KEYS, *STAGE3_KEYS):
+        assert key in body, f"missing {key!r} in response: {sorted(body)}"
+    assert body["processing_log"]["modality"] == "text"
+
+
+def test_convert_csv_raw_mode_returns_markdown_only(api_client):
+    resp = api_client.post(
+        "/v1/convert", data={"pipeline_mode": "raw"}, files=_upload_csv(),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    for key in ALWAYS_KEYS:
+        assert key in body
+    for key in STAGE3_KEYS:
+        assert key not in body
+    assert "bolt" in body["markdown"]
+    assert body["processing_log"]["modality"] == "deterministic"

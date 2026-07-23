@@ -37,6 +37,7 @@ from .rasterizer import (
     classify_file,
 )
 from .progress import ProgressReporter
+from .structured_page import EMPTY_200_ALERT_THRESHOLD, empty_200_streak
 from .structured_pipeline import run_structured_pipeline
 from .vlm_client import VLMClient
 
@@ -244,7 +245,18 @@ async def health():
             status_code=503,
             content={"status": "unhealthy", "unavailable": unavailable},
         )
-    return {"status": "ok"}
+
+    # §5.3 empty-200 watch: consecutive blank completions returned with HTTP
+    # 200 are the TP-rank-desync signature. The model server answers health
+    # checks normally while producing nothing, so this is the only signal.
+    streak = empty_200_streak()
+    if streak >= EMPTY_200_ALERT_THRESHOLD:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "empty_200_streak": streak,
+                     "detail": "consecutive empty completions — restart the model server"},
+        )
+    return {"status": "ok", "empty_200_streak": streak}
 
 
 _SUPPORTED_EXTENSIONS = (
@@ -252,7 +264,13 @@ _SUPPORTED_EXTENSIONS = (
     | SPREADSHEET_EXTENSIONS | TEXT_EXTENSIONS | {CSV_EXTENSION}
 )
 _SKIP_CHUNKING_CLASSES = {"spreadsheet", "csv"}
-_STRUCTURED_ELIGIBLE_CLASSES = {"pdf", "image", "office"}
+# Every supported class now has a modality under the shrew-ocr-preview
+# contract: pdf/image/office rasterize to the image arm, text/csv/spreadsheet
+# go through their deterministic extractor into the text arm.
+_STRUCTURED_ELIGIBLE_CLASSES = {"pdf", "image", "office",
+                                "text", "csv", "spreadsheet"}
+# "raw" is the structured pipeline rendered as flat text instead of JSON.
+_STRUCTURED_MODES = {"structured", "raw"}
 
 
 def _save_upload(upload: UploadFile) -> str:
@@ -354,8 +372,11 @@ async def convert(
             )
 
             def _run():
-                if pipeline_mode == "structured" and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
-                    return run_structured_pipeline(tmp_path, output_dir, config)
+                if pipeline_mode in _STRUCTURED_MODES and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
+                    return run_structured_pipeline(
+                        tmp_path, output_dir, config,
+                        raw=(pipeline_mode == "raw"),
+                    )
                 return run_pipeline(
                     tmp_path, output_dir, config,
                     figure_converter=_figure_converter,
@@ -448,8 +469,11 @@ async def convert_stream(
                 section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
             )
 
-            if pipeline_mode == "structured" and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
-                result = run_structured_pipeline(tmp_path, output_dir, config, progress=progress)
+            if pipeline_mode in _STRUCTURED_MODES and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
+                result = run_structured_pipeline(
+                    tmp_path, output_dir, config, progress=progress,
+                    raw=(pipeline_mode == "raw"),
+                )
             else:
                 result = run_pipeline(
                     tmp_path, output_dir, config,
@@ -512,7 +536,14 @@ def _build_response(result: PipelineResult, skip_stage3: bool) -> dict:
         },
     }
 
-    if not skip_stage3:
+    for key in ("modality", "gates", "failed_pages"):
+        if key in result.processing_log:
+            response["processing_log"][key] = result.processing_log[key]
+
+    # raw mode returns no structured_json at all: the stage-3 keys are omitted
+    # rather than returned empty, so a caller can't mistake "no model ran" for
+    # "the model found nothing".
+    if not skip_stage3 and result.structured_json:
         response["metadata"] = result.structured_json.get("metadata", {})
         response["summary"] = result.structured_json.get("summary", "")
         response["semantic_chunks"] = result.structured_json.get("semantic_chunks", [])

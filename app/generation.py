@@ -48,14 +48,17 @@ _STAGE_PARAMS = {
         "temperature": 0.7,
         "extra": {"top_p": 0.8, "top_k": 20, "presence_penalty": 1.5},
     },
+    # shrew-ocr-preview contract (SHREW_OCR_PREVIEW.md §3): first-pass sampling
+    # is EXACTLY temperature 0 and nothing else. No top_p/top_k/min_p, no
+    # penalties, no structured-output enforcement, no template kwargs. Gate F
+    # measured penalty-free unconstrained greedy — any decode-path knob added
+    # here voids every published eval number, and smoke_test_preview will
+    # report DRIFT. `no_model_flags` keeps the Qwen merge below from injecting
+    # anything if the operator points VLM_MODEL at a Qwen-named endpoint.
     "structured_page": {
-        "temperature": 0.3,
-        "extra": {
-            "top_p": 0.8,
-            "top_k": 20,
-            "min_p": 0.0,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
+        "temperature": 0,
+        "extra": {},
+        "no_model_flags": True,
     },
 }
 
@@ -74,7 +77,7 @@ def get_generation_params(model_name: str, stage: str) -> dict:
     cfg = _STAGE_PARAMS[stage]
     extra = dict(cfg["extra"])
 
-    if is_qwen3x(model_name):
+    if is_qwen3x(model_name) and not cfg.get("no_model_flags"):
         extra.update(_qwen3x_flags())
 
     return {

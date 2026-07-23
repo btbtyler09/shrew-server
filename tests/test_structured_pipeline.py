@@ -10,6 +10,8 @@ from app.models import PipelineConfig
 from app.pipeline import CancelledException
 from app.structured_pipeline import (
     build_structured_json,
+    gate_metrics,
+    render_raw_text,
     run_structured_pipeline,
     synthesize_markdown,
 )
@@ -190,6 +192,37 @@ def test_build_structured_json_tables_and_images(tmp_path):
     base64.b64decode(image["data"])
 
 
+def test_no_crop_means_no_format_claim(tmp_path):
+    """A figure/table with no crop (null bbox, or a text-modality page with no
+    render behind it) must not advertise format "png" alongside data: null."""
+    doc = assemble_document(
+        "d3", "/f.xlsx", "spreadsheet",
+        [_page(1,
+               figures=[{"bbox": None, "caption": "Sheet: Allowables"}],
+               tables=[{"bbox": None, "caption": "T", "html": "<table></table>"}])],
+        stitch=False,
+    )
+    sj = build_structured_json(doc, total_pages=1)
+    assert sj["images"][0]["data"] is None and sj["images"][0]["format"] is None
+    assert sj["tables"][0]["data"] is None and sj["tables"][0]["format"] is None
+    # ...but the caption and page provenance survive.
+    assert sj["images"][0]["caption"] == "Sheet: Allowables"
+    assert sj["images"][0]["page"] == 1
+
+
+def test_markdown_does_not_link_images_that_do_not_exist(tmp_path):
+    doc = assemble_document(
+        "d4", "/f.xlsx", "spreadsheet",
+        [_page(1, chunks=[{"chunk_id": "1", "title": "T", "content": "c",
+                            "keywords": [], "section_type": "results"}],
+               figures=[{"bbox": None, "caption": "Sheet: Allowables"}])],
+        stitch=False,
+    )
+    md = synthesize_markdown(doc)
+    assert "![" not in md, "no image ref without a crop to back it"
+    assert "[Figure: Sheet: Allowables]" in md
+
+
 def test_build_structured_json_image_without_crop_keeps_caption():
     doc = assemble_document(
         "d2", "/f.pdf", "arxiv",
@@ -230,3 +263,368 @@ def test_synthesize_markdown_groups_units_under_their_page(tmp_path):
     assert "![Fig one]" not in page2
     # No leftover global sections from the old layout.
     assert "## Tables" not in md and "## Figures" not in md
+
+
+# ── text modality: deterministic extractor -> model text arm ────────────────
+
+
+def test_csv_routes_through_the_text_modality_not_rasterization(tmp_path):
+    """A csv has a deterministic extractor, so it must reach the model as a
+    §2 text-modality request (plain-string user content) and never be
+    rasterized."""
+    doc_path = tmp_path / "data.csv"
+    doc_path.write_text("name,qty\nbolt,4\nnut,8\n")
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client,
+    )
+
+    assert result.processing_log["modality"] == "text"
+    user_content = client.calls[0]["messages"][1]["content"]
+    assert isinstance(user_content, str), "text arm takes a raw string"
+    assert "bolt" in user_content
+    # No rasterization happened.
+    assert not (tmp_path / "out" / "pages").exists()
+    assert result.structured_json["semantic_chunks"]
+
+
+def test_large_text_input_is_paginated_into_page_sized_requests(tmp_path):
+    """The text arm only ever saw page-sized input, so a big extraction is
+    split into several requests rather than sent as one giant message."""
+    doc_path = tmp_path / "big.md"
+    para = "word " * 500  # ~2500 chars
+    doc_path.write_text("\n\n".join([para] * 40))  # ~100k chars
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")] * 40)
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client,
+    )
+
+    assert len(client.calls) > 1, "should have paginated"
+    from app.structured_page import TEXT_PAGE_MAX_CHARS
+    for call in client.calls:
+        assert len(call["messages"][1]["content"]) <= TEXT_PAGE_MAX_CHARS
+    assert result.processing_log["total_pages"] == len(client.calls)
+
+
+def test_pdf_class_still_uses_the_image_modality(tmp_path):
+    doc_path = tmp_path / "doc.png"
+    Image.new("RGB", (1700, 2200), "white").save(doc_path)
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client,
+    )
+
+    assert result.processing_log["modality"] == "image"
+    assert isinstance(client.calls[0]["messages"][1]["content"], list)
+
+
+# ── raw rendering ───────────────────────────────────────────────────────────
+
+
+def test_raw_mode_on_image_input_runs_the_model_and_flattens(tmp_path):
+    doc_path = tmp_path / "doc.png"
+    Image.new("RGB", (1700, 2200), "white").save(doc_path)
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client, raw=True,
+    )
+
+    assert len(client.calls) == 1, "raw still uses shrew-ocr for image input"
+    assert result.structured_json == {}, "stage-3 keys are omitted in raw mode"
+    assert "Doc Title" in result.clean_markdown
+    assert "Some intro content." in result.clean_markdown
+
+
+def test_raw_mode_on_markdown_still_uses_the_model(tmp_path):
+    """"Messy HTML/markdown/code/plain text" is what the text modality was
+    built for (§2), so raw runs these through the model and flattens the
+    result rather than echoing the source file back."""
+    doc_path = tmp_path / "page.md"
+    doc_path.write_text("# scraped\n\nnav nav nav\n\nreal content here")
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client, raw=True,
+    )
+
+    assert len(client.calls) == 1, "markdown goes through the model in raw mode"
+    assert result.processing_log["modality"] == "text"
+    assert "Doc Title" in result.clean_markdown
+
+
+def test_raw_mode_on_spreadsheet_family_skips_the_model(tmp_path):
+    """A csv/xlsx/eml already has a lossless deterministic parse; raw returns
+    it directly rather than paying the model to re-emit it."""
+    doc_path = tmp_path / "data.csv"
+    doc_path.write_text("name,qty\nbolt,4\n")
+
+    client = FakeClient([])  # must never be called
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client, raw=True,
+    )
+
+    assert client.calls == [], "no model call for deterministic raw extraction"
+    assert result.processing_log["modality"] == "deterministic"
+    assert result.structured_json == {}
+    assert "bolt" in result.clean_markdown
+
+
+def test_render_raw_text_sections_are_fixed_and_ordered(tmp_path):
+    from app.structured_pipeline import RAW_SECTIONS
+    doc = _two_page_doc(tmp_path)
+    doc["metadata"] = {"title": "The Title", "authors": ["Ada", "Bob"],
+                        "organization": "ACME", "year": "2019", "doc_type": "report"}
+    doc["doc_summary"] = "A short summary."
+    out = render_raw_text(doc)
+
+    # Every section present, in the declared order.
+    positions = [out.index(f"# {name}") for name in RAW_SECTIONS]
+    assert positions == sorted(positions)
+    assert out.startswith("# Metadata")
+
+    assert "Title: The Title" in out and "Authors: Ada, Bob" in out
+    assert "Organization: ACME" in out and "Year: 2019" in out and "Type: report" in out
+    assert "Pages: 2" in out
+    assert "A short summary." in out
+    # Content is content-only — no chunk-title headings.
+    assert "Intro text." in out and "Result text." in out
+    assert "## Intro" not in out and "## Results" not in out
+
+
+def test_render_raw_text_tables_and_figures_keep_their_page(tmp_path):
+    doc = _two_page_doc(tmp_path)
+    out = render_raw_text(doc)
+    # Moving them out of the page blocks must not lose locality.
+    assert "## Table 1 (page 2)" in out
+    assert "## Figure 1 (page 1) — Fig one" in out
+    assert "<table>" not in out, "tables render as flat text, not HTML"
+    assert "![" not in out, "no markdown image refs in the raw rendering"
+
+
+def test_render_raw_text_emits_empty_sections(tmp_path):
+    """Sections are unconditional so a consumer can split on /^# / and rely on
+    the same headers every time."""
+    from app.structured_pipeline import RAW_SECTIONS
+    doc = assemble_document(
+        "d9", "/f.pdf", "arxiv",
+        [_page(1, summary=None, chunks=[])], stitch=False,
+    )
+    out = render_raw_text(doc)
+    for name in RAW_SECTIONS:
+        assert f"# {name}" in out
+    assert out.count("(none)") >= 3  # summary, content, tables, figures
+
+
+def test_render_raw_text_survives_missing_metadata(tmp_path):
+    doc = _two_page_doc(tmp_path)
+    out = render_raw_text(doc)
+    assert out.startswith("# Metadata")
+    assert "Pages: 2" in out
+
+
+# ── §3/§5 gate metrics ──────────────────────────────────────────────────────
+
+
+def test_gate_metrics_counts_each_outcome():
+    m = gate_metrics([
+        {"ok": True, "status": "ok"},
+        {"ok": True, "status": "ok"},
+        {"ok": True, "status": "ok_coerced", "schema_coerced": True},
+        {"ok": False, "status": "degenerate", "degenerate": True},
+        {"ok": False, "status": "oversize"},
+    ])
+    assert m["pages"] == 5
+    assert m["first_pass_ok"] == 2
+    assert m["schema_coerced"] == 1
+    assert m["degenerate"] == 1
+    assert m["oversize_filtered"] == 1
+    assert m["first_pass_fail_rate"] == 0.6
+    assert m["degeneration_rate"] == 0.2
+    # One of the two pages that took the retry tier came back usable.
+    assert m["coerce_success_rate"] == 0.5
+
+
+def test_gate_metrics_coerce_rate_is_none_when_nothing_retried():
+    m = gate_metrics([{"ok": True, "status": "ok"}])
+    assert m["coerce_success_rate"] is None
+    assert m["first_pass_fail_rate"] == 0.0
+
+
+def test_processing_log_reports_gates(tmp_path):
+    doc_path = tmp_path / "doc.png"
+    Image.new("RGB", (1700, 2200), "white").save(doc_path)
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=client,
+    )
+    assert result.processing_log["gates"]["first_pass_ok"] == 1
+    assert result.processing_log["gates"]["first_pass_fail_rate"] == 0.0
+
+
+def test_raw_sections_split_reliably_even_with_headings_in_content():
+    """Model chunk content routinely contains its own '# Title' (title pages do
+    this). Those must not collide with the section headers, or splitting the
+    document on /^# / silently produces bogus sections."""
+    import re
+    from app.structured_pipeline import RAW_SECTIONS
+    doc = assemble_document(
+        "d10", "/f.pdf", "arxiv",
+        [_page(1, chunks=[{"chunk_id": "1", "title": "Title Page",
+                            "content": "# A Critical Evaluation\n\n## Subhead\n\nbody",
+                            "keywords": [], "section_type": "introduction"}])],
+        stitch=False,
+    )
+    out = render_raw_text(doc)
+
+    found = re.findall(r"^# (.+)$", out, re.M)
+    assert found == list(RAW_SECTIONS), f"stray h1 leaked into sections: {found}"
+    # The heading survives, one level down — content is not dropped.
+    assert "## A Critical Evaluation" in out
+    assert "### Subhead" in out
+    assert "body" in out
+
+
+# ── model-input geometry ────────────────────────────────────────────────────
+
+
+def test_pdf_pages_keep_the_exact_200_to_100_transform():
+    """PDFs are rasterized by us at config.high_dpi, so the contract's fixed
+    200->100 halving is correct and must not be second-guessed."""
+    from app.structured_pipeline import _model_input_src_dpi
+    cfg = _make_config()
+    assert _model_input_src_dpi((1700, 2200), cfg, "pdf") == cfg.high_dpi
+    assert _model_input_src_dpi((1700, 2200), cfg, "office") == cfg.high_dpi
+
+
+def test_uploaded_scan_is_normalized_to_the_trained_scale():
+    """A 400-DPI scan arrives at its native size, so the fixed halving would
+    hand the model 4x the trained pixel area."""
+    from app.structured_pipeline import TRAINED_LONG_EDGE, _model_input_src_dpi
+    cfg = _make_config()
+    src_dpi = _model_input_src_dpi((3400, 4400), cfg, "image")
+    # prepare_image scales by low_dpi/src_dpi.
+    scaled_long_edge = round(4400 * cfg.low_dpi / src_dpi)
+    assert scaled_long_edge == TRAINED_LONG_EDGE
+
+
+def test_a_200dpi_image_upload_still_lands_at_850x1100():
+    from app.structured_pipeline import _model_input_src_dpi
+    cfg = _make_config()
+    assert _model_input_src_dpi((1700, 2200), cfg, "image") == 200
+
+
+def test_small_uploads_are_never_upscaled():
+    """A thumbnail has no detail to recover; blowing it up to 1100 just
+    invents pixels."""
+    from app.structured_pipeline import _model_input_src_dpi
+    cfg = _make_config()
+    assert _model_input_src_dpi((400, 500), cfg, "image") == cfg.low_dpi
+
+
+def test_landscape_scan_normalizes_on_the_long_edge():
+    from app.structured_pipeline import TRAINED_LONG_EDGE, _model_input_src_dpi
+    cfg = _make_config()
+    src_dpi = _model_input_src_dpi((4400, 3400), cfg, "image")
+    assert round(4400 * cfg.low_dpi / src_dpi) == TRAINED_LONG_EDGE
+
+
+def test_oversized_scan_reaches_the_model_at_trained_size(tmp_path):
+    """End-to-end: the saved model input must be the trained geometry, not the
+    scan's native size."""
+    from PIL import Image as PILImage
+    doc_path = tmp_path / "scan.png"
+    PILImage.new("RGB", (3400, 4400), "white").save(doc_path)
+    out_dir = tmp_path / "out"
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")])
+    run_structured_pipeline(str(doc_path), str(out_dir), _make_config(), client=client)
+
+    model_png = next((out_dir / "pages").glob("*_model.png"))
+    with PILImage.open(model_png) as im:
+        assert max(im.size) == 1100, f"model input was {im.size}"
+
+
+# ── caption / chunk de-duplication ──────────────────────────────────────────
+
+
+def _doc_with_caption_placeholder(tmp_path):
+    """Mirrors the trained convention: a figure caption emitted BOTH as a
+    figures[] entry and as its own semantic_chunk."""
+    hires = tmp_path / "p.png"
+    Image.new("RGB", (2000, 1000)).save(hires)
+    return assemble_document(
+        "capdoc", "/f.pdf", "arxiv",
+        [_page(1,
+               chunks=[
+                   {"chunk_id": "1", "title": "Coordinate System", "keywords": [],
+                    "section_type": "technical_content",
+                    "content": "The axes are given by the principal basis vectors."},
+                   {"chunk_id": "2", "title": "Figure 1. Principal basis vectors.",
+                    "keywords": [], "section_type": "technical_content",
+                    "content": "Figure 1. Principal basis vectors."},
+               ],
+               figures=[{"bbox": [100, 200, 600, 700],
+                         "caption": "Figure 1. Principal basis vectors."}]),
+        ],
+        hires_images={1: str(hires)},
+        crops_dir=str(tmp_path / "crops"),
+        stitch=False,
+    )
+
+
+def test_structured_keeps_placeholder_chunk_but_strips_image_caption(tmp_path):
+    """semantic_chunks stays eval-faithful (the placeholder chunk survives),
+    while the bottom image ref drops the redundant caption."""
+    doc = _doc_with_caption_placeholder(tmp_path)
+
+    # The placeholder chunk is still in the structured data.
+    sj = build_structured_json(doc, total_pages=1)
+    assert any(c["content"] == "Figure 1. Principal basis vectors."
+               for c in sj["semantic_chunks"])
+
+    md = synthesize_markdown(doc)
+    # The image ref is placed INLINE at the placeholder chunk's reading-order
+    # position, carrying the caption as alt text — not dumped at the page end.
+    assert "![Figure 1. Principal basis vectors.](img:1)" in md
+    # The placeholder chunk's own text is replaced by the image, so the caption
+    # appears exactly once (as the alt), and the real prose chunk is untouched.
+    assert md.count("Figure 1. Principal basis vectors.") == 1
+    assert "The axes are given by the principal basis vectors." in md
+    # It lands where the figure belongs — after the real prose chunk that
+    # preceded it, inside the page block (not appended after everything).
+    assert md.index("The axes are given") < md.index("![Figure 1")
+
+
+def test_standalone_figure_keeps_its_caption_in_the_ref(tmp_path):
+    """When no chunk echoes the caption, the image ref keeps it (so the figure
+    is not left with an empty alt)."""
+    hires = tmp_path / "p.png"
+    Image.new("RGB", (2000, 1000)).save(hires)
+    doc = assemble_document(
+        "d", "/f.pdf", "arxiv",
+        [_page(1, chunks=[{"chunk_id": "1", "title": "Body", "keywords": [],
+                           "section_type": "results", "content": "Unrelated prose."}],
+               figures=[{"bbox": [100, 200, 600, 700], "caption": "Fig 7. Turbine map."}])],
+        hires_images={1: str(hires)}, crops_dir=str(tmp_path / "crops"), stitch=False,
+    )
+    md = synthesize_markdown(doc)
+    assert "![Fig 7. Turbine map.](img:1)" in md
+
+
+def test_raw_content_drops_caption_placeholder_chunks(tmp_path):
+    """In raw, the caption-echo chunk is dropped from Content; the caption is
+    still present once, in the Figures section."""
+    doc = _doc_with_caption_placeholder(tmp_path)
+    out = render_raw_text(doc)
+
+    content = out[out.index("# Content"):out.index("# Tables")]
+    assert "principal basis vectors" in content.lower()  # the real prose chunk
+    # ...but the caption-echo chunk is not duplicated into Content.
+    assert "Figure 1. Principal basis vectors." not in content
+    # The caption lives once, in the Figures section.
+    figures = out[out.index("# Figures"):]
+    assert "Figure 1. Principal basis vectors." in figures
