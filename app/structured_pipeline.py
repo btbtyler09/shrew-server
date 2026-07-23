@@ -244,6 +244,13 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
             "table_id": t["table_id"],
             "page": t["page"],
             "pages": t.get("pages", [t["page"]]),
+            # Long tables are split into <=3-page segments so no single entry
+            # outgrows an embedding/model context. Segments of one logical
+            # table are linked both directions and each repeats the header
+            # row: `continues` names the previous segment, `continued_by` the
+            # next (null for ordinary tables / chain ends).
+            "continues": t.get("continues"),
+            "continued_by": t.get("continued_by"),
             "bbox": t["bbox"],
             "caption": t["caption"],
             "html": t["html"],

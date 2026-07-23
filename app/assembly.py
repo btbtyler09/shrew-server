@@ -156,6 +156,37 @@ def should_stitch_tables(prev: dict, nxt: dict) -> bool:
     return True
 
 
+# Cap a merged table at this many pages. A long-running table (CLIN sheets,
+# data appendices) would otherwise grow into a single blob too large to embed
+# or to sit in a model context; at realistic table density 3 pages lands
+# around 6-9k tokens. Splits fall on page boundaries — segments are linked
+# both directions (`continues`/`continued_by`) and every segment repeats the
+# header row, so no segment is a headerless orphan.
+_STITCH_MAX_PAGES = 3
+
+
+def _inject_header_row(prev: dict, nxt: dict) -> None:
+    """Copy prev's header row to the top of nxt's html, in place.
+
+    Used when a continuation is declined for SIZE (we know it is the same
+    table — the gates passed): the new segment would otherwise be a headerless
+    orphan whose rows carry no column semantics for retrieval."""
+    psoup = BeautifulSoup(prev.get("html", ""), "html.parser")
+    prows = psoup.find_all("tr")
+    if not prows or not prows[0].find("th"):
+        return  # no header row to carry
+    nsoup = BeautifulSoup(nxt.get("html", ""), "html.parser")
+    nrows = nsoup.find_all("tr")
+    if not nrows:
+        return
+    if _norm_row_text(nrows[0]) == _norm_row_text(prows[0]):
+        return  # already repeats the header
+    header_copy = BeautifulSoup(str(prows[0]), "html.parser").find("tr")
+    nrows[0].insert_before(header_copy)
+    nxt["html"] = str(nsoup)
+    nxt["flat_text"] = table_flat_text(nxt["html"], nxt.get("caption"))
+
+
 def _rowappend_html(prev: dict, nxt: dict) -> str:
     """Deterministic merge: nxt's rows appended to prev's table, dropping a
     repeated header row. The fallback when no model refinement is available."""
@@ -276,6 +307,16 @@ def stitch_tables(tables: list[dict], refine=None) -> list[dict]:
         ts = by_page[p]
         head = ts[0]
         if tail is not None and tail_end_page == p - 1 and should_stitch_tables(tail, head):
+            if len(tail.get("pages", [tail["page"]])) >= _STITCH_MAX_PAGES:
+                # Same table, but the segment is full. Start a new linked
+                # segment on this page boundary: it inherits the header row so
+                # its rows keep column semantics, and the two-way
+                # continues/continued_by links record the relationship.
+                head["continues"] = tail["table_id"]
+                tail["continued_by"] = head["table_id"]
+                _inject_header_row(tail, head)
+                tail, tail_end_page = ts[-1], p
+                continue
             refined = None
             if refine is not None and len(tail.get("pages", [tail["page"]])) == 1:
                 refined = refine(tail, head)

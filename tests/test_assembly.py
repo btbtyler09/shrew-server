@@ -303,3 +303,71 @@ def test_composite_crops_are_bbox_padded():
     # margin(50) + the padded strip should contain the black line
     from PIL import ImageOps
     assert comp.convert("L").getextrema()[0] == 0, "padded content missing from crop"
+
+
+# ── page-capped stitching: <=3-page segments, linked both directions ───────
+
+
+def _cap_tbl(page, y0=0, y1=1000, rows=3, tid=None):
+    from app.assembly import table_flat_text
+    body = "".join(f"<tr><td>p{page}r{i}a</td><td>p{page}r{i}b</td></tr>"
+                   for i in range(rows))
+    html = f"<table><tr><th>Col1</th><th>Col2</th></tr>{body}</table>"
+    return {"table_id": tid or f"d_p{page}_t1", "page": page, "pages": [page],
+            "bbox": [100, y0, 900, y1], "caption": None, "html": html,
+            "flat_text": table_flat_text(html, None), "crop_path": None}
+
+
+def _chain(n_pages):
+    """n consecutive pages, each fully covered by one table fragment."""
+    return [_cap_tbl(p, y0=0, y1=1000) for p in range(1, n_pages + 1)]
+
+
+def test_three_pages_merge_into_one_segment():
+    out = stitch_tables(_chain(3))
+    assert len(out) == 1
+    assert out[0]["pages"] == [1, 2, 3]
+    assert "continues" not in out[0] and "continued_by" not in out[0]
+
+
+def test_fourth_page_starts_a_linked_segment():
+    out = stitch_tables(_chain(4))
+    assert len(out) == 2
+    seg1, seg2 = out
+    assert seg1["pages"] == [1, 2, 3] and seg2["pages"] == [4]
+    # Linked both directions.
+    assert seg1["continued_by"] == "d_p4_t1"
+    assert seg2["continues"] == "d_p1_t1"
+    # The new segment keeps header semantics (already repeated here -> once).
+    assert seg2["html"].count("<th>Col1</th>") == 1
+    assert seg2["flat_text"].startswith("Col1 | Col2")
+
+
+def test_seven_page_chain_makes_three_segments():
+    out = stitch_tables(_chain(7))
+    assert [t["pages"] for t in out] == [[1, 2, 3], [4, 5, 6], [7]]
+    assert out[0]["continued_by"] == out[1]["table_id"]
+    assert out[1]["continues"] == out[0]["table_id"]
+    assert out[1]["continued_by"] == out[2]["table_id"]
+    assert out[2]["continues"] == out[1]["table_id"]
+    assert "continued_by" not in out[2]
+
+
+def test_segment_without_repeated_header_gets_one_injected():
+    from app.assembly import _inject_header_row
+    t1 = _cap_tbl(1)
+    t2 = {"table_id": "d_p2_t1", "page": 2, "pages": [2],
+          "bbox": [100, 0, 900, 1000], "caption": None,
+          "html": "<table><tr><td>x</td><td>y</td></tr></table>",
+          "flat_text": "x | y", "crop_path": None}
+    _inject_header_row(t1, t2)
+    assert t2["html"].count("<th>Col1</th>") == 1
+    assert t2["flat_text"].startswith("Col1 | Col2")
+
+
+def test_header_not_duplicated_when_continuation_already_repeats_it():
+    from app.assembly import _inject_header_row
+    t1 = _cap_tbl(1, rows=3)
+    t2 = _cap_tbl(2, rows=3)  # same header already present
+    _inject_header_row(t1, t2)
+    assert t2["html"].count("<th>Col1</th>") == 1
