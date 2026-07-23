@@ -752,3 +752,48 @@ def test_oversize_composite_skips_model_call(tmp_path):
     assert client.calls == [], "no model call for an oversize composite"
     assert len(doc["tables"]) == 1 and doc["tables"][0]["pages"] == [1, 2]
     assert stats == {"attempted": 1}
+
+
+def test_refiner_exception_falls_back_instead_of_crashing(tmp_path):
+    """A transport failure (timeout, connection reset) during refinement must
+    degrade to the deterministic row-append — never fail the document."""
+    class ExplodingClient:
+        model = "shrew-ocr-preview"
+        def chat_completion(self, *a, **k):
+            raise TimeoutError("read timed out")
+
+    hires = {}
+    for p in (1, 2):
+        path = tmp_path / f"h{p}.png"
+        Image.new("RGB", (1700, 2200), "white").save(path)
+        hires[p] = str(path)
+    stats = {}
+    refiner = make_table_refiner(hires, str(tmp_path), ExplodingClient(), stats)
+    doc = assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
+                            table_refiner=refiner)
+    assert len(doc["tables"]) == 1
+    assert doc["tables"][0]["pages"] == [1, 2]
+    assert "<td>3</td>" in doc["tables"][0]["html"], "row-append fallback ran"
+    assert stats == {"attempted": 1}
+
+
+def test_refiner_passes_a_bounded_timeout(tmp_path):
+    from app.structured_pipeline import _REFINE_TIMEOUT_S
+
+    class RecordingClient(FakeClient):
+        def chat_completion(self, messages, max_tokens=8192, temperature=0.2,
+                             timeout=None, extra_params=None):
+            self.calls.append({"messages": messages, "timeout": timeout})
+            text, fr = self.replies.pop(0)
+            return {"choices": [{"finish_reason": fr, "message": {"content": text}}]}
+
+    hires = {}
+    for p in (1, 2):
+        path = tmp_path / f"h{p}.png"
+        Image.new("RGB", (1700, 2200), "white").save(path)
+        hires[p] = str(path)
+    client = RecordingClient([(REFINED_TABLE_JSON, "stop")])
+    refiner = make_table_refiner(hires, str(tmp_path), client, {})
+    assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
+                      table_refiner=refiner)
+    assert client.calls and client.calls[0]["timeout"] == _REFINE_TIMEOUT_S

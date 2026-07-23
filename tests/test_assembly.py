@@ -279,3 +279,27 @@ def test_assemble_document_stitches_tables_when_stitch_true():
     assert len(doc["tables"]) == 1
     assert doc["tables"][0]["pages"] == [1, 2]
     assert doc["tables"][0]["caption"] == "Parts"
+
+
+def test_pad_bbox_expands_and_clamps():
+    from app.assembly import pad_bbox
+    assert pad_bbox([100, 700, 900, 960], 40) == [60, 660, 940, 1000]
+    assert pad_bbox([10, 0, 995, 1000], 40) == [0, 0, 1000, 1000]
+
+
+def test_composite_crops_are_bbox_padded():
+    """The fragment crops must be larger than the raw bboxes dictate — a tight
+    crop can clip the header row, and the re-extraction can't recover content
+    that never made it into the composite."""
+    from app.assembly import build_table_composite
+    a = Image.new("RGB", (1000, 1000), "white")
+    # paint a black border just OUTSIDE the bbox: visible only if padded
+    px = a.load()
+    for x in range(80, 920):
+        px[x, 680] = (0, 0, 0)   # 20 units above bbox y0=700
+    b = Image.new("RGB", (1000, 1000), "white")
+    comp = build_table_composite(a, [100, 700, 900, 960], b, [100, 0, 900, 100])
+    assert comp is not None
+    # margin(50) + the padded strip should contain the black line
+    from PIL import ImageOps
+    assert comp.convert("L").getextrema()[0] == 0, "padded content missing from crop"

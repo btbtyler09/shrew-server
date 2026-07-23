@@ -194,15 +194,34 @@ def _merge_table(prev: dict, nxt: dict, refined=None) -> None:
     prev["pages"] = prev.get("pages", [prev["page"]]) + [nxt["page"]]
 
 
+# How far to expand a fragment's bbox (0-1000 normalized units) before
+# cropping. The model's bboxes are good but not pixel-perfect (figure F1@0.5
+# 0.902) — a tight crop can clip the header row or the fragment's last line,
+# and the re-extraction cannot recover content that never made it into the
+# composite. Padding is deliberately heavy because over-inclusion is free:
+# only tables are kept from the re-extraction, so any neighboring prose the
+# pad drags in is read into chunks that get discarded.
+_FRAGMENT_BBOX_PAD = 40
+
+
+def pad_bbox(bbox, pad: int = _FRAGMENT_BBOX_PAD) -> list:
+    """Expand a 0-1000 normalized bbox by `pad` units per side, clamped."""
+    x0, y0, x1, y1 = bbox
+    return [max(0, x0 - pad), max(0, y0 - pad),
+            min(1000, x1 + pad), min(1000, y1 + pad)]
+
+
 def build_table_composite(prev_img, prev_bbox, next_img, next_bbox,
-                           *, margin: int = 50, gap: int = 8):
+                           *, margin: int = 50, gap: int = 8,
+                           pad: int = _FRAGMENT_BBOX_PAD):
     """Compose two table-fragment crops onto one full page-sized canvas.
 
-    Crops each fragment from its hires page render (no minimum-area filter —
-    a continuation's top sliver can be tiny) and stacks them, heavily padded,
-    on a white canvas with the SAME dimensions as the source page. Text stays
-    at native scale and the canvas is exactly the geometry of a real page from
-    this document, so the standard 200→100 transform lands the model input
+    Each fragment's bbox is heavily padded (see _FRAGMENT_BBOX_PAD) and then
+    cropped from its hires page render (no minimum-area filter — a
+    continuation's top sliver can be tiny). The crops are stacked on a white
+    canvas with the SAME dimensions as the source page: text stays at native
+    scale and the canvas is exactly the geometry of a real page from this
+    document, so the standard 200→100 transform lands the model input
     squarely in the trained distribution — a page containing one table and a
     lot of white space.
 
@@ -213,8 +232,8 @@ def build_table_composite(prev_img, prev_bbox, next_img, next_bbox,
     the request timeout. Unfittable continuations fall back to the
     deterministic row-append.
     """
-    a = crop_bbox(prev_img, prev_bbox, min_area_frac=0.0)
-    b = crop_bbox(next_img, next_bbox, min_area_frac=0.0)
+    a = crop_bbox(prev_img, pad_bbox(prev_bbox, pad), min_area_frac=0.0)
+    b = crop_bbox(next_img, pad_bbox(next_bbox, pad), min_area_frac=0.0)
     if a is None or b is None:
         return None
     W, H = prev_img.size

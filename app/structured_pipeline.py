@@ -140,6 +140,13 @@ def _count_rows(html: str) -> int:
     return (html or "").count("<tr")
 
 
+# Per-attempt cap for the refinement model call. The verified-good case (RFQ
+# real-table composite) completes well under this; anything slower is the
+# model enumerating filler from a padded form-like region, and the row-append
+# fallback is already in hand.
+_REFINE_TIMEOUT_S = 120
+
+
 def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict):
     """Build the stitch_tables refine hook: re-extract a detected cross-page
     table from a composite of its two fragment crops.
@@ -178,12 +185,25 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
         hires_path = os.path.join(crops_dir, f"{prev['table_id']}_stitched.png")
         composite.save(hires_path)
 
-        # Same transform as every rasterized page: 200-DPI source -> 100-DPI
-        # enhanced luminance.
+        # Standard 200->100 halving for rasterized pages — but the canvas
+        # inherits the source page's pixel size, and for an uploaded scan that
+        # is its native resolution (a 400-DPI scan gives a 3400x4400 canvas).
+        # Normalize by long edge exactly like _model_input_src_dpi does, never
+        # upscaling, so the model input lands at trained scale.
+        eff_src = max(200, round(100 * max(composite.size) / TRAINED_LONG_EDGE))
         model_png = os.path.join(crops_dir, f"{prev['table_id']}_stitched_model.png")
-        prepare_image(composite, 100, 200).save(model_png)
+        prepare_image(composite, 100, eff_src).save(model_png)
 
-        res = extract_page(model_png, client)
+        # Refinement is an optional enhancement — it must never be able to
+        # fail the document. Any transport error (timeout included) means
+        # fall back to the row-append. The timeout is deliberately tighter
+        # than the default: a composite that sends the model into a slow
+        # enumeration (seen live on a form-heavy page) is not worth waiting
+        # 300s for when a good deterministic merge is already in hand.
+        try:
+            res = extract_page(model_png, client, timeout=_REFINE_TIMEOUT_S)
+        except Exception:
+            return None
         if not res["ok"] or not res["data"]:
             return None
         tables = [t for t in res["data"].get("tables", []) if t.get("html")]
