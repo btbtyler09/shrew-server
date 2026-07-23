@@ -156,18 +156,15 @@ def should_stitch_tables(prev: dict, nxt: dict) -> bool:
     return True
 
 
-def _merge_table(prev: dict, nxt: dict) -> None:
-    """Append nxt's rows to prev in place: drop a repeated header row, extend
-    html/flat_text, and record the extra page. prev keeps its table_id,
-    caption, bbox and (later) crop — the bbox/crop describe the first fragment
-    only, which is the honest best available (a merged bbox spanning two pages
-    is meaningless)."""
+def _rowappend_html(prev: dict, nxt: dict) -> str:
+    """Deterministic merge: nxt's rows appended to prev's table, dropping a
+    repeated header row. The fallback when no model refinement is available."""
     psoup = BeautifulSoup(prev.get("html", ""), "html.parser")
     nsoup = BeautifulSoup(nxt.get("html", ""), "html.parser")
     ptable = psoup.find("table")
     nrows = nsoup.find_all("tr")
     if ptable is None or not nrows:
-        return
+        return prev.get("html", "")
 
     prows = psoup.find_all("tr")
     if prows and _norm_row_text(nrows[0]) == _norm_row_text(prows[0]):
@@ -177,21 +174,76 @@ def _merge_table(prev: dict, nxt: dict) -> None:
     anchor = ptable.find("tbody") or ptable
     for row in nrows:
         anchor.append(row.extract())
+    return str(psoup)
 
-    prev["html"] = str(psoup)
+
+def _merge_table(prev: dict, nxt: dict, refined=None) -> None:
+    """Fold nxt into prev in place. prev keeps its table_id and caption.
+
+    `refined` is an optional (html, crop_path) from a model re-extraction of
+    the composite fragment image; when absent (or the refiner declined), the
+    deterministic row-append is used, and the bbox/crop keep describing the
+    first fragment only — the honest best available without a composite."""
+    if refined is not None:
+        prev["html"], crop_path = refined
+        if crop_path:
+            prev["crop_path"] = crop_path
+    else:
+        prev["html"] = _rowappend_html(prev, nxt)
     prev["flat_text"] = table_flat_text(prev["html"], prev.get("caption"))
     prev["pages"] = prev.get("pages", [prev["page"]]) + [nxt["page"]]
 
 
-def stitch_tables(tables: list[dict]) -> list[dict]:
+def build_table_composite(prev_img, prev_bbox, next_img, next_bbox,
+                           *, margin: int = 50, gap: int = 8):
+    """Compose two table-fragment crops onto one full page-sized canvas.
+
+    Crops each fragment from its hires page render (no minimum-area filter —
+    a continuation's top sliver can be tiny) and stacks them, heavily padded,
+    on a white canvas with the SAME dimensions as the source page. Text stays
+    at native scale and the canvas is exactly the geometry of a real page from
+    this document, so the standard 200→100 transform lands the model input
+    squarely in the trained distribution — a page containing one table and a
+    lot of white space.
+
+    Returns None when either crop fails or the fragments cannot fit the page
+    canvas at native scale. Never shrinks to fit: an empirical check
+    (2026-07-23, live model) showed a two-page composite scaled to the trained
+    long edge puts text at ~55% of trained scale and stalls generation into
+    the request timeout. Unfittable continuations fall back to the
+    deterministic row-append.
+    """
+    a = crop_bbox(prev_img, prev_bbox, min_area_frac=0.0)
+    b = crop_bbox(next_img, next_bbox, min_area_frac=0.0)
+    if a is None or b is None:
+        return None
+    W, H = prev_img.size
+    if a.height + b.height + 2 * margin + gap > H:
+        return None
+    canvas = Image.new("RGB", (W, H), "white")
+    canvas.paste(a, (min(margin, max(0, W - a.width)), margin))
+    canvas.paste(b, (min(margin, max(0, W - b.width)), margin + a.height + gap))
+    return canvas
+
+
+def stitch_tables(tables: list[dict], refine=None) -> list[dict]:
     """Merge cross-page table fragments in a page-ordered table list.
 
     Walks pages in order; when the first table of page N+1 passes
-    should_stitch_tables against the tail table of page N, its rows fold into
-    that table. Chains naturally across 3+ pages: a merged table remains the
-    tail candidate when the continuation was its page's only table. A failed
-    page in between breaks adjacency (its tables simply don't exist), so no
-    stitch happens across a gap.
+    should_stitch_tables against the tail table of page N, the fragments are
+    folded into one table. Chains naturally across 3+ pages: a merged table
+    remains the tail candidate when the continuation was its page's only
+    table. A failed page in between breaks adjacency (its tables simply don't
+    exist), so no stitch happens across a gap.
+
+    `refine`, when given, is called as refine(prev, nxt) on each merge pair
+    and may return (html, crop_path) from a model re-extraction of the
+    composite fragment image — the model resolves the seam (a row split
+    across the break, rowspan structure) better than row concatenation can.
+    Returning None falls back to the deterministic row-append, so stitching
+    never depends on the refiner succeeding. Refinement is only attempted on
+    the first join of a chain (a 2-fragment composite); later chain joins use
+    the row-append.
     """
     by_page: dict[int, list[dict]] = {}
     for t in tables:
@@ -205,7 +257,10 @@ def stitch_tables(tables: list[dict]) -> list[dict]:
         ts = by_page[p]
         head = ts[0]
         if tail is not None and tail_end_page == p - 1 and should_stitch_tables(tail, head):
-            _merge_table(tail, head)
+            refined = None
+            if refine is not None and len(tail.get("pages", [tail["page"]])) == 1:
+                refined = refine(tail, head)
+            _merge_table(tail, head, refined=refined)
             merged_away.add(id(head))
             rest = ts[1:]
             if rest:
@@ -246,7 +301,8 @@ def join_doc_summary(page_summaries: list) -> str:
 
 
 def assemble_document(doc_id, file_path, source, page_results,
-                       hires_images=None, *, stitch=True, crops_dir=None) -> dict:
+                       hires_images=None, *, stitch=True, crops_dir=None,
+                       table_refiner=None) -> dict:
     """Build the canonical document record from ordered per-page results.
 
     page_results: list of {"page": int, "ok": bool, "data": dict|None} in
@@ -313,7 +369,7 @@ def assemble_document(doc_id, file_path, source, page_results,
             })
 
     if stitch:
-        tables = stitch_tables(tables)
+        tables = stitch_tables(tables, refine=table_refiner)
 
     figures = []
     for pr in ok_pages:
@@ -350,6 +406,8 @@ def assemble_document(doc_id, file_path, source, page_results,
                 for table in page_tables.get(page, []):
                     if table["bbox"] is None:
                         continue
+                    if table.get("crop_path"):
+                        continue  # a stitched composite already covers it
                     crop = crop_bbox(hires_img, table["bbox"])
                     if crop is not None:
                         crop_path = os.path.join(crops_dir, f"{table['table_id']}.png")

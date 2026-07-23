@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
 from . import rasterizer
-from .assembly import assemble_document
+from .assembly import assemble_document, build_table_composite
 from .models import PipelineResult
 from .pipeline import CancelledException
 from .preprocess import prepare_image
@@ -134,6 +134,72 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
     """Run extraction on one paginated block of extracted text."""
     return _page_result(page_no, extract_text_page(text, client))
+
+
+def _count_rows(html: str) -> int:
+    return (html or "").count("<tr")
+
+
+def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict):
+    """Build the stitch_tables refine hook: re-extract a detected cross-page
+    table from a composite of its two fragment crops.
+
+    The composite (fragment crops heavily padded onto a full page-sized white
+    canvas — exactly trained geometry) goes through the standard
+    image-modality path: prepare_image then extract_page, same
+    sentinel/sampling/gates as any page. The model resolves the seam properly
+    (a row split across the break, rowspan structure), which row
+    concatenation cannot. ONLY the re-extraction's tables are used; whatever
+    metadata/summary/chunks/figures the model reads into the synthetic image
+    are discarded.
+
+    Declines (returns None -> deterministic row-append fallback) when the
+    fragments cannot fit a page canvas at native text scale (never shrinks —
+    sub-scale text empirically stalls the model), when extraction fails any
+    gate, or when the re-extracted table has fewer rows than the larger
+    fragment (the known dropped-trailing-tables failure mode). On success
+    returns (html, crop_path); the hires composite doubles as the merged
+    table's crop.
+    """
+    def refine(prev: dict, nxt: dict):
+        stats["attempted"] = stats.get("attempted", 0) + 1
+        prev_hires = hires_images.get(prev["page"])
+        next_hires = hires_images.get(nxt["page"])
+        if not prev_hires or not next_hires:
+            return None
+
+        with Image.open(prev_hires) as pi, Image.open(next_hires) as ni:
+            composite = build_table_composite(pi, prev["bbox"], ni, nxt["bbox"])
+        if composite is None:
+            return None
+
+        crops_dir = os.path.join(output_dir, "crops")
+        os.makedirs(crops_dir, exist_ok=True)
+        hires_path = os.path.join(crops_dir, f"{prev['table_id']}_stitched.png")
+        composite.save(hires_path)
+
+        # Same transform as every rasterized page: 200-DPI source -> 100-DPI
+        # enhanced luminance.
+        model_png = os.path.join(crops_dir, f"{prev['table_id']}_stitched_model.png")
+        prepare_image(composite, 100, 200).save(model_png)
+
+        res = extract_page(model_png, client)
+        if not res["ok"] or not res["data"]:
+            return None
+        tables = [t for t in res["data"].get("tables", []) if t.get("html")]
+        if not tables:
+            return None
+        best = max(tables, key=lambda t: _count_rows(t["html"]))
+        # The model may legitimately return FEWER rows than the two fragments
+        # combined (it joins the seam row) — but fewer than the larger single
+        # fragment means content was dropped.
+        if _count_rows(best["html"]) < max(_count_rows(prev.get("html", "")),
+                                            _count_rows(nxt.get("html", ""))):
+            return None
+        stats["model_refined"] = stats.get("model_refined", 0) + 1
+        return best["html"], hires_path
+
+    return refine
 
 
 def build_structured_json(doc: dict, total_pages: int) -> dict:
@@ -608,10 +674,17 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     with open(file_path, "rb") as f:
         doc_id = hashlib.sha256(f.read()).hexdigest()[:16]
 
+    # Model-refined table stitching needs the hires renders — image modality
+    # only (text-modality tables have null bboxes and never stitch anyway).
+    stitch_stats: dict = {}
+    table_refiner = (make_table_refiner(hires_images, output_dir, client, stitch_stats)
+                     if hires_images else None)
+
     doc = assemble_document(
         doc_id, file_path, input_class, page_results,
         hires_images=hires_images, stitch=True,
         crops_dir=os.path.join(output_dir, "crops"),
+        table_refiner=table_refiner,
     )
 
     if raw:
@@ -634,6 +707,10 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         "failed_pages": sum(1 for pr in page_results if not pr["ok"]),
         "modality": "text" if input_class in TEXT_CLASSES else "image",
         "gates": gate_metrics(page_results),
+        "table_stitch": {
+            "attempted": stitch_stats.get("attempted", 0),
+            "model_refined": stitch_stats.get("model_refined", 0),
+        },
     }
 
     return PipelineResult(clean_markdown, structured_json, processing_log)

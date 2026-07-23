@@ -628,3 +628,127 @@ def test_raw_content_drops_caption_placeholder_chunks(tmp_path):
     # The caption lives once, in the Figures section.
     figures = out[out.index("# Figures"):]
     assert "Figure 1. Principal basis vectors." in figures
+
+
+# ── model-refined table stitching ───────────────────────────────────────────
+
+
+from app.assembly import build_table_composite
+from app.structured_pipeline import make_table_refiner
+
+
+def test_build_table_composite_pads_to_full_page_geometry(tmp_path):
+    a = Image.new("RGB", (1700, 2200), "white")
+    b = Image.new("RGB", (1700, 2200), "white")
+    # fragments: bottom 30% of page 1, top 20% of page 2
+    comp = build_table_composite(a, [100, 700, 900, 1000], b, [100, 0, 900, 200])
+    assert comp is not None
+    # Heavily padded to EXACTLY the source page dims, so the standard 200→100
+    # transform lands the model input squarely in the trained distribution.
+    assert comp.size == (1700, 2200)
+    assert comp.getpixel((2, 2)) == (255, 255, 255)
+
+
+def test_build_table_composite_never_shrinks_to_fit():
+    """Two near-full-page fragments cannot fit a page canvas at native scale;
+    shrinking is forbidden (sub-scale text stalls the model — verified live),
+    so the builder declines and the caller falls back to row-append."""
+    a = Image.new("RGB", (1700, 2200), "white")
+    b = Image.new("RGB", (1700, 2200), "white")
+    assert build_table_composite(a, [50, 90, 950, 950], b, [50, 90, 950, 1000]) is None
+
+
+def _stitchable_pages():
+    """Two pages whose tables pass should_stitch_tables."""
+    frag1 = "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+    frag2 = "<table><tr><td>3</td><td>4</td></tr></table>"
+    return [
+        _page(1, tables=[{"bbox": [100, 800, 900, 1000], "caption": "Parts", "html": frag1}]),
+        _page(2, tables=[{"bbox": [100, 0, 900, 150], "caption": None, "html": frag2}]),
+    ]
+
+
+REFINED_TABLE_JSON = json.dumps({
+    "metadata": {"title": None, "authors": [], "organization": None,
+                 "year": None, "doc_type": None},
+    "summary": "s", "semantic_chunks": [], "figures": [],
+    "tables": [{"bbox": [50, 50, 950, 950], "caption": "Parts",
+                "html": ("<table><tr><th>A</th><th>B</th></tr>"
+                          "<tr><td>1</td><td>2</td></tr>"
+                          "<tr><td>3</td><td>4</td></tr></table>")}],
+})
+
+
+def _refiner_fixture(tmp_path, replies):
+    hires = {}
+    for p in (1, 2):
+        path = tmp_path / f"h{p}.png"
+        Image.new("RGB", (1700, 2200), "white").save(path)
+        hires[p] = str(path)
+    stats = {}
+    client = FakeClient(replies)
+    refiner = make_table_refiner(hires, str(tmp_path), client, stats)
+    return refiner, stats, client
+
+
+def test_refined_stitch_uses_model_html_and_composite_crop(tmp_path):
+    refiner, stats, client = _refiner_fixture(tmp_path, [(REFINED_TABLE_JSON, "stop")])
+    doc = assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
+                            table_refiner=refiner)
+    assert len(doc["tables"]) == 1
+    t = doc["tables"][0]
+    assert t["pages"] == [1, 2] and t["caption"] == "Parts"
+    # Model html, not row-append: one coherent table with 3 rows.
+    assert t["html"].count("<tr") == 3
+    # The hires composite became the merged table's crop.
+    assert t["crop_path"] and t["crop_path"].endswith("_stitched.png")
+    assert Path(t["crop_path"]).exists()
+    assert stats == {"attempted": 1, "model_refined": 1}
+    # The model call went through the standard image modality (image part).
+    assert isinstance(client.calls[0]["messages"][1]["content"], list)
+
+
+def test_failed_refinement_falls_back_to_rowappend(tmp_path):
+    refiner, stats, _ = _refiner_fixture(
+        tmp_path, [("not json", "stop"), ("still not json", "stop")])
+    doc = assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
+                            table_refiner=refiner)
+    assert len(doc["tables"]) == 1
+    t = doc["tables"][0]
+    # Stitched anyway — deterministically.
+    assert t["pages"] == [1, 2]
+    assert "<td>3</td>" in t["html"] and "<td>1</td>" in t["html"]
+    assert not t.get("crop_path")
+    assert stats == {"attempted": 1}
+
+
+def test_refinement_that_drops_rows_is_rejected(tmp_path):
+    dropped = json.dumps({
+        "metadata": {"title": None, "authors": [], "organization": None,
+                     "year": None, "doc_type": None},
+        "summary": "s", "semantic_chunks": [], "figures": [],
+        "tables": [{"bbox": None, "caption": None,
+                    "html": "<table><tr><td>only</td></tr></table>"}],
+    })
+    refiner, stats, _ = _refiner_fixture(tmp_path, [(dropped, "stop")])
+    doc = assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
+                            table_refiner=refiner)
+    t = doc["tables"][0]
+    # 1-row re-extraction < 2-row fragment -> fallback row-append (3 rows).
+    assert t["html"].count("<tr") == 3
+    assert stats == {"attempted": 1}
+
+
+def test_oversize_composite_skips_model_call(tmp_path):
+    # Full-page fragments on both sides: composite ~4400px tall > 2400 cap.
+    frag = "<table><tr><td>x</td><td>y</td></tr></table>"
+    pages = [
+        _page(1, tables=[{"bbox": [0, 0, 1000, 1000], "caption": None, "html": frag}]),
+        _page(2, tables=[{"bbox": [0, 0, 1000, 100], "caption": None, "html": frag}]),
+    ]
+    # page-1 table spans the whole page (y0=0,y1=1000) and page-2 starts at top
+    refiner, stats, client = _refiner_fixture(tmp_path, [])
+    doc = assemble_document("d", "/f.pdf", "arxiv", pages, table_refiner=refiner)
+    assert client.calls == [], "no model call for an oversize composite"
+    assert len(doc["tables"]) == 1 and doc["tables"][0]["pages"] == [1, 2]
+    assert stats == {"attempted": 1}
