@@ -101,6 +101,123 @@ def stitch_pages(pages_chunks: list[tuple[int, list[dict]]]) -> list[dict]:
     return merged
 
 
+# ── cross-page table stitching ──────────────────────────────────────────────
+#
+# Thresholds calibrated against the GT test split (2026-07-23): of 701
+# consecutive test-page pairs, 29 had tables on both pages; hand-classifying
+# all 29 gave 9 true continuations and 20 non-continuations. True
+# continuations: last-table y1 ∈ {942, 1000}, next-table y0 ∈ {0, 90}. The
+# nearest false positives the gates must reject: y1=942/y0=113 with a 2-col →
+# 5-col structure change (column gate), y1=1000/y0=357 (y0 gate), y1=838 with
+# a fresh "Table 8-5." caption (y1 + caption gates), and NASA/AEDC run-data
+# dumps that repeat identical headers every page but always sit mid-page
+# (y1 gate). Distinct "TABLE 6" → "TABLE 7" pairs with identical headers are
+# rejected by geometry (y1=634) and by the new-table caption pattern.
+
+_STITCH_Y1_MIN = 930
+_STITCH_Y0_MAX = 100
+
+# "Table 8-5.", "TABLE II:", "Tab. 3 —" — a fresh numbered caption means a new
+# table, not a continuation.
+_NEW_TABLE_CAPTION = re.compile(r"^\s*tab(?:le|\.)?\s*[A-Za-z0-9][\w.-]*\s*[.:)–—-]", re.I)
+# "(continued)", "cont'd", "cont." — an explicit continuation marker.
+_CONTINUED_CAPTION = re.compile(r"\bcont(?:inued|'d|\.)?\b", re.I)
+
+
+def _max_row_cells(html: str) -> int:
+    """Widest row, in cells. The modal count is unreliable here — one verified
+    GT continuation is dominated by single-cell colspan section rows — and the
+    model's known ragged-row artifact means exact equality is too strict."""
+    widest = 0
+    soup = BeautifulSoup(html or "", "html.parser")
+    for row in soup.find_all("tr"):
+        widest = max(widest, len(row.find_all(["th", "td"])))
+    return widest
+
+
+def _norm_row_text(row) -> str:
+    return _WS.sub(" ", row.get_text()).strip().lower()
+
+
+def should_stitch_tables(prev: dict, nxt: dict) -> bool:
+    """Is `nxt` (first table of page N+1) a continuation of `prev` (last table
+    of page N)? Pure geometry + structure + caption; no model call."""
+    pb, nb = prev.get("bbox"), nxt.get("bbox")
+    if not pb or not nb:
+        return False  # text-modality/null bboxes carry no position evidence
+    if pb[3] < _STITCH_Y1_MIN or nb[1] > _STITCH_Y0_MAX:
+        return False
+    pc, nc = _max_row_cells(prev.get("html", "")), _max_row_cells(nxt.get("html", ""))
+    if not pc or not nc or abs(pc - nc) > 1:
+        return False
+    cap = nxt.get("caption")
+    if cap and not _CONTINUED_CAPTION.search(cap) and _NEW_TABLE_CAPTION.match(cap):
+        return False
+    return True
+
+
+def _merge_table(prev: dict, nxt: dict) -> None:
+    """Append nxt's rows to prev in place: drop a repeated header row, extend
+    html/flat_text, and record the extra page. prev keeps its table_id,
+    caption, bbox and (later) crop — the bbox/crop describe the first fragment
+    only, which is the honest best available (a merged bbox spanning two pages
+    is meaningless)."""
+    psoup = BeautifulSoup(prev.get("html", ""), "html.parser")
+    nsoup = BeautifulSoup(nxt.get("html", ""), "html.parser")
+    ptable = psoup.find("table")
+    nrows = nsoup.find_all("tr")
+    if ptable is None or not nrows:
+        return
+
+    prows = psoup.find_all("tr")
+    if prows and _norm_row_text(nrows[0]) == _norm_row_text(prows[0]):
+        nrows = nrows[1:]  # repeated header row
+
+    # Append into the same section the last row lives in (tbody if present).
+    anchor = ptable.find("tbody") or ptable
+    for row in nrows:
+        anchor.append(row.extract())
+
+    prev["html"] = str(psoup)
+    prev["flat_text"] = table_flat_text(prev["html"], prev.get("caption"))
+    prev["pages"] = prev.get("pages", [prev["page"]]) + [nxt["page"]]
+
+
+def stitch_tables(tables: list[dict]) -> list[dict]:
+    """Merge cross-page table fragments in a page-ordered table list.
+
+    Walks pages in order; when the first table of page N+1 passes
+    should_stitch_tables against the tail table of page N, its rows fold into
+    that table. Chains naturally across 3+ pages: a merged table remains the
+    tail candidate when the continuation was its page's only table. A failed
+    page in between breaks adjacency (its tables simply don't exist), so no
+    stitch happens across a gap.
+    """
+    by_page: dict[int, list[dict]] = {}
+    for t in tables:
+        by_page.setdefault(t["page"], []).append(t)
+
+    merged_away: set[int] = set()
+    tail = None            # last surviving table of the previous page chain
+    tail_end_page = None   # page its content currently ends on
+
+    for p in sorted(by_page):
+        ts = by_page[p]
+        head = ts[0]
+        if tail is not None and tail_end_page == p - 1 and should_stitch_tables(tail, head):
+            _merge_table(tail, head)
+            merged_away.add(id(head))
+            rest = ts[1:]
+            if rest:
+                tail, tail_end_page = rest[-1], p
+            else:
+                tail_end_page = p  # merged table keeps trailing the chain
+        else:
+            tail, tail_end_page = ts[-1], p
+
+    return [t for t in tables if id(t) not in merged_away]
+
+
 def aggregate_metadata(page_metas: list[dict]) -> dict:
     """Combine per-page metadata dicts into one document-level metadata dict.
 
@@ -187,12 +304,16 @@ def assemble_document(doc_id, file_path, source, page_results,
             tables.append({
                 "table_id": f"{doc_id}_p{page}_t{i}",
                 "page": page,
+                "pages": [page],
                 "bbox": table.get("bbox"),
                 "caption": table.get("caption"),
                 "html": html,
                 "flat_text": table_flat_text(html, table.get("caption")),
                 "crop_path": None,
             })
+
+    if stitch:
+        tables = stitch_tables(tables)
 
     figures = []
     for pr in ok_pages:

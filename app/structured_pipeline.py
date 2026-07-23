@@ -157,6 +157,7 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
         tables.append({
             "table_id": t["table_id"],
             "page": t["page"],
+            "pages": t.get("pages", [t["page"]]),
             "bbox": t["bbox"],
             "caption": t["caption"],
             "html": t["html"],
@@ -408,7 +409,10 @@ def render_raw_text(doc: dict) -> str:
     # ── Tables ──────────────────────────────────────────────────────────────
     table_blocks = []
     for i, t in enumerate(doc["tables"], start=1):
-        head = f"## Table {i} (page {t['page']})"
+        tpages = t.get("pages", [t["page"]])
+        where = (f"page {t['page']}" if len(tpages) == 1
+                 else f"pages {tpages[0]}–{tpages[-1]}")
+        head = f"## Table {i} ({where})"
         if t.get("caption"):
             head += f" — {t['caption']}"
         # flat_text already leads with the caption when there is one, so use

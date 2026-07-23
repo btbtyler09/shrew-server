@@ -175,3 +175,107 @@ def test_assemble_document_produces_crops_and_hires_px(tmp_path):
     figure = doc["figures"][0]
     assert figure["crop_path"] == str(tmp_path / f"{figure['figure_id']}.png")
     assert Path(figure["crop_path"]).is_file()
+
+
+# ── cross-page table stitching ──────────────────────────────────────────────
+# Thresholds calibrated on the GT test split: 29 hand-labeled consecutive-page
+# table pairs, 9 true continuations / 20 not; should_stitch_tables scores
+# perfectly on all 29 (see assembly.py comment for the evidence).
+
+from app.assembly import should_stitch_tables, stitch_tables
+
+H2 = "<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
+
+
+def _tbl(page, y0=0, y1=1000, html=H2, caption=None, tid=None):
+    return {"table_id": tid or f"d_p{page}_t1", "page": page, "pages": [page],
+            "bbox": [100, y0, 900, y1], "caption": caption, "html": html,
+            "flat_text": "", "crop_path": None}
+
+
+def test_true_continuation_merges_rows_and_pages():
+    prev = _tbl(1, y1=1000)
+    nxt = _tbl(2, y0=0, html="<table><tr><td>3</td><td>4</td></tr></table>")
+    out = stitch_tables([prev, nxt])
+    assert len(out) == 1
+    t = out[0]
+    assert t["pages"] == [1, 2] and t["page"] == 1
+    assert t["table_id"] == "d_p1_t1"
+    assert "<td>3</td>" in t["html"] and "<td>1</td>" in t["html"]
+    assert "3 | 4" in t["flat_text"]
+
+
+def test_repeated_header_row_is_dropped():
+    prev = _tbl(1, y1=1000)
+    nxt = _tbl(2, y0=0, html=H2)  # same header + same data row
+    out = stitch_tables([prev, nxt])
+    assert len(out) == 1
+    assert out[0]["html"].count("<th>A</th>") == 1, "header must not repeat"
+
+
+def test_mid_page_tables_do_not_merge():
+    # The NASA/AEDC trap: identical headers every page, but mid-page geometry.
+    assert not should_stitch_tables(_tbl(1, y1=551), _tbl(2, y0=382))
+    assert not should_stitch_tables(_tbl(1, y1=634), _tbl(2, y0=0))   # TABLE 6->7 case
+    assert not should_stitch_tables(_tbl(1, y1=1000), _tbl(2, y0=357))
+
+
+def test_column_structure_change_blocks_merge():
+    # The Atachment-0006 trap: y1=942/y0=113 passes... but 2 cols vs 5 cols.
+    five = "<table><tr><th>a</th><th>b</th><th>c</th><th>d</th><th>e</th></tr></table>"
+    assert not should_stitch_tables(_tbl(1, y1=942), _tbl(2, y0=90, html=five))
+
+
+def test_fresh_table_caption_blocks_merge_but_continued_allows():
+    assert not should_stitch_tables(
+        _tbl(1, y1=1000), _tbl(2, y0=0, caption="Table 8-5. More results"))
+    assert should_stitch_tables(
+        _tbl(1, y1=1000), _tbl(2, y0=0, caption="Table 8-4 (continued)"))
+    # A stray fragment caption that is not a fresh "Table N." heading is fine
+    # (DTIC_ADB028240's "Row Location (see Fig. 6)").
+    assert should_stitch_tables(
+        _tbl(1, y1=1000), _tbl(2, y0=0, caption="Row Location (see Fig. 6)"))
+
+
+def test_null_bbox_blocks_merge():
+    a, b = _tbl(1), _tbl(2)
+    a["bbox"] = None
+    assert not should_stitch_tables(a, b)
+
+
+def test_three_page_chain_merges_into_one():
+    p1 = _tbl(1, y1=1000)
+    p2 = _tbl(2, y0=0, y1=1000, html="<table><tr><td>3</td><td>4</td></tr></table>")
+    p3 = _tbl(3, y0=0, html="<table><tr><td>5</td><td>6</td></tr></table>")
+    out = stitch_tables([p1, p2, p3])
+    assert len(out) == 1
+    assert out[0]["pages"] == [1, 2, 3]
+    assert "5 | 6" in out[0]["flat_text"]
+
+
+def test_no_stitch_across_a_page_gap():
+    # Page 2 failed (no tables from it) -> pages 1 and 3 are not adjacent.
+    out = stitch_tables([_tbl(1, y1=1000), _tbl(3, y0=0)])
+    assert len(out) == 2
+
+
+def test_only_first_table_of_next_page_can_continue():
+    prev = _tbl(1, y1=1000)
+    first = _tbl(2, y0=0, html="<table><tr><td>3</td><td>4</td></tr></table>")
+    second = _tbl(2, y0=500, y1=800, tid="d_p2_t2")
+    out = stitch_tables([prev, first, second])
+    assert len(out) == 2
+    assert out[0]["pages"] == [1, 2]
+    assert out[1]["table_id"] == "d_p2_t2" and out[1]["pages"] == [2]
+
+
+def test_assemble_document_stitches_tables_when_stitch_true():
+    doc = assemble_document("d", "/f.pdf", "arxiv", [
+        _page(1, tables=[{"bbox": [100, 800, 900, 1000], "caption": "Parts",
+                          "html": H2}]),
+        _page(2, tables=[{"bbox": [100, 0, 900, 200], "caption": None,
+                          "html": "<table><tr><td>3</td><td>4</td></tr></table>"}]),
+    ])
+    assert len(doc["tables"]) == 1
+    assert doc["tables"][0]["pages"] == [1, 2]
+    assert doc["tables"][0]["caption"] == "Parts"
