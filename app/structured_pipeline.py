@@ -128,12 +128,27 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     model_png = os.path.join(pages_dir, f"page_{page_no:04d}_model.png")
     enh.save(model_png)
 
-    return _page_result(page_no, extract_page(model_png, client))
+    # A transport failure (timeout under queue pressure, connection reset) on
+    # ONE page must surface as a page-level failure record, never crash the
+    # document (§5.2 discipline — same as parse/schema failures).
+    try:
+        return _page_result(page_no, extract_page(model_png, client))
+    except Exception as e:
+        return _page_result(page_no, {
+            "ok": False, "data": None, "status": "transport_error",
+            "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
+        })
 
 
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
     """Run extraction on one paginated block of extracted text."""
-    return _page_result(page_no, extract_text_page(text, client))
+    try:
+        return _page_result(page_no, extract_text_page(text, client))
+    except Exception as e:
+        return _page_result(page_no, {
+            "ok": False, "data": None, "status": "transport_error",
+            "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
+        })
 
 
 def _count_rows(html: str) -> int:
@@ -646,6 +661,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
 
     client = client or VLMClient(
         base_url=config.vlm_url, model=config.vlm_model, api_key=config.api_key,
+        default_timeout=1200,
     )
 
     if progress is not None and progress.is_cancelled():

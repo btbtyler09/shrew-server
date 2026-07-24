@@ -797,3 +797,20 @@ def test_refiner_passes_a_bounded_timeout(tmp_path):
     assemble_document("d", "/f.pdf", "arxiv", _stitchable_pages(),
                       table_refiner=refiner)
     assert client.calls and client.calls[0]["timeout"] == _REFINE_TIMEOUT_S
+
+
+def test_transport_failure_on_one_page_does_not_crash_the_doc(tmp_path):
+    """A timeout/connection-reset on a single page call must produce a
+    page-level failure record (§5.2), never a doc-level exception."""
+    class TimeoutClient:
+        model = "shrew-ocr-preview"
+        def chat_completion(self, *a, **k):
+            raise TimeoutError("read timed out")
+
+    doc_path = tmp_path / "doc.png"
+    Image.new("RGB", (1700, 2200), "white").save(doc_path)
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(), client=TimeoutClient(),
+    )
+    assert result.processing_log["failed_pages"] == 1
+    assert result.structured_json["semantic_chunks"] == []
