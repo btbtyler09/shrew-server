@@ -147,18 +147,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"  Pipeline concurrency: {_config.pipeline_concurrency}")
     logger.info("=" * 60)
 
-    # Initialize heron-101 figure detector
-    try:
-        from .docling_client import create_figure_converter
-        figure_device = os.environ.get("DOCLING_DEVICE", "auto")
-        _figure_converter = create_figure_converter(device=figure_device)
-        if _figure_converter:
-            logger.info("Heron-101 figure detector ready")
-        else:
-            logger.info("torch/transformers not available — figure detection disabled")
-    except Exception as e:
-        logger.warning(f"Failed to initialize figure detector: {e}")
-        _figure_converter = None
+    # The heron-101 figure detector is a LEGACY-pipeline dependency only —
+    # the structured path gets figure bboxes from the OCR model itself. Load
+    # it lazily on the first conventional/vlm request instead of paying ~5s
+    # and several GB of RAM at startup for a model the default path never uses.
+    logger.info("Figure detector: lazy (loads on first legacy-mode request)")
 
     # Discover LoRA adapters from Shrew vLLM server
     if _config.shrew_vllm_url:
@@ -287,6 +280,32 @@ _STRUCTURED_ELIGIBLE_CLASSES = {"pdf", "image", "office",
 _STRUCTURED_MODES = {"structured", "raw"}
 
 
+_figure_converter_lock = threading.Lock()
+_figure_converter_loaded = False
+
+
+def _get_figure_converter():
+    """Load the legacy heron-101 figure detector on first use (thread-safe)."""
+    global _figure_converter, _figure_converter_loaded
+    if _figure_converter_loaded:
+        return _figure_converter
+    with _figure_converter_lock:
+        if _figure_converter_loaded:
+            return _figure_converter
+        try:
+            from .docling_client import create_figure_converter
+            device = os.environ.get("DOCLING_DEVICE", "auto")
+            _figure_converter = create_figure_converter(device=device)
+            logger.info("Heron-101 figure detector loaded (lazy)"
+                        if _figure_converter else
+                        "torch/transformers unavailable — figure detection disabled")
+        except Exception as e:
+            logger.warning(f"Failed to initialize figure detector: {e}")
+            _figure_converter = None
+        _figure_converter_loaded = True
+    return _figure_converter
+
+
 def _save_upload(upload: UploadFile) -> str:
     """Save uploaded file to a temp path and return the path."""
     suffix = os.path.splitext(upload.filename or "doc.pdf")[1].lower()
@@ -393,7 +412,7 @@ async def convert(
                     )
                 return run_pipeline(
                     tmp_path, output_dir, config,
-                    figure_converter=_figure_converter,
+                    figure_converter=_get_figure_converter(),
                     vlm_pool=_vlm_pool,
                 )
 
@@ -491,7 +510,7 @@ async def convert_stream(
             else:
                 result = run_pipeline(
                     tmp_path, output_dir, config,
-                    figure_converter=_figure_converter,
+                    figure_converter=_get_figure_converter(),
                     progress=progress,
                     vlm_pool=_vlm_pool,
                 )
