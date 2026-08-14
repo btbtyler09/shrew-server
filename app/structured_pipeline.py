@@ -156,7 +156,7 @@ def _model_input_src_dpi(size, config, input_class: str) -> int:
 
 
 def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
-                       input_class: str = "pdf") -> dict:
+                       input_class: str = "pdf", fallback_client=None) -> dict:
     """Prepare the model input image for one page and run extraction on it."""
     pages_dir = os.path.join(output_dir, "pages")
     os.makedirs(pages_dir, exist_ok=True)
@@ -178,12 +178,32 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     # ONE page must surface as a page-level failure record, never crash the
     # document (§5.2 discipline — same as parse/schema failures).
     try:
-        return _page_result(page_no, extract_page(model_png, client), bucket)
+        result = _page_result(page_no, extract_page(model_png, client), bucket)
     except Exception as e:
-        return _page_result(page_no, {
+        result = _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
             "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
         }, bucket)
+
+    # Optional rescue: a failed page goes to the fallback model with the
+    # teacher-lineage prompt, rendered glyph-aware from the NATIVE hires page
+    # (generic VLMs tile arbitrary resolutions themselves — the bucket
+    # pinpoints are Granite-specific and do not transfer). A rescue can only
+    # upgrade a page; on any fallback failure the primary record stands.
+    if not result["ok"] and fallback_client is not None:
+        from . import fallback as fb
+        data = fb.extract_page_fallback(
+            hires_path, cached_glyph_height(Image.open(hires_path), hires_path),
+            fallback_client,
+            output_path=os.path.join(pages_dir, f"page_{page_no:04d}_fallback.png"),
+        )
+        if data is not None:
+            result = _page_result(page_no, {
+                "ok": True, "data": data, "status": "fallback_ok",
+                "error": None, "attempts": 1, "raw_len": 0,
+            }, bucket)
+            result["fallback"] = True
+    return result
 
 
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
@@ -633,6 +653,9 @@ def gate_metrics(page_results: list[dict]) -> dict:
         # grind the zlib guard cannot see). Not counted in `retried` — the
         # abort deliberately skips the enforcement retry.
         "wall_clock_aborts": sum(1 for s in statuses if s == "wall_clock_abort"),
+        # Pages rescued by the fallback model (teacher-lineage prompt). Outside
+        # the validated e4 distribution — downstream can filter on this.
+        "fallback_pages": sum(1 for s in statuses if s == "fallback_ok"),
         "empty_completions": sum(1 for s in statuses if s == "empty_completion"),
         "overlong_failed": sum(1 for s in statuses if s == "overlong_failed"),
         "first_pass_fail_rate": round((n - sum(1 for s in statuses if s == "ok")) / n, 4) if n else 0.0,
@@ -732,6 +755,8 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         base_url=config.vlm_url, model=config.vlm_model, api_key=config.api_key,
         default_timeout=1200,
     )
+    from . import fallback as _fb
+    fallback_client = _fb.make_fallback_client()
 
     if progress is not None and progress.is_cancelled():
         raise CancelledException()
@@ -761,7 +786,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
             futures = {
                 pool.submit(
                     _process_one_page, pno, page_images[pno][1], config, output_dir,
-                    client, input_class,
+                    client, input_class, fallback_client,
                 ): pno
                 for pno in page_numbers
             }

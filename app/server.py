@@ -263,6 +263,15 @@ async def ui():
     return HTMLResponse(UI_HTML)
 
 
+def _fallback_health() -> dict:
+    from . import fallback as fb
+    if not fb.enabled():
+        return {"enabled": False}
+    return {"enabled": True, "model": fb.FALLBACK_MODEL or "(auto)",
+            "glyph_target": fb.FALLBACK_GLYPH_TARGET,
+            "max_long_edge": fb.FALLBACK_MAX_LONG_EDGE}
+
+
 @app.get("/health")
 async def health():
     unavailable = []
@@ -307,6 +316,7 @@ async def health():
             "ratio": STREAM_GUARD_RATIO,
             "consecutive": STREAM_GUARD_CONSECUTIVE,
         },
+        "fallback": _fallback_health(),
     }
     if not capacity["ok"]:
         body["status"] = "degraded"
