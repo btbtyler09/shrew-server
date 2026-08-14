@@ -39,7 +39,8 @@ class FakeStreamClient:
         self.calls = 0
 
     def chat_completion_stream(self, messages, max_tokens=None, temperature=None,
-                               timeout=None, extra_params=None, on_delta=None):
+                               timeout=None, extra_params=None, on_delta=None,
+                               wall_clock_s=None):
         self.calls += 1
         parts, acc, stop = [], "", None
         for i in range(0, len(self.body), 100):

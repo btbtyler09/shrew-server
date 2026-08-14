@@ -629,6 +629,10 @@ def gate_metrics(page_results: list[dict]) -> dict:
         # any batching heuristic keys off this distribution (§2.1).
         "buckets": buckets,
         "oversize_filtered": sum(1 for s in statuses if s == "oversize"),
+        # Pages whose stream exceeded the wall-clock bound (varied-gibberish
+        # grind the zlib guard cannot see). Not counted in `retried` — the
+        # abort deliberately skips the enforcement retry.
+        "wall_clock_aborts": sum(1 for s in statuses if s == "wall_clock_abort"),
         "empty_completions": sum(1 for s in statuses if s == "empty_completion"),
         "overlong_failed": sum(1 for s in statuses if s == "overlong_failed"),
         "first_pass_fail_rate": round((n - sum(1 for s in statuses if s == "ok")) / n, 4) if n else 0.0,

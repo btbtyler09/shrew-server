@@ -179,8 +179,13 @@ class VLMClient:
         timeout: Optional[int] = None,
         extra_params: Optional[dict] = None,
         on_delta: Optional[Callable[[str, str], Optional[str]]] = None,
+        wall_clock_s: Optional[float] = None,
     ) -> dict:
         """Streaming chat completion, assembled into the non-streaming response shape.
+
+        ``wall_clock_s`` bounds the TOTAL stream duration; ``timeout`` only
+        bounds the gap between bytes, so a trickling generation never trips it.
+        On expiry the stream aborts with ``finish_reason: "wall_clock_abort"``.
 
         Returns the same ``{"choices": [{"message": {...}, "finish_reason": ...}]}``
         dict as ``chat_completion``, so callers can treat the two identically.
@@ -224,6 +229,13 @@ class VLMClient:
             ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines(decode_unicode=True):
+                    if wall_clock_s is not None and time.time() - start > wall_clock_s:
+                        aborted = "wall_clock_abort"
+                        finish_reason = aborted
+                        logger.warning(
+                            f"wall_clock_abort after {time.time() - start:.0f}s "
+                            f"({len(''.join(parts))} chars emitted)")
+                        break
                     if not line:
                         continue
                     if line.startswith("data:"):

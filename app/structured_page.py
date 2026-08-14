@@ -385,6 +385,16 @@ STREAM_GUARD_ENABLED = os.environ.get("SHREW_LOOP_GUARD", "1").strip().lower() n
 
 REPETITION_ABORT = "repetition_abort"
 
+# Wall-clock bound on one streamed generation. The §5.2 guard only catches
+# COMPRESSIBLE loops; a manuscript page emitting varied gibberish rides to the
+# 20k-token cap unaborted, and at congested per-request decode speeds that ran
+# past two hours (measured live, VHR corpus run 2026-08-14: GNHK handwriting
+# tail p100 5,408s). requests' `timeout` cannot bound this — it applies to gaps
+# between bytes, and a grinding stream never stops trickling. 3600s allows the
+# slowest legitimate page (20k tokens at ~10 tok/s is ~2000s) with margin.
+WALL_CLOCK_ABORT = "wall_clock_abort"
+STREAM_WALL_CLOCK_S = float(os.environ.get("SHREW_PAGE_WALL_CLOCK", "3600"))
+
 
 class RepetitionGuard:
     """Trailing-window compression check over a token stream.
@@ -587,6 +597,7 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout):
     result = client.chat_completion_stream(
         messages, max_tokens=max_tokens, temperature=temperature,
         extra_params=extra_params, timeout=timeout, on_delta=guard,
+        wall_clock_s=STREAM_WALL_CLOCK_S,
     )
     choice = result["choices"][0]
     return choice["message"].get("content") or "", choice.get("finish_reason"), guard
@@ -611,6 +622,16 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> 
     if verdict == "ok":
         return _result(True, parsed, "ok", None, 1, len(text),
                        loop_guard=guard.stats() if guard else None)
+
+    if finish_reason == WALL_CLOCK_ABORT:
+        # No retry: greedy is deterministic, so an enforcement retry grinds for
+        # the full cap again before failing the same way. Fail the page now and
+        # keep the doc moving — the retry tier is for failures a second call
+        # can actually change.
+        return _result(False, None, "wall_clock_abort",
+                       f"stream exceeded {STREAM_WALL_CLOCK_S:.0f}s wall clock "
+                       f"({len(text)} chars emitted)",
+                       1, len(text), loop_guard=guard.stats() if guard else None)
 
     # ── Retry tier: ONE attempt, enforcement on, flagged ────────────────────
     # Greedy is deterministic: an identical request reproduces the identical
