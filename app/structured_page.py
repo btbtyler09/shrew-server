@@ -603,7 +603,30 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout):
     return choice["message"].get("content") or "", choice.get("finish_reason"), guard
 
 
-def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> dict:
+def _content_chars(sj: dict) -> int:
+    """Characters of actual extracted content in a 5-key result — chunk text,
+    table markup, figure captions, summary. JSON scaffolding excluded."""
+    n = len(sj.get("summary") or "")
+    for c in sj.get("semantic_chunks") or []:
+        if isinstance(c, dict):
+            n += len(c.get("content") or "") + len(c.get("title") or "")
+    for t in sj.get("tables") or []:
+        if isinstance(t, dict):
+            n += len(t.get("html") or "")
+    for f in sj.get("figures") or []:
+        if isinstance(f, dict):
+            n += len(f.get("caption") or "")
+    return n
+
+
+# Coercion-density floor for image pages (chars of extracted content). The one
+# measured slop case carried 206; a dense page's real text runs 5-15k. 300 is
+# far under any legitimate coerced dense page while comfortably above the slop.
+COERCED_MIN_CHARS = int(os.environ.get("SHREW_COERCED_MIN_CHARS", "300"))
+
+
+def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
+             min_content_chars: int = 0) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry."""
     params = get_generation_params(client.model, "structured_page")
 
@@ -654,6 +677,22 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> 
     stats = (rguard or guard).stats() if (rguard or guard) else None
 
     if rverdict == "ok":
+        # Coercion-density gate. Enforcement can produce WELL-FORMED slop: a
+        # dense broadsheet whose first pass looped came back from the retry as
+        # valid JSON carrying 206 chars of hallucinated names against 13,948
+        # chars of real page text — it passed every gate and silently poisoned
+        # its 43 retrieval queries (VHR run 2026-08-14). A coerced rescue that
+        # emits almost nothing from a RENDERED page is not a rescue. First-pass
+        # successes are exempt: sparse pages (posters, covers) legitimately say
+        # little, but they don't need coercion to say it.
+        if min_content_chars and _content_chars(rparsed) < min_content_chars:
+            return _result(False, None, "coerced_empty",
+                           f"coerced output carries {_content_chars(rparsed)} "
+                           f"content chars (< {min_content_chars}) on a rendered "
+                           f"page — hallucination-slop signature, counted failed",
+                           2, len(rtext), schema_coerced=True,
+                           degenerate=(first_verdict == "degenerate"),
+                           repetition_abort=aborted, loop_guard=stats)
         # Well-formed but outside the validated distribution — flag it so
         # downstream can filter or de-rank.
         return _result(True, rparsed, "ok_coerced", None, 2, len(rtext),
@@ -688,8 +727,13 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
     Returns {"ok", "data", "status", "error", "attempts", "raw_len",
              "schema_coerced", "degenerate", "repetition_abort", "loop_guard"}.
     """
+    # The coercion-density floor applies to image pages only: a rendered page
+    # that needed the enforcement retry AND produced almost no content is the
+    # hallucination-slop signature. Text pages are exempt — a tiny text segment
+    # legitimately coerces to a tiny result.
     return _extract(build_image_messages(image_path), client,
-                    max_tokens=max_tokens, timeout=timeout)
+                    max_tokens=max_tokens, timeout=timeout,
+                    min_content_chars=COERCED_MIN_CHARS)
 
 
 def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,

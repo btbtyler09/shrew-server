@@ -30,8 +30,14 @@ from app.structured_page import (
 # by every test below is enough (contents are irrelevant, only bytes matter).
 Path("/tmp/fake.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
 
+# Content is deliberately > SHREW_COERCED_MIN_CHARS: several tests route GOOD
+# through the enforcement retry, and a coerced result below the density floor
+# now fails as hallucination slop (see test_coerced_density.py).
+_BODY = "Real extracted page text with actual substance to it. " * 8
 GOOD = ('{"metadata":{"title":null,"authors":[],"organization":null,"year":null,'
-        '"doc_type":null},"summary":"s","semantic_chunks":[],"figures":[],"tables":[]}')
+        '"doc_type":null},"summary":"s","semantic_chunks":[{"chunk_id":"c1",'
+        '"title":"Body","section_type":"technical_content","content":"' + _BODY +
+        '"}],"figures":[],"tables":[]}')
 
 # Parses and passes the schema, but bad section_type -> schema gate failure.
 BAD_SCHEMA = ('{"metadata":{"title":null,"authors":[],"organization":null,'

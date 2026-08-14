@@ -653,6 +653,10 @@ def gate_metrics(page_results: list[dict]) -> dict:
         # grind the zlib guard cannot see). Not counted in `retried` — the
         # abort deliberately skips the enforcement retry.
         "wall_clock_aborts": sum(1 for s in statuses if s == "wall_clock_abort"),
+        # Coerced retries rejected by the density floor — well-formed JSON whose
+        # content was hallucination slop (~1% of the page's real text). Counted
+        # failed so they never poison retrieval silently.
+        "coerced_empty": sum(1 for s in statuses if s == "coerced_empty"),
         # Pages rescued by the fallback model (teacher-lineage prompt). Outside
         # the validated e4 distribution — downstream can filter on this.
         "fallback_pages": sum(1 for s in statuses if s == "fallback_ok"),
