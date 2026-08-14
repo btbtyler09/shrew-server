@@ -3,23 +3,27 @@
 Implements the serving contract in shrew_ocr/deploy/SHREW_OCR_PREVIEW.md.
 Two input modalities, one output schema:
 
-  * image — a page rendered at 200 DPI and put through ``preprocess.prepare_image``
-    (luminance, downscaled to 100 DPI), sent as a data-URI image part.
+  * image — a page routed to a glyph-matched tile bucket by
+    ``preprocess.prepare_image_bucketed`` (§2.1) and sent as a data-URI image
+    part.
   * text  — messy HTML/markdown/code/plain text sent as a raw string. Same
     5-key output; ``figures[].bbox`` / ``tables[].bbox`` come back null.
 
-Sampling is EXACTLY ``temperature 0, max_tokens 12000`` (§3). Gate F measured
+Sampling is EXACTLY ``temperature 0, max_tokens 20000`` (§3.1). Gate F measured
 penalty-free unconstrained greedy, so any decode knob here voids the published
-eval numbers. Because greedy is deterministic, an identical retry reproduces
-an identical failure — the only retry allowed is ONE attempt with
-``structured_outputs`` enforcement, and any page that survives it is flagged
-``schema_coerced`` so downstream can filter or de-rank it.
+eval numbers. Streaming is not a decode knob — it changes nothing about what the
+model emits, only when we can see it, which is what lets the §5.2 guard abort a
+loop instead of paying for the full cap. Because greedy is deterministic, an
+identical retry reproduces an identical failure — the only retry allowed is ONE
+attempt with ``structured_outputs`` enforcement, and any page that survives it
+is flagged ``schema_coerced`` so downstream can filter or de-rank it.
 
 # parse_json_lenient vendored from shrew_ocr/structured_eval/run_structured.py; validate_schema/SECTION_ENUM from shrew_ocr/structured_eval/metrics_v2.py — keep in sync.
 """
 
 import json
 import logging
+import os
 import re
 import threading
 import zlib
@@ -32,10 +36,23 @@ logger = logging.getLogger("shrew.structured_page")
 
 SENTINEL = "structured_extraction"
 
-# §3: the eval setting. Longest GT ≈ 6.1k tokens; 12000 leaves headroom.
-MAX_TOKENS = 12000
-# §4 serving recipe: vllm serve ... --max-model-len 16384
-MAX_MODEL_LEN = 16384
+# §3.1 (e4, supersedes the 12000/16384 pair). `max_model_len` bounds prompt and
+# output TOGETHER, and on the largest tile bucket the image dominates: at
+# --max-model-len 16384 a B3 page could emit only 7,872 tokens, while the median
+# correct newspaper-class label is 6,891 with a tail past 12k. That cap truncated
+# real content, and the truncation is indistinguishable from a loop downstream —
+# it was misdiagnosed as model truncation twice. Measured cost of the raise: none
+# (KV cache 1,157,984 tokens, 36x concurrency headroom at TP=4).
+MAX_TOKENS = int(os.environ.get("SHREW_MAX_TOKENS", "20000"))
+# §4 serving recipe: vllm serve ... --max-model-len 32768
+MAX_MODEL_LEN = int(os.environ.get("SHREW_MAX_MODEL_LEN", "32768"))
+
+# §2.1 image-token cost per tile bucket, and the measured prompt-text overhead
+# (sentinel + chat template + image placeholder scaffolding). Used to verify the
+# output budget is actually REACHABLE on the largest bucket rather than merely
+# configured — the silent-ceiling failure this constant pair exists to prevent.
+BUCKET_IMAGE_TOKENS = {"B0": 1200, "B1": 1920, "B2": 3672, "B3": 7152}
+PROMPT_TEXT_TOKENS = 1360
 # Conservative chars-per-token. Real ratios on this corpus run 3.5-4.5;
 # a low divisor over-estimates tokens, which fails safe.
 CHARS_PER_TOKEN = 3.5
@@ -70,6 +87,53 @@ def context_limit_chars(max_model_len: int = MAX_MODEL_LEN,
     max_model_len.
     """
     return int((max_model_len - max_tokens) * CHARS_PER_TOKEN)
+
+
+def output_room(bucket: str, max_model_len: int = MAX_MODEL_LEN) -> int:
+    """Tokens a page in `bucket` can actually emit, given the served context.
+
+    This is the number that bit twice (§3.1): `max_tokens` is an upper bound the
+    server will silently undercut when the prompt leaves less room, so a page can
+    stop at 7,872 tokens with `max_tokens=12000` configured and look like model
+    truncation.
+    """
+    return max_model_len - BUCKET_IMAGE_TOKENS.get(bucket, 0) - PROMPT_TEXT_TOKENS
+
+
+def check_output_budget(max_model_len: int = MAX_MODEL_LEN,
+                        max_tokens: int = MAX_TOKENS) -> dict:
+    """Verify the configured output budget is REACHABLE on every tile bucket.
+
+    Acceptance criterion for shrew-server-public#1/#2: an effective ceiling below
+    the configured `max_tokens` is a silent truncation, so it is surfaced on
+    /health and logged loudly at startup rather than discovered from bad output.
+    """
+    rooms = {b: output_room(b, max_model_len) for b in BUCKET_IMAGE_TOKENS}
+    short = {b: r for b, r in rooms.items() if r < max_tokens}
+    return {
+        "max_model_len": max_model_len,
+        "max_tokens": max_tokens,
+        "output_room": rooms,
+        "ok": not short,
+        "constrained_buckets": short,
+    }
+
+
+def warn_if_budget_unreachable(max_model_len: int = MAX_MODEL_LEN,
+                               max_tokens: int = MAX_TOKENS) -> dict:
+    report = check_output_budget(max_model_len, max_tokens)
+    if not report["ok"]:
+        logger.error(
+            "OUTPUT BUDGET UNREACHABLE: max_model_len=%d leaves %s — below the "
+            "configured max_tokens=%d. Pages in those buckets will be truncated "
+            "silently and the truncation is indistinguishable from a loop. "
+            "Serve with --max-model-len %d (§3.1).",
+            max_model_len,
+            ", ".join(f"{b}:{r}" for b, r in sorted(report["constrained_buckets"].items())),
+            max_tokens,
+            max(BUCKET_IMAGE_TOKENS.values()) + PROMPT_TEXT_TOKENS + max_tokens,
+        )
+    return report
 
 
 # --------------------------------------------------------------------------- vendored: parse_json_lenient (run_structured.py)
@@ -293,6 +357,97 @@ def is_degenerate(raw: str, gate: float = ZLIB_GATE_RATIO) -> bool:
     return zlib_ratio(raw) > gate
 
 
+# --------------------------------------------------------------------------- §5.2 streaming repetition guard
+
+# Detect loops DURING generation, not after. Without this a loop runs to the
+# full output cap: 46% of newspaper pages consumed all 20,000 tokens producing
+# garbage, and enabling the guard took screening throughput from 37 to 415
+# pages/hr on the same hardware.
+#
+# Whole-stream compression cannot do this job — a page that emits 8k tokens of
+# correct content and then degenerates still has a healthy overall ratio,
+# because the good prefix dominates. The window must be trailing.
+#
+# CALIBRATED on 252 dense pages (§5.2), NOT inherited from the §5.1 document
+# gate: a short window of structured JSON — repeated keys, field names,
+# punctuation — compresses far harder than a whole document, so 7.0 would fire
+# on legitimate content. At these settings the guard fires at median 4,404
+# chars with ZERO false positives across 150 clean pages (clean window maxima:
+# median 2.1, p95 3.9, max 10.1) while loops score 34-86. 15.0 sits in a wide
+# empty gap; 10 would not.
+STREAM_GUARD_WINDOW_CHARS = int(os.environ.get("SHREW_LOOP_WINDOW", "2000"))
+STREAM_GUARD_CHECK_EVERY_CHARS = int(os.environ.get("SHREW_LOOP_CHECK_EVERY", "800"))
+STREAM_GUARD_RATIO = float(os.environ.get("SHREW_LOOP_RATIO", "15.0"))
+STREAM_GUARD_CONSECUTIVE = int(os.environ.get("SHREW_LOOP_CONSECUTIVE", "2"))
+STREAM_GUARD_ENABLED = os.environ.get("SHREW_LOOP_GUARD", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+REPETITION_ABORT = "repetition_abort"
+
+
+class RepetitionGuard:
+    """Trailing-window compression check over a token stream.
+
+    Use as the ``on_delta`` callback of ``VLMClient.chat_completion_stream``:
+    returns None to continue, or ``REPETITION_ABORT`` to stop the generation.
+
+    Requires ``consecutive`` violating windows before aborting. A single window
+    can spike on legitimately repetitive content (a dense numeric table, a long
+    run of near-identical rows); requiring the condition to persist costs a few
+    hundred tokens of latency and removes that false-positive class. Checks
+    start only once a FULL window has accumulated — a partial window of JSON
+    scaffolding compresses much harder than a real one.
+    """
+
+    def __init__(self, window: int = STREAM_GUARD_WINDOW_CHARS,
+                 check_every: int = STREAM_GUARD_CHECK_EVERY_CHARS,
+                 threshold: float = STREAM_GUARD_RATIO,
+                 consecutive: int = STREAM_GUARD_CONSECUTIVE):
+        self.window = window
+        self.check_every = check_every
+        self.threshold = threshold
+        self.consecutive = consecutive
+        self.violations = 0
+        self.ratio = 0.0
+        self.max_ratio = 0.0
+        self.position = 0
+        self.fired = False
+        self._next_check = window
+
+    def __call__(self, chunk: str, accumulated: str):
+        n = len(accumulated)
+        if n < self._next_check:
+            return None
+        self._next_check = n + self.check_every
+        self.ratio = zlib_ratio(accumulated[-self.window:])
+        self.max_ratio = max(self.max_ratio, self.ratio)
+        if self.ratio <= self.threshold:
+            self.violations = 0
+            return None
+        self.violations += 1
+        if self.violations < self.consecutive:
+            return None
+        self.fired = True
+        self.position = n
+        logger.warning(
+            "repetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
+            "for %d consecutive windows",
+            n, self.ratio, self.threshold, self.violations,
+        )
+        return REPETITION_ABORT
+
+    def stats(self) -> dict:
+        return {
+            "aborted": self.fired,
+            "ratio": round(self.ratio, 2),
+            "max_window_ratio": round(self.max_ratio, 2),
+            "position_chars": self.position,
+            "threshold": self.threshold,
+            "window_chars": self.window,
+        }
+
+
 # --------------------------------------------------------------------------- message construction
 
 
@@ -358,7 +513,8 @@ def reset_empty_200_streak() -> None:
 
 
 def _result(ok, data, status, error, attempts, raw_len, *,
-            schema_coerced=False, degenerate=False) -> dict:
+            schema_coerced=False, degenerate=False, repetition_abort=False,
+            loop_guard=None) -> dict:
     return {
         "ok": ok,
         "data": data,
@@ -368,15 +524,26 @@ def _result(ok, data, status, error, attempts, raw_len, *,
         "raw_len": raw_len,
         "schema_coerced": schema_coerced,
         "degenerate": degenerate,
+        "repetition_abort": repetition_abort,
+        "loop_guard": loop_guard,
     }
 
 
-def _gate(text: str, finish_reason: str | None):
+def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" = None):
     """Run the §5 gates over one completion.
 
     Returns (parsed, verdict, error) where verdict is one of
     "ok" | "parse" | "schema" | "degenerate" | "length" | "empty".
     """
+    if finish_reason == REPETITION_ABORT:
+        # §5.2: an aborted page is looped BY THE ABORT, never re-derived from
+        # the truncated text. Stopping early leaves less output, and a loop
+        # killed at ~1.5k chars can score a whole-string ratio around 5 — under
+        # the §5.1 gate — so re-deriving would silently count it clean.
+        obs = guard.ratio if guard else 0.0
+        pos = guard.position if guard else len(text)
+        return None, "degenerate", (f"repetition_abort: trailing-window zlib ratio "
+                                    f"{obs:.1f} at {pos} chars")
     if finish_reason == "length":
         # Truncated mid-object. Never parse a partial per §3 — treat as a
         # parse-class failure so it takes the one enforcement retry.
@@ -399,25 +566,51 @@ def _gate(text: str, finish_reason: str | None):
     return parsed, "ok", None
 
 
+def _call(messages, client, *, max_tokens, temperature, extra_params, timeout):
+    """One model call, streamed when the §5.2 guard is on.
+
+    Streaming changes nothing about sampling — greedy is greedy — so the eval
+    numbers are untouched; it only makes the output observable while it is being
+    produced, which is what lets a loop be aborted instead of paid for in full.
+    Returns (text, finish_reason, guard). A server that cannot stream falls back
+    to the blocking path with the guard disabled rather than failing the page.
+    """
+    if not (STREAM_GUARD_ENABLED and hasattr(client, "chat_completion_stream")):
+        result = client.chat_completion(
+            messages, max_tokens=max_tokens, temperature=temperature,
+            extra_params=extra_params, timeout=timeout,
+        )
+        choice = result["choices"][0]
+        return choice["message"].get("content") or "", choice.get("finish_reason"), None
+
+    guard = RepetitionGuard()
+    result = client.chat_completion_stream(
+        messages, max_tokens=max_tokens, temperature=temperature,
+        extra_params=extra_params, timeout=timeout, on_delta=guard,
+    )
+    choice = result["choices"][0]
+    return choice["message"].get("content") or "", choice.get("finish_reason"), guard
+
+
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry."""
     params = get_generation_params(client.model, "structured_page")
 
     # ── First pass: minimal params, no enforcement ──────────────────────────
-    result = client.chat_completion(
-        messages,
+    text, finish_reason, guard = _call(
+        messages, client,
         max_tokens=max_tokens,
         temperature=params["temperature"],
         extra_params=params["extra_params"],
         timeout=timeout,
     )
-    choice = result["choices"][0]
-    text = choice["message"].get("content") or ""
-    parsed, verdict, error = _gate(text, choice.get("finish_reason"))
+    parsed, verdict, error = _gate(text, finish_reason, guard)
     _note_completion(verdict == "empty")
+    aborted = finish_reason == REPETITION_ABORT
 
     if verdict == "ok":
-        return _result(True, parsed, "ok", None, 1, len(text))
+        return _result(True, parsed, "ok", None, 1, len(text),
+                       loop_guard=guard.stats() if guard else None)
 
     # ── Retry tier: ONE attempt, enforcement on, flagged ────────────────────
     # Greedy is deterministic: an identical request reproduces the identical
@@ -427,23 +620,24 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> 
     first_verdict = verdict
     first_error = error
 
-    retry = client.chat_completion(
-        messages,
+    rtext, rfinish, rguard = _call(
+        messages, client,
         max_tokens=max_tokens,
         temperature=params["temperature"],
         extra_params={**(params["extra_params"] or {}), **enforcement_params()},
         timeout=timeout,
     )
-    rchoice = retry["choices"][0]
-    rtext = rchoice["message"].get("content") or ""
-    rparsed, rverdict, rerror = _gate(rtext, rchoice.get("finish_reason"))
+    rparsed, rverdict, rerror = _gate(rtext, rfinish, rguard)
     _note_completion(rverdict == "empty")
+    aborted = aborted or rfinish == REPETITION_ABORT
+    stats = (rguard or guard).stats() if (rguard or guard) else None
 
     if rverdict == "ok":
         # Well-formed but outside the validated distribution — flag it so
         # downstream can filter or de-rank.
         return _result(True, rparsed, "ok_coerced", None, 2, len(rtext),
-                       schema_coerced=True, degenerate=(first_verdict == "degenerate"))
+                       schema_coerced=True, degenerate=(first_verdict == "degenerate"),
+                       repetition_abort=aborted, loop_guard=stats)
 
     # Still failing → page-level failure record; the doc-level pipeline continues.
     status = {
@@ -454,7 +648,8 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None) -> 
     return _result(False, None, status,
                    f"first={first_verdict}:{first_error}; retry={rverdict}:{rerror}",
                    2, len(rtext), degenerate=(first_verdict == "degenerate"
-                                              or rverdict == "degenerate"))
+                                              or rverdict == "degenerate"),
+                   repetition_abort=aborted, loop_guard=stats)
 
 
 # --------------------------------------------------------------------------- public API
@@ -464,13 +659,13 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
                   timeout=None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
-    ``image_path`` must already be ``preprocess.prepare_image`` output — a
-    200-DPI render reduced to 100-DPI luminance. Feeding anything else (a raw
-    render, a different DPI) changes the model's output distribution and voids
-    the eval numbers.
+    ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
+    — fitted to its glyph-routed tile bucket, then enhanced. Feeding anything
+    else (a raw render, the legacy fixed DPI downscale) changes the model's
+    output distribution and voids the eval numbers.
 
     Returns {"ok", "data", "status", "error", "attempts", "raw_len",
-             "schema_coerced", "degenerate"}.
+             "schema_coerced", "degenerate", "repetition_abort", "loop_guard"}.
     """
     return _extract(build_image_messages(image_path), client,
                     max_tokens=max_tokens, timeout=timeout)

@@ -37,8 +37,19 @@ from .rasterizer import (
     classify_file,
 )
 from .progress import ProgressReporter
-from .structured_page import EMPTY_200_ALERT_THRESHOLD, empty_200_streak
-from .structured_pipeline import run_structured_pipeline
+from .structured_page import (
+    EMPTY_200_ALERT_THRESHOLD,
+    MAX_MODEL_LEN,
+    MAX_TOKENS,
+    STREAM_GUARD_CONSECUTIVE,
+    STREAM_GUARD_ENABLED,
+    STREAM_GUARD_RATIO,
+    STREAM_GUARD_WINDOW_CHARS,
+    check_output_budget,
+    empty_200_streak,
+    warn_if_budget_unreachable,
+)
+from .structured_pipeline import IMAGE_TRANSFORM, run_structured_pipeline
 from .ui import UI_HTML
 from .vlm_client import VLMClient
 
@@ -102,6 +113,9 @@ _shrew_lora_format: str = "none"
 _vlm_pool = None
 _pipeline_sem: Optional[asyncio.Semaphore] = None
 _pipeline_gate: Optional[threading.Semaphore] = None
+# Context length the VLM is actually serving, read from /v1/models at startup.
+# None means the probe failed; the configured constant is used as a fallback.
+_served_max_model_len: Optional[int] = None
 
 
 # ── Lifespan ─────────────────────────────────────────────────────────────────
@@ -128,21 +142,33 @@ async def lifespan(app: FastAPI):
     _pipeline_sem = asyncio.Semaphore(_config.pipeline_concurrency)
     _pipeline_gate = threading.Semaphore(_config.pipeline_concurrency)
 
-    # Auto-detect VLM model name if not set
-    if not _config.vlm_model:
-        try:
-            resp = requests.get(f"{_config.vlm_url.rstrip('/')}/v1/models", timeout=5)
-            resp.raise_for_status()
-            models = resp.json().get("data", [])
-            if models:
+    # Auto-detect the VLM model name and the served context length. The context
+    # length is not cosmetic: `max_model_len` bounds prompt + output together, so
+    # a server started with too small a value silently truncates large-bucket
+    # pages below the configured max_tokens (§3.1 — misdiagnosed as model
+    # truncation twice). Check the real server, not our own constant.
+    global _served_max_model_len
+    try:
+        resp = requests.get(f"{_config.vlm_url.rstrip('/')}/v1/models", timeout=5)
+        resp.raise_for_status()
+        models = resp.json().get("data", [])
+        if models:
+            if not _config.vlm_model:
                 _config.vlm_model = models[0]["id"]
                 logger.info(f"Auto-detected VLM model: {_config.vlm_model}")
-        except Exception as e:
-            logger.warning(f"Failed to auto-detect VLM model: {e}")
+            served = next((m.get("max_model_len") for m in models
+                           if m.get("id") == _config.vlm_model), None)
+            _served_max_model_len = served or models[0].get("max_model_len")
+    except Exception as e:
+        logger.warning(f"Failed to query VLM /v1/models: {e}")
+
+    warn_if_budget_unreachable(_served_max_model_len or MAX_MODEL_LEN)
 
     logger.info("=" * 60)
     logger.info("SHREW SERVER STARTING")
     logger.info(f"  VLM: {_config.vlm_url} / {_config.vlm_model}")
+    logger.info(f"  Context: max_model_len={_served_max_model_len or 'unknown'} "
+                f"max_tokens={MAX_TOKENS} transform={IMAGE_TRANSFORM}")
     logger.info(f"  VLM concurrency: {_config.vlm_concurrency}")
     logger.info(f"  Pipeline concurrency: {_config.pipeline_concurrency}")
     logger.info("=" * 60)
@@ -263,7 +289,29 @@ async def health():
             content={"status": "degraded", "empty_200_streak": streak,
                      "detail": "consecutive empty completions — restart the model server"},
         )
-    return {"status": "ok", "empty_200_streak": streak}
+
+    # Serving-contract config. `capacity.ok` false means the served
+    # max_model_len cannot reach the configured max_tokens on some tile bucket:
+    # those pages will be truncated silently, and the truncation looks exactly
+    # like a loop downstream. That is a misconfiguration, not a runtime fault,
+    # so it degrades the probe too.
+    capacity = check_output_budget(_served_max_model_len or MAX_MODEL_LEN)
+    body = {
+        "status": "ok",
+        "empty_200_streak": streak,
+        "image_transform": IMAGE_TRANSFORM,
+        "capacity": capacity,
+        "loop_guard": {
+            "enabled": STREAM_GUARD_ENABLED,
+            "window_chars": STREAM_GUARD_WINDOW_CHARS,
+            "ratio": STREAM_GUARD_RATIO,
+            "consecutive": STREAM_GUARD_CONSECUTIVE,
+        },
+    }
+    if not capacity["ok"]:
+        body["status"] = "degraded"
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 _SUPPORTED_EXTENSIONS = (

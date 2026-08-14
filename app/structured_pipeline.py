@@ -2,8 +2,9 @@
 
 One model, two modalities, one output schema (SHREW_OCR_PREVIEW.md §2):
 
-  * pdf/image/office -> rasterize at 200 DPI -> preprocess.prepare_image
-    (luminance, 100 DPI) -> extract_page                  [image modality]
+  * pdf/image/office -> rasterize at 200 DPI ->
+    preprocess.prepare_image_bucketed (glyph-routed tile bucket, then the v2
+    luminance enhancement) -> extract_page                [image modality]
   * text/csv/spreadsheet -> the deterministic extractor for that format
     (text_extract/spreadsheet_extract/msg_extract) -> paginate ->
     extract_text_page                                     [text modality]
@@ -35,7 +36,7 @@ from . import rasterizer
 from .assembly import assemble_document, build_table_composite
 from .models import PipelineResult
 from .pipeline import CancelledException
-from .preprocess import prepare_image
+from .preprocess import glyph_height, prepare_image, prepare_image_bucketed
 from .rasterizer import classify_file, prepare_pages
 from .structured_page import extract_page, extract_text_page, paginate_text
 from .text_extract import extract_text
@@ -73,7 +74,7 @@ def _b64(path) -> str | None:
         return base64.b64encode(f.read()).decode()
 
 
-def _page_result(page_no: int, res: dict) -> dict:
+def _page_result(page_no: int, res: dict, bucket: str | None = None) -> dict:
     """Project an extract_* result into the shape assemble_document wants,
     keeping the gate outcome so processing_log can report §5 health metrics."""
     return {
@@ -83,12 +84,50 @@ def _page_result(page_no: int, res: dict) -> dict:
         "status": res["status"],
         "schema_coerced": res.get("schema_coerced", False),
         "degenerate": res.get("degenerate", False),
+        "repetition_abort": res.get("repetition_abort", False),
+        "bucket": bucket,
     }
 
 
-# The trained model-input geometry. Every page in the corpus was rendered at
-# 200 DPI and halved to 100 DPI — uniformly 1700x2200 -> 850x1100, i.e. a long
-# edge of 1100 (verified across the test split: no other size occurs).
+# §2.1 (e4): the image transform is glyph-routed tile buckets. The pre-bucket
+# adapters were trained on the fixed 200->100 DPI downscale, so serving one of
+# those needs `SHREW_IMAGE_TRANSFORM=dpi`. Nothing else should set it — feeding
+# the bucket-trained adapter a ratio downscale is the single largest quality
+# regression available (measured: 24% vs 74% clean body reads).
+IMAGE_TRANSFORM = os.environ.get("SHREW_IMAGE_TRANSFORM", "bucket").strip().lower()
+
+
+# Native glyph height is a fixed property of an image and the only CPU-bound
+# step in the transform, so it is measured once per source file and reused —
+# including by the table refiner, whose composites are built from native-scale
+# crops of these same pages and therefore share their glyph height.
+_GLYPH_CACHE: dict = {}
+_GLYPH_CACHE_MAX = 4096
+
+
+def cached_glyph_height(img: Image.Image, path=None):
+    """`glyph_height` memoized on (path, size, mtime). Falls back to a plain
+    measurement when there is no file identity to key on."""
+    if path is None:
+        return glyph_height(img)
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return glyph_height(img)
+    if key in _GLYPH_CACHE:
+        return _GLYPH_CACHE[key]
+    val = glyph_height(img)
+    if len(_GLYPH_CACHE) >= _GLYPH_CACHE_MAX:
+        _GLYPH_CACHE.clear()
+    _GLYPH_CACHE[key] = val
+    return val
+
+
+# Legacy (pre-bucket) model-input geometry. Every page in the corpus was
+# rendered at 200 DPI and halved to 100 DPI — uniformly 1700x2200 -> 850x1100,
+# i.e. a long edge of 1100 (verified across the test split: no other size
+# occurs). Only reachable under SHREW_IMAGE_TRANSFORM=dpi.
 TRAINED_LONG_EDGE = 1100
 
 
@@ -123,8 +162,15 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     os.makedirs(pages_dir, exist_ok=True)
 
     with Image.open(hires_path) as img:
-        src_dpi = _model_input_src_dpi(img.size, config, input_class)
-        enh = prepare_image(img, config.low_dpi, src_dpi)
+        if IMAGE_TRANSFORM == "bucket":
+            # §2.1: route on this page's own measured text size. Works on the
+            # NATIVE render, which is why no DPI normalization is needed here —
+            # a 400-DPI upload and a 200-DPI rasterization of the same page have
+            # different pixel counts but land at the same effective glyph size.
+            enh, bucket = prepare_image_bucketed(img, cached_glyph_height(img, hires_path))
+        else:
+            src_dpi = _model_input_src_dpi(img.size, config, input_class)
+            enh, bucket = prepare_image(img, config.low_dpi, src_dpi), "dpi"
     model_png = os.path.join(pages_dir, f"page_{page_no:04d}_model.png")
     enh.save(model_png)
 
@@ -132,12 +178,12 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     # ONE page must surface as a page-level failure record, never crash the
     # document (§5.2 discipline — same as parse/schema failures).
     try:
-        return _page_result(page_no, extract_page(model_png, client))
+        return _page_result(page_no, extract_page(model_png, client), bucket)
     except Exception as e:
         return _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
             "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
-        })
+        }, bucket)
 
 
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
@@ -192,6 +238,11 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
 
         with Image.open(prev_hires) as pi, Image.open(next_hires) as ni:
             composite = build_table_composite(pi, prev["bbox"], ni, nxt["bbox"])
+            # Measured on the source page while it is open: the composite is
+            # built from native-scale crops of it, so it inherits that page's
+            # glyph height. Measuring the composite itself would be skewed by
+            # the white padding that dominates the synthetic canvas.
+            glyph = cached_glyph_height(pi, prev_hires)
         if composite is None:
             return None
 
@@ -200,14 +251,15 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
         hires_path = os.path.join(crops_dir, f"{prev['table_id']}_stitched.png")
         composite.save(hires_path)
 
-        # Standard 200->100 halving for rasterized pages — but the canvas
-        # inherits the source page's pixel size, and for an uploaded scan that
-        # is its native resolution (a 400-DPI scan gives a 3400x4400 canvas).
-        # Normalize by long edge exactly like _model_input_src_dpi does, never
-        # upscaling, so the model input lands at trained scale.
-        eff_src = max(200, round(100 * max(composite.size) / TRAINED_LONG_EDGE))
         model_png = os.path.join(crops_dir, f"{prev['table_id']}_stitched_model.png")
-        prepare_image(composite, 100, eff_src).save(model_png)
+        if IMAGE_TRANSFORM == "bucket":
+            prepare_image_bucketed(composite, glyph)[0].save(model_png)
+        else:
+            # Legacy: the canvas inherits the source page's pixel size, so a
+            # 400-DPI scan gives a 3400x4400 canvas. Normalize by long edge
+            # exactly like _model_input_src_dpi, never upscaling.
+            eff_src = max(200, round(100 * max(composite.size) / TRAINED_LONG_EDGE))
+            prepare_image(composite, 100, eff_src).save(model_png)
 
         # Refinement is an optional enhancement — it must never be able to
         # fail the document. Any transport error (timeout included) means
@@ -553,6 +605,11 @@ def gate_metrics(page_results: list[dict]) -> dict:
     n = len(page_results)
     coerced = sum(1 for pr in page_results if pr.get("schema_coerced"))
     degenerate = sum(1 for pr in page_results if pr.get("degenerate"))
+    aborted = sum(1 for pr in page_results if pr.get("repetition_abort"))
+    buckets: dict = {}
+    for pr in page_results:
+        if pr.get("bucket"):
+            buckets[pr["bucket"]] = buckets.get(pr["bucket"], 0) + 1
     statuses = [pr.get("status") for pr in page_results]
     # A page needed the retry tier iff it was coerced or ended in any failure.
     retried = coerced + sum(1 for s in statuses
@@ -563,6 +620,14 @@ def gate_metrics(page_results: list[dict]) -> dict:
         "first_pass_ok": sum(1 for s in statuses if s == "ok"),
         "schema_coerced": coerced,
         "degenerate": degenerate,
+        # Loops caught mid-generation by the §5.2 streaming guard. These are a
+        # SUBSET of `degenerate` — the abort is what marks the page looped, so a
+        # rising split between the two says the guard is doing the catching and
+        # the whole-string §5.1 gate is only seeing what got past it.
+        "repetition_aborted": aborted,
+        # Prefill cost varies ~3.5x across buckets, so throughput planning and
+        # any batching heuristic keys off this distribution (§2.1).
+        "buckets": buckets,
         "oversize_filtered": sum(1 for s in statuses if s == "oversize"),
         "empty_completions": sum(1 for s in statuses if s == "empty_completion"),
         "overlong_failed": sum(1 for s in statuses if s == "overlong_failed"),

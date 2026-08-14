@@ -532,9 +532,11 @@ def test_landscape_scan_normalizes_on_the_long_edge():
     assert round(4400 * cfg.low_dpi / src_dpi) == TRAINED_LONG_EDGE
 
 
-def test_oversized_scan_reaches_the_model_at_trained_size(tmp_path):
-    """End-to-end: the saved model input must be the trained geometry, not the
-    scan's native size."""
+def test_oversized_scan_reaches_the_model_at_bucket_geometry(tmp_path):
+    """End-to-end: the saved model input must be the routed bucket fit (§2.1),
+    not the scan's native size. A blank page has no measurable glyphs, so it
+    defaults to B2 [1536, 2304]; a 3400x4400 scan fits that grid at
+    min(1536/3400, 2304/4400) -> 1536x1988."""
     from PIL import Image as PILImage
     doc_path = tmp_path / "scan.png"
     PILImage.new("RGB", (3400, 4400), "white").save(doc_path)
@@ -545,7 +547,7 @@ def test_oversized_scan_reaches_the_model_at_trained_size(tmp_path):
 
     model_png = next((out_dir / "pages").glob("*_model.png"))
     with PILImage.open(model_png) as im:
-        assert max(im.size) == 1100, f"model input was {im.size}"
+        assert im.size == (1536, 1988), f"model input was {im.size}"
 
 
 # ── caption / chunk de-duplication ──────────────────────────────────────────

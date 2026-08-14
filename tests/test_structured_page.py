@@ -88,13 +88,15 @@ def test_text_modality_sends_raw_string_not_content_parts():
 
 
 def test_first_pass_sampling_is_greedy_and_bare():
-    """§3: exactly temperature 0 and max_tokens 12000 — nothing else. Any decode
-    knob here voids Gate F and smoke_test_preview reports DRIFT."""
+    """§3.1: exactly temperature 0 and max_tokens 20000 — nothing else. Any
+    decode knob here voids Gate F and smoke_test_preview reports DRIFT. (12000
+    was the pre-bucket budget; a B3 page carries ~7k image tokens and the
+    median correct newspaper label runs past it — see the e4 spec update.)"""
     c = FakeClient([(GOOD, "stop")])
     extract_page("/tmp/fake.png", c)
     call = c.calls[0]
     assert call["temperature"] == 0
-    assert call["max_tokens"] == MAX_TOKENS == 12000
+    assert call["max_tokens"] == MAX_TOKENS == 20000
     assert not call["extra_params"], f"first pass must send no extras, got {call['extra_params']}"
 
 
