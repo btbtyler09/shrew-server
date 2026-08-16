@@ -109,7 +109,7 @@ curl -X POST localhost:8080/v1/convert -F file=@doc.pdf
 | Extra | What it adds | Without it |
 |-------|-------------|------------|
 | `server` | FastAPI HTTP server (`shrew serve`) | CLI-only (`shrew convert`) |
-| `figures` | Figure detection via heron-101 layout model (pulls PyTorch) | No figure crops or captions |
+| `figures` | Figure detection via heron-101 layout model (pulls PyTorch) — **legacy pipeline only**; the structured pipeline gets figure/table crops from the model's own bboxes and does not need this | No figure crops in legacy mode |
 
 `pip install .` gives you just the CLI with no figure detection. `pip install .[server,figures]` is the full install.
 
