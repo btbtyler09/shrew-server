@@ -65,25 +65,30 @@ available via `pipeline_mode=vlm`.
 
 ## Architecture
 
-Shrew has two components:
+The default (structured) pipeline is two pieces — this server and one model:
 
 ```mermaid
 graph LR
     Client["Client"]
-    Server["Shrew Server :8080<br><small>FastAPI · Heron-101 · LibreOffice</small>"]
-    VLM["External VLM<br>Qwen3.5-35B, OpenRouter, etc."]
-    Model["Doc Processing Model :8000 (optional)<br><small>llama.cpp · Qwen3.5-2B · doc_processing LoRA</small>"]
+    Server["Shrew Server :8080<br><small>FastAPI · rasterize · buckets · gates · assembly</small>"]
+    VLM["shrew-ocr-preview<br><small>vLLM / llama.cpp — you serve it</small>"]
 
     Client -- "document" --> Server
-    Server -- "page images" --> VLM
-    VLM -- "markdown" --> Server
-    Server -- "figure crops, markdown" --> Model
-    Model -- "classification, metadata,<br>summary, chunks" --> Server
-    Server -- "markdown + structured JSON" --> Client
+    Server -- "bucket-fitted page images<br>(sentinel request shape)" --> VLM
+    VLM -- "structured JSON per page<br>(chunks · figures · tables · bboxes)" --> Server
+    Server -- "markdown + assembled structured JSON" --> Client
 ```
 
-- **External VLM** (required) — A large VLM like Qwen3.5-35B for page transcription. You provide this (vLLM, llama.cpp, OpenRouter, etc.).
-- **Doc Processing Model** (optional) — A small Qwen3.5-2B with a fine-tuned `doc_processing` LoRA adapter for structured extraction (metadata, summary, chunking). Runs locally via llama.cpp. If not available, the main VLM handles extraction instead. *Note: semantic chunking is currently in beta.*
+The server owns everything around the model: rasterization, glyph-routed
+bucket preprocessing, the request contract, tuned decoding with a
+schema-enforced retry tier, the streaming repetition guard, schema/coercion
+gates, multi-page assembly (chunk provenance, cross-page table continuation),
+and figure/table cropping from the hires renders. One model call per page.
+
+A **legacy multi-stage pipeline** (any transcription VLM such as Qwen 3.5 +
+an optional small Doc Processing model with a LoRA adapter, plus the heron-101
+figure detector) remains available via `pipeline_mode=vlm` /
+`pipeline_mode=conventional`; the legacy Docker variants below serve it.
 
 ## Quick start
 
@@ -92,7 +97,8 @@ graph LR
 ```bash
 pip install .[server,figures]
 
-VLM_URL=http://localhost:8000 VLM_MODEL=Qwen/Qwen3.5-35B shrew serve
+# Point at your endpoint serving shrew-ocr-preview (see quickstart above)
+VLM_URL=http://localhost:8000 VLM_MODEL=shrew-ocr-preview shrew serve
 
 # Convert a document
 curl -X POST localhost:8080/v1/convert -F file=@doc.pdf
@@ -133,11 +139,15 @@ Other GPU variants: replace `docker-compose.cuda.yml` with `docker-compose.rocm.
 | Variant | Dockerfile | Base image | Purpose |
 |---------|-----------|------------|---------|
 | **server** | `Dockerfile.server` | `python:3.12-slim` | Shrew API + figure detection + LibreOffice |
-| **cuda** | `Dockerfile.cuda` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Doc Processing model on NVIDIA GPU |
-| **rocm** | `Dockerfile.rocm` | `ghcr.io/ggml-org/llama.cpp:server-rocm` | Doc Processing model on AMD GPU |
-| **vulkan** | `Dockerfile.vulkan` | `ghcr.io/ggml-org/llama.cpp:server-vulkan` | Doc Processing model on any Vulkan GPU |
+| **ocr-cuda** | `Dockerfile.ocr-cuda` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | **shrew-ocr-preview Q8_0** (structured pipeline) on NVIDIA GPU |
+| **cuda** | `Dockerfile.cuda` | `ghcr.io/ggml-org/llama.cpp:server-cuda` | Legacy Doc Processing model on NVIDIA GPU |
+| **rocm** | `Dockerfile.rocm` | `ghcr.io/ggml-org/llama.cpp:server-rocm` | Legacy Doc Processing model on AMD GPU |
+| **vulkan** | `Dockerfile.vulkan` | `ghcr.io/ggml-org/llama.cpp:server-vulkan` | Legacy Doc Processing model on any Vulkan GPU |
 
-The **server** container always runs. Pick one GPU variant for the Doc Processing model, or skip it to use your main VLM for everything.
+The **server** container always runs. For the default structured pipeline,
+pair it with **ocr-cuda** (`docker-compose.ocr.yml`, see Quick start) or an
+external vLLM endpoint serving shrew-ocr-preview. The cuda/rocm/vulkan
+variants belong to the legacy pipeline.
 
 ### Running with Docker Compose
 
@@ -165,7 +175,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.vulkan.yml 
 docker build -f docker/Dockerfile.server -t shrew-server .
 docker run -p 8080:8080 \
   -e VLM_URL=http://host.docker.internal:8000 \
-  -e VLM_MODEL=Qwen/Qwen3.5-35B \
+  -e VLM_MODEL=shrew-ocr-preview \
   shrew-server
 
 # Build and run Doc Processing model separately (CUDA example)
@@ -240,33 +250,74 @@ Convert a document to markdown + structured JSON.
 | `skip_extraction` | bool | `false` | Skip structured extraction (metadata/summary/chunking). `skip_stage3` is a deprecated alias. |
 | `high_dpi` | int | `200` | DPI for page images sent to VLM |
 
-**Response** (JSON):
+**Response** (JSON, structured pipeline — the default):
 ```json
 {
-  "markdown": "# Document Title\n\n...",
+  "markdown": "<page 1>\n# Document Title\n\n...",
   "metadata": {
-    "title": "...",
-    "authors": ["..."],
-    "year": 2024,
-    "type": "research_paper",
-    "keywords": ["..."]
+    "title": "...", "authors": ["..."], "organization": "...",
+    "year": 2024, "doc_type": "research_paper",
+    "type": "pdf", "id": "...", "file_path": "...",
+    "source_pages": 12, "num_chunks": 34
   },
-  "summary": "...",
+  "summary": "Document-level summary assembled from per-page summaries.",
   "semantic_chunks": [
-    {"chunk_id": "1", "content": "...", "type": "introduction"}
+    {
+      "chunk_id": "p1_c1",
+      "title": "Abstract and Introduction Overview",
+      "content": "...",
+      "section_type": "abstract",
+      "keywords": ["..."],
+      "page": 1, "pages": [1]
+    }
+  ],
+  "tables": [
+    {
+      "table_id": "t1", "page": 3, "pages": [3],
+      "continues": null, "continued_by": null,
+      "bbox": [481.2, 680.0, 810.0, 815.0],
+      "caption": "...", "html": "<table>...</table>",
+      "flat_text": "...", "format": "png", "data": "<base64 table crop>"
+    }
   ],
   "images": [
-    {"index": 0, "data": "<base64>", "format": "png", "caption": "...", "page": 3}
+    {
+      "index": 0, "data": "<base64 figure crop>", "format": "png",
+      "caption": "...", "page": 2, "bbox": [557.1, 155.0, 830.0, 300.0]
+    }
   ],
   "processing_log": {
-    "total_pages": 12,
-    "total_figures": 4,
-    "total_time_seconds": 45.2
+    "total_pages": 12, "total_figures": 4, "total_time_seconds": 45.2,
+    "modality": "image",
+    "failed_pages": 0,
+    "gates": {
+      "pages": 12, "first_pass_ok": 11, "schema_coerced": 1,
+      "degenerate": 0, "repetition_aborted": 0, "wall_clock_aborts": 0,
+      "coerced_empty": 0, "fallback_pages": 0,
+      "buckets": {"B1": 8, "B2": 4}
+    }
   }
 }
 ```
 
-**v2 structured pipeline (default):** `/v1/convert` and `/v1/convert/stream` now route through the v2 single-model structured pipeline by default (`pipeline_mode=structured`). One structured-extraction VLM (`VLM_MODEL`, e.g. `shrew-9b`) is called once per page and returns metadata/summary/semantic_chunks/figures/tables directly — no separate Doc Processing model or docling stage is required. The response shape above still holds, plus a new `tables` key (cropped table images alongside `html`/`flat_text` transcriptions); `images` are now figure crops taken from the hires page render rather than VLM-described images; and each `semantic_chunks` entry carries page provenance (which page(s) it was assembled from) so chunks can be traced back to source pages. The legacy multi-stage pipeline (VLM transcription + docling + editor) is still available by passing `pipeline_mode=vlm` or `pipeline_mode=conventional`.
+Notes on the shape:
+- `section_type` is one of the model's trained categories (`abstract`,
+  `introduction`, `methodology`, `results`, `discussion`, `conclusion`,
+  `technical_content`, `appendix`).
+- Bounding boxes are `[x0, y0, x1, y1]` on a 0–1000 grid normalized to the
+  page image. `images` are figure crops cut from the hires page render using
+  those boxes; `tables` carry both the crop and the model's `html` /
+  `flat_text` transcriptions, with `continues`/`continued_by` linking
+  cross-page table fragments.
+- Chunks carry page provenance (`page`/`pages`) so every chunk traces back to
+  its source page(s).
+- `processing_log.gates` reports the serving-gate outcomes per document
+  (first-pass successes, schema coercions, repetition/degeneration aborts,
+  bucket routing counts). A page that fails every tier is counted in
+  `failed_pages` and omitted from content — never silently filled.
+
+The **legacy multi-stage pipeline** (`pipeline_mode=vlm` or `conventional`)
+returns the pre-v2 shape without `tables`, bboxes, or `gates`.
 
 ### `POST /v1/convert/stream`
 
@@ -293,6 +344,11 @@ Returns `{"status": "ok"}` when all VLM backends are reachable. Returns `503` wi
 Both `/v1/convert` and `/v1/convert/stream` also run a pre-flight VLM health check and return `503` if the VLM is unreachable.
 
 ## CLI
+
+The `shrew convert` CLI runs the **legacy multi-stage pipeline** (hence the
+Qwen examples below) — the structured shrew-ocr-preview pipeline is served
+via `shrew serve` / the API above. `--markdown` prints the assembled markdown
+to stdout.
 
 ```bash
 pip install .
@@ -321,6 +377,9 @@ shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B \
 ```
 
 ## Output
+
+CLI (legacy pipeline) output directory layout — API users get the JSON
+response documented above instead:
 
 ```
 output/
