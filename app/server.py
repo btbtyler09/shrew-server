@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .cli import parse_page_range
@@ -399,9 +399,14 @@ async def convert(
     pipeline_mode: str = Form("structured"),
     model: Optional[str] = Form(None),
     pages: Optional[str] = Form(None),
-    skip_stage3: bool = Form(False),
+    format: str = Form("json"),          # "json" | "markdown"
+    skip_extraction: bool = Form(False),
+    skip_stage3: bool = Form(False),     # deprecated alias of skip_extraction
     high_dpi: int = Form(200),
 ):
+    if format not in ("json", "markdown"):
+        raise HTTPException(422, "format must be 'json' or 'markdown'")
+    skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document to markdown + structured JSON."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -451,7 +456,7 @@ async def convert(
                 api_key=api_key,
                 high_dpi=high_dpi,
                 vlm_concurrency=_config.vlm_concurrency,
-                skip_stage3=skip_stage3,
+                skip_stage3=skip_extraction,
                 skip_chunking=skip_chunking,
                 page_range=page_range,
                 accurate=not _config.shrew_vllm_url,
@@ -475,7 +480,12 @@ async def convert(
                 )
 
             result = await loop.run_in_executor(None, _run)
-            response = _build_response(result, skip_stage3)
+            response = _build_response(result, skip_extraction)
+            if format == "markdown":
+                # structured markdown only — same assembly the JSON carries in
+                # its "markdown" key, as a text/markdown body
+                return PlainTextResponse(response["markdown"],
+                                         media_type="text/markdown; charset=utf-8")
             return JSONResponse(content=response)
 
         except Exception as e:
@@ -495,9 +505,11 @@ async def convert_stream(
     pipeline_mode: str = Form("structured"),
     model: Optional[str] = Form(None),
     pages: Optional[str] = Form(None),
-    skip_stage3: bool = Form(False),
+    skip_extraction: bool = Form(False),
+    skip_stage3: bool = Form(False),     # deprecated alias of skip_extraction
     high_dpi: int = Form(200),
 ):
+    skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document with SSE streaming progress."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
@@ -549,7 +561,7 @@ async def convert_stream(
                 api_key=api_key,
                 high_dpi=high_dpi,
                 vlm_concurrency=_config.vlm_concurrency,
-                skip_stage3=skip_stage3,
+                skip_stage3=skip_extraction,
                 skip_chunking=skip_chunking,
                 page_range=page_range,
                 accurate=not _config.shrew_vllm_url,
@@ -573,7 +585,7 @@ async def convert_stream(
                     vlm_pool=_vlm_pool,
                 )
 
-            response = _build_response(result, skip_stage3)
+            response = _build_response(result, skip_extraction)
             progress.emit_complete(response)
 
         except CancelledException:

@@ -57,15 +57,19 @@ def _run_convert(args):
         low_dpi=args.low_dpi,
         high_dpi=args.high_dpi,
         vlm_concurrency=args.vlm_concurrency,
-        skip_stage3=args.skip_stage3,
+        skip_stage3=args.skip_extraction,
         page_range=page_range,
         shrew_vllm_url=args.shrew_vllm_url,
-        shrew_async_stage3=args.async_stage3,
+        shrew_async_stage3=args.async_extraction,
         accurate=not args.shrew_vllm_url,
         section_max_tokens=args.section_max_tokens,
     )
 
     result = run_pipeline(args.input, args.output_dir, config)
+
+    if args.markdown:
+        print(result.clean_markdown)
+        return
 
     log = result.processing_log
     print(f"\nClean markdown: {args.output_dir}/clean.md")
@@ -145,8 +149,17 @@ def main():
         default=os.environ.get("SHREW_VLLM_URL"),
         help="Doc Processing model vLLM/llama.cpp URL for structured extraction (env: SHREW_VLLM_URL)",
     )
-    convert_parser.add_argument("--async-stage3", action="store_true", help="Run structured extraction tasks concurrently")
-    convert_parser.add_argument("--skip-stage3", action="store_true", help="Skip structured extraction")
+    convert_parser.add_argument("--async-extraction", dest="async_extraction", action="store_true",
+                                help="Run structured extraction tasks concurrently")
+    convert_parser.add_argument("--skip-extraction", dest="skip_extraction", action="store_true",
+                                help="Skip structured extraction")
+    convert_parser.add_argument("--markdown", action="store_true",
+                                help="Print the structured markdown to stdout (instead of only writing files)")
+    # deprecated aliases, kept for compatibility — remove in a future release
+    convert_parser.add_argument("--async-stage3", dest="async_extraction", action="store_true",
+                                help=argparse.SUPPRESS)
+    convert_parser.add_argument("--skip-stage3", dest="skip_extraction", action="store_true",
+                                help=argparse.SUPPRESS)
     convert_parser.add_argument("--section-max-tokens", type=int, default=6000, help="Max tokens per section for chunking (default: 6000)")
     convert_parser.add_argument("--pages", type=str, default=None, help="Page range (e.g., '1-5' or '3')")
     convert_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")

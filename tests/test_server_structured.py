@@ -262,3 +262,36 @@ def test_root_redirects_to_ui(api_client):
     resp = api_client.get("/", follow_redirects=False)
     assert resp.status_code in (302, 307)
     assert resp.headers["location"] == "/ui"
+
+
+def test_convert_format_markdown_returns_text_markdown(api_client):
+    """format=markdown returns the structured markdown as a text/markdown body
+    — same content the JSON response carries in its "markdown" key."""
+    json_body = api_client.post("/v1/convert", files=_upload_png()).json()
+    resp = api_client.post(
+        "/v1/convert", data={"format": "markdown"}, files=_upload_png(),
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.text == json_body["markdown"]
+
+
+def test_convert_format_rejects_unknown_value(api_client):
+    resp = api_client.post(
+        "/v1/convert", data={"format": "yaml"}, files=_upload_png(),
+    )
+    assert resp.status_code == 422
+
+
+def test_convert_skip_extraction_matches_deprecated_alias(api_client):
+    """skip_extraction is the current name; skip_stage3 must keep working as a
+    deprecated alias with identical behavior until removed."""
+    new = api_client.post(
+        "/v1/convert", data={"skip_extraction": "true"}, files=_upload_png(),
+    ).json()
+    old = api_client.post(
+        "/v1/convert", data={"skip_stage3": "true"}, files=_upload_png(),
+    ).json()
+    assert sorted(new) == sorted(old)
+    for key in STAGE3_KEYS:
+        assert key not in new

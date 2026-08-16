@@ -43,6 +43,9 @@ VLM_URL=http://localhost:8000 VLM_MODEL=shrew-ocr-preview shrew serve
 
 # 3. Convert
 curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F pipeline_mode=structured
+
+# Or get the structured markdown directly (text/markdown response)
+curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F format=markdown
 ```
 
 Both the bf16 and GPTQ-8bit model variants work unchanged (the server is
@@ -223,7 +226,8 @@ Convert a document to markdown + structured JSON.
 | `file` | file | required | PDF, image, or office document |
 | `model` | string | server default | VLM model name override |
 | `pages` | string | all | Page range, e.g. `1-5` or `3` |
-| `skip_stage3` | bool | `false` | Skip structured extraction (metadata/summary/chunking) |
+| `format` | str | `json` | `json` (full response) or `markdown` (text/markdown body of the structured markdown only) |
+| `skip_extraction` | bool | `false` | Skip structured extraction (metadata/summary/chunking). `skip_stage3` is a deprecated alias. |
 | `high_dpi` | int | `200` | DPI for page images sent to VLM |
 
 **Response** (JSON):
@@ -299,11 +303,11 @@ shrew convert scan.png -o output/ --vlm-model Qwen/Qwen3.5-35B
 shrew convert scan.tiff -o output/ --vlm-model Qwen/Qwen3.5-35B
 
 # Specific pages, skip structured extraction
-shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B --skip-stage3 --pages 1-5
+shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B --skip-extraction --pages 1-5
 
 # With Doc Processing model for structured extraction
 shrew convert doc.pdf -o output/ --vlm-model Qwen/Qwen3.5-35B \
-  --shrew-vllm-url http://localhost:8000 --async-stage3
+  --shrew-vllm-url http://localhost:8000 --async-extraction
 ```
 
 ## Output
@@ -313,7 +317,7 @@ output/
 ├── clean.md                  # Final markdown with <page N> tags
 ├── dirty.md                  # Raw VLM transcription
 ├── processing_log.json       # Timing and config
-├── structured.json           # Metadata, summary, chunks, images (unless --skip-stage3 flag)
+├── structured.json           # Metadata, summary, chunks, images (unless --skip-extraction flag)
 ├── figures/                  # Extracted figure crops
 │   └── figure_page3_0.png
 └── pages/
