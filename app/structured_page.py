@@ -622,7 +622,14 @@ def _content_chars(sj: dict) -> int:
 # Coercion-density floor for image pages (chars of extracted content). The one
 # measured slop case carried 206; a dense page's real text runs 5-15k. 300 is
 # far under any legitimate coerced dense page while comfortably above the slop.
+# The floor alone over-fires on honest sparse pages (handwritten notes,
+# diagram-only pages: 204/206 gate kills on VHR 2026-08-15 had <300 chars in
+# the reference arm too), so it only counts when the coerced output is ALSO
+# tiny relative to the first-pass emission — a page the model ground 33k chars
+# against does not honestly rescue to 206; a page whose first pass said little
+# legitimately coerces to little.
 COERCED_MIN_CHARS = int(os.environ.get("SHREW_COERCED_MIN_CHARS", "300"))
+COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
 
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
@@ -682,14 +689,20 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         # valid JSON carrying 206 chars of hallucinated names against 13,948
         # chars of real page text — it passed every gate and silently poisoned
         # its 43 retrieval queries (VHR run 2026-08-14). A coerced rescue that
-        # emits almost nothing from a RENDERED page is not a rescue. First-pass
-        # successes are exempt: sparse pages (posters, covers) legitimately say
-        # little, but they don't need coercion to say it.
-        if min_content_chars and _content_chars(rparsed) < min_content_chars:
+        # emits almost nothing from a page the FIRST PASS ground thousands of
+        # chars against is not a rescue. Sparse pages are exempt two ways:
+        # first-pass successes never reach this gate, and a coerced result is
+        # only slop if it is also tiny relative to the first-pass emission —
+        # honest sparse pages (handwriting photos, diagram-only pages) fail
+        # first-pass on FORM, not volume, and rescue to proportionate content.
+        _cc = _content_chars(rparsed)
+        if (min_content_chars and _cc < min_content_chars
+                and _cc < COERCED_MIN_RATIO * len(text)):
             return _result(False, None, "coerced_empty",
-                           f"coerced output carries {_content_chars(rparsed)} "
-                           f"content chars (< {min_content_chars}) on a rendered "
-                           f"page — hallucination-slop signature, counted failed",
+                           f"coerced output carries {_cc} content chars "
+                           f"(< {min_content_chars} floor and < {COERCED_MIN_RATIO:.0%} "
+                           f"of the {len(text)}-char first-pass emission) "
+                           f"— hallucination-slop signature, counted failed",
                            2, len(rtext), schema_coerced=True,
                            degenerate=(first_verdict == "degenerate"),
                            repetition_abort=aborted, loop_guard=stats)

@@ -172,3 +172,52 @@ def test_on_delta_can_abort_a_real_stream(sse_server):
     choice = res["choices"][0]
     assert choice["finish_reason"] == REPETITION_ABORT
     assert 14 <= len(choice["message"]["content"]) < len(_SSEHandler.BODY)
+
+
+# ── wall clock starts at first byte, not submission ─────────────────────────
+
+
+class _SlowFirstByteHandler(_SSEHandler):
+    """Simulates deep-queue scheduling: a long wait BEFORE the first byte,
+    then a fast healthy stream. Queue wait must not count against the
+    generation wall clock (measured: 21 false aborts in one congested hour,
+    VHR 2026-08-15)."""
+
+    QUEUE_S = 0.7
+
+    def do_POST(self):
+        import time as _t
+        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        _t.sleep(self.QUEUE_S)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for i in range(0, len(self.BODY), 7):
+            evt = {"choices": [{"delta": {"content": self.BODY[i:i + 7]}}]}
+            self.wfile.write(f"data: {json.dumps(evt)}\r\n\r\n".encode())
+        self.wfile.write(b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\r\n\r\n')
+        self.wfile.write(b"data: [DONE]\r\n\r\n")
+        self.wfile.flush()
+
+
+@pytest.fixture
+def slow_sse_server():
+    srv = HTTPServer(("127.0.0.1", 0), _SlowFirstByteHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}"
+    srv.shutdown()
+
+
+def test_wall_clock_excludes_queue_wait(slow_sse_server):
+    """wall_clock_s smaller than the queue wait but larger than the stream:
+    submission-relative timing would abort; first-byte-relative completes."""
+    from app.vlm_client import VLMClient
+
+    client = VLMClient(slow_sse_server, "shrew-ocr-preview")
+    res = client.chat_completion_stream(
+        [{"role": "user", "content": "x"}],
+        wall_clock_s=0.5,
+    )
+    choice = res["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert choice["message"]["content"] == _SSEHandler.BODY

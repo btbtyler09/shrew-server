@@ -183,7 +183,10 @@ class VLMClient:
     ) -> dict:
         """Streaming chat completion, assembled into the non-streaming response shape.
 
-        ``wall_clock_s`` bounds the TOTAL stream duration; ``timeout`` only
+        ``wall_clock_s`` bounds the stream duration FROM THE FIRST BYTE —
+        scheduler queue wait must not convert healthy pages into aborts when
+        the backend runs a deep queue; time-to-first-byte is still bounded by
+        ``timeout``. ``timeout`` otherwise only
         bounds the gap between bytes, so a trickling generation never trips it.
         On expiry the stream aborts with ``finish_reason: "wall_clock_abort"``.
 
@@ -210,6 +213,7 @@ class VLMClient:
 
         t = timeout or self.default_timeout
         start = time.time()
+        first_byte_at: Optional[float] = None
         parts: list[str] = []
         finish_reason = None
         aborted = None
@@ -229,12 +233,16 @@ class VLMClient:
             ) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines(decode_unicode=True):
-                    if wall_clock_s is not None and time.time() - start > wall_clock_s:
+                    if first_byte_at is None:
+                        first_byte_at = time.time()
+                    if (wall_clock_s is not None
+                            and time.time() - first_byte_at > wall_clock_s):
                         aborted = "wall_clock_abort"
                         finish_reason = aborted
                         logger.warning(
-                            f"wall_clock_abort after {time.time() - start:.0f}s "
-                            f"({len(''.join(parts))} chars emitted)")
+                            f"wall_clock_abort after {time.time() - first_byte_at:.0f}s "
+                            f"generating (+{first_byte_at - start:.0f}s queued, "
+                            f"{len(''.join(parts))} chars emitted)")
                         break
                     if not line:
                         continue
