@@ -11,7 +11,7 @@ import multiprocessing
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -40,6 +40,39 @@ def make_image_content(image_path: Path | str, detail: str = "high") -> dict:
         "type": "image_url",
         "image_url": {"url": data_uri, "detail": detail},
     }
+
+
+class PinpointMismatchError(RuntimeError):
+    """The served model config does not carry the tile-bucket pinpoint list.
+
+    The processor cuts the tiles, but the MODEL unpads and packs features using
+    `config.image_grid_pinpoints`. Patch the PROCESSOR only and every request
+    fails (measured 40/40) with a feature/token count mismatch — an error whose
+    text says nothing about the actual cause, which is why it is translated here.
+    """
+
+
+# vLLM surfaces the mismatch as a 400 whose body contains this phrase.
+_PINPOINT_SIGNATURE = "image features and image tokens do not match"
+
+_PINPOINT_HELP = (
+    "The served model is missing the tile-bucket pinpoints. Serve a model "
+    "directory whose config.json AND preprocessor_config.json both carry, in "
+    '[height, width] order: "image_grid_pinpoints": '
+    "[[1536,1152],[2304,1536],[3072,2304],[1152,1152]]. Patching only the "
+    "processor fails EVERY request (SHREW_OCR_PREVIEW.md §2.1)."
+)
+
+
+def _translate_http_error(e: "requests.HTTPError") -> Exception:
+    """Turn the opaque feature/token mismatch into the actionable message."""
+    try:
+        body = e.response.text or ""
+    except Exception:
+        body = ""
+    if _PINPOINT_SIGNATURE in body.lower():
+        return PinpointMismatchError(f"{_PINPOINT_HELP} (server said: {body[:300]})")
+    return e
 
 
 def make_text_content(text: str) -> dict:
@@ -130,13 +163,133 @@ class VLMClient:
             raise
         except requests.HTTPError as e:
             logger.error(f"VLM HTTP error: {e.response.status_code} - {e.response.text[:500]}")
-            raise
+            raise _translate_http_error(e) from e
         except requests.RequestException as e:
             logger.error(f"VLM request failed: {e}")
             raise
         finally:
             if gate is not None:
                 gate.release()
+
+    def chat_completion_stream(
+        self,
+        messages: list[dict],
+        max_tokens: int = 8192,
+        temperature: float = 0.2,
+        timeout: Optional[int] = None,
+        extra_params: Optional[dict] = None,
+        on_delta: Optional[Callable[[str, str], Optional[str]]] = None,
+        wall_clock_s: Optional[float] = None,
+    ) -> dict:
+        """Streaming chat completion, assembled into the non-streaming response shape.
+
+        ``wall_clock_s`` bounds the stream duration FROM THE FIRST BYTE —
+        scheduler queue wait must not convert healthy pages into aborts when
+        the backend runs a deep queue; time-to-first-byte is still bounded by
+        ``timeout``. ``timeout`` otherwise only
+        bounds the gap between bytes, so a trickling generation never trips it.
+        On expiry the stream aborts with ``finish_reason: "wall_clock_abort"``.
+
+        Returns the same ``{"choices": [{"message": {...}, "finish_reason": ...}]}``
+        dict as ``chat_completion``, so callers can treat the two identically.
+
+        ``on_delta(chunk, accumulated)`` is invoked for every content delta. It
+        normally returns None; returning a string aborts the request and that
+        string becomes ``finish_reason``. This is how the §5.2 repetition guard
+        stops a loop mid-generation instead of paying for the full output cap —
+        closing the response releases the vLLM slot. The call holds the same
+        cross-process concurrency gate as ``chat_completion`` for its whole
+        duration: a streaming slot is still a slot.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if extra_params:
+            payload.update(extra_params)
+
+        t = timeout or self.default_timeout
+        start = time.time()
+        first_byte_at: Optional[float] = None
+        parts: list[str] = []
+        finish_reason = None
+        aborted = None
+
+        gate = _vlm_gate
+        if gate is not None:
+            if not gate.acquire(block=False):
+                logger.debug("VLM gate full, waiting for slot...")
+                gate.acquire()
+        try:
+            with requests.post(
+                f"{self.base_url}/v1/chat/completions",
+                headers=self._headers(),
+                json=payload,
+                timeout=t,
+                stream=True,
+            ) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines(decode_unicode=True):
+                    if first_byte_at is None:
+                        first_byte_at = time.time()
+                    if (wall_clock_s is not None
+                            and time.time() - first_byte_at > wall_clock_s):
+                        aborted = "wall_clock_abort"
+                        finish_reason = aborted
+                        logger.warning(
+                            f"wall_clock_abort after {time.time() - first_byte_at:.0f}s "
+                            f"generating (+{first_byte_at - start:.0f}s queued, "
+                            f"{len(''.join(parts))} chars emitted)")
+                        break
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    for choice in evt.get("choices") or []:
+                        piece = (choice.get("delta") or {}).get("content") or ""
+                        if piece:
+                            parts.append(piece)
+                            if on_delta is not None:
+                                aborted = on_delta(piece, "".join(parts))
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    if aborted:
+                        # Abandon the response body; the context manager closes
+                        # the connection, which cancels the generation server-side.
+                        finish_reason = aborted
+                        break
+
+        except requests.Timeout:
+            logger.error(f"VLM stream timed out after {t}s")
+            raise
+        except requests.HTTPError as e:
+            logger.error(f"VLM HTTP error: {e.response.status_code} - {e.response.text[:500]}")
+            raise _translate_http_error(e) from e
+        except requests.RequestException as e:
+            logger.error(f"VLM stream failed: {e}")
+            raise
+        finally:
+            if gate is not None:
+                gate.release()
+
+        text = "".join(parts)
+        logger.debug(f"VLM stream: {time.time() - start:.1f}s, "
+                     f"{len(text)} chars, finish_reason={finish_reason}")
+        return {
+            "choices": [{
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": finish_reason,
+            }],
+        }
 
     def simple_completion(
         self,

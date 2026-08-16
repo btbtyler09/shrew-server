@@ -14,7 +14,9 @@ pytest:
     - pip install --upgrade pip
   script:
     - . .venv/bin/activate
-    - pip install -e ".[dev]"
+    # server extra pulls fastapi/uvicorn/sse-starlette for the endpoint tests
+    # (test_server_structured uses fastapi.testclient). No heavy deps (no torch).
+    - pip install -e ".[dev,server]"
     - pytest tests/ -v
   cache:
     key: pip-venv

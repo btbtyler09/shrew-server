@@ -20,7 +20,34 @@ Shrew renders each page of a document as an image and sends it to a VLM for tran
 
 Supports **PDF**, **images** (PNG, JPG, TIFF, BMP, WebP, GIF), and **office documents** (DOCX, PPTX, DOC, PPT, ODT, ODP).
 
-Prompts and generation parameters are tuned for **Qwen 3.5**. Other VLMs may work but are not tested.
+## Using with shrew-ocr-preview (recommended)
+
+The default structured pipeline is built for
+[**shrew-ocr-preview**](https://huggingface.co/btbtyler09/shrew-ocr-preview) —
+our per-page document-understanding model — and implements its **entire input
+contract server-side**: glyph-routed bucket preprocessing, the
+`structured_extraction` sentinel request shape, greedy-plus-presence-penalty
+decoding, the streaming repetition guard, schema gates with coercion checks,
+and multi-page assembly. You do not hand-build any of the model card's
+preprocessing — point the server at a vLLM endpoint serving the model and POST
+documents:
+
+```bash
+# 1. Serve the model (bf16 or the GPTQ-8bit variant) with vLLM per its model card
+vllm serve btbtyler09/shrew-ocr-preview --trust-remote-code \
+  --max-model-len 32768 --limit-mm-per-prompt '{"image":1}' --no-enable-prefix-caching
+
+# 2. Run shrew-server against it
+VLM_URL=http://localhost:8000 VLM_MODEL=shrew-ocr-preview shrew serve
+
+# 3. Convert
+curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F pipeline_mode=structured
+```
+
+Both the bf16 and GPTQ-8bit model variants work unchanged (the server is
+endpoint-agnostic; follow the model card's serving flags for the variant you
+run). The legacy multi-stage pipeline below (tuned for **Qwen 3.5**) remains
+available via `pipeline_mode=vlm`.
 
 ## Architecture
 
@@ -223,6 +250,8 @@ Convert a document to markdown + structured JSON.
   }
 }
 ```
+
+**v2 structured pipeline (default):** `/v1/convert` and `/v1/convert/stream` now route through the v2 single-model structured pipeline by default (`pipeline_mode=structured`). One structured-extraction VLM (`VLM_MODEL`, e.g. `shrew-9b`) is called once per page and returns metadata/summary/semantic_chunks/figures/tables directly — no separate Doc Processing model or docling stage is required. The response shape above still holds, plus a new `tables` key (cropped table images alongside `html`/`flat_text` transcriptions); `images` are now figure crops taken from the hires page render rather than VLM-described images; and each `semantic_chunks` entry carries page provenance (which page(s) it was assembled from) so chunks can be traced back to source pages. The legacy multi-stage pipeline (VLM transcription + docling + editor) is still available by passing `pipeline_mode=vlm` or `pipeline_mode=conventional`.
 
 ### `POST /v1/convert/stream`
 

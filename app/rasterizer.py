@@ -12,12 +12,40 @@ this module entirely — see text_extract.py and spreadsheet_extract.py.
 import logging
 import os
 import subprocess
+import threading
 from pathlib import Path
 
 import pypdfium2
 from PIL import Image
 
 logger = logging.getLogger("shrew.rasterizer")
+
+# pypdfium2 uses a C library that is not thread-safe — all rasterization in
+# the process (legacy and structured pipelines alike) must serialize on this
+# single lock.
+RASTERIZE_LOCK = threading.Lock()
+
+# Long-edge ceiling for a rendered page, in pixels. A fixed DPI is blind to the
+# page's physical size: a poster-sized page (or one with corrupt MediaBox
+# metadata) rendered at 200 DPI produces a 300-700 MP image, which PIL then
+# refuses to open (decompression-bomb guard, ~179 MP) — the doc 500s before the
+# model transform ever runs. Clamping the long edge loses nothing: the bucket
+# transform downsizes to at most 2304x3072 anyway, and the routing rule is
+# scale-invariant (effective glyph = native_glyph_px * min(bw/w, bh/h); halving
+# the render halves both factors' numerator and denominator alike), so the
+# bucket choice is unchanged as long as the clamp stays above the B3 grid.
+RENDER_MAX_LONG_EDGE = 6000
+
+
+def _clamped_scale(page, dpi: float) -> float:
+    """Render scale for `dpi`, reduced if the page's long edge would exceed
+    RENDER_MAX_LONG_EDGE px. pdfium page sizes are in points (1/72 inch)."""
+    scale = dpi / 72
+    w, h = page.get_size()
+    long_edge = max(w, h) * scale
+    if long_edge > RENDER_MAX_LONG_EDGE:
+        scale *= RENDER_MAX_LONG_EDGE / long_edge
+    return scale
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp", ".gif"}
 OFFICE_EXTENSIONS = {".docx", ".pptx", ".doc", ".ppt", ".odt", ".odp"}
@@ -246,12 +274,12 @@ def rasterize_pages(
 
             # Display resolution
             display_path = Path(pages_dir) / f"page_{page_no:04d}_display.png"
-            bitmap = page.render(scale=low_dpi / 72)
+            bitmap = page.render(scale=_clamped_scale(page, low_dpi))
             bitmap.to_pil().save(str(display_path))
 
             # Extraction resolution
             hires_path = Path(pages_dir) / f"page_{page_no:04d}_hires.png"
-            bitmap = page.render(scale=high_dpi / 72)
+            bitmap = page.render(scale=_clamped_scale(page, high_dpi))
             bitmap.to_pil().save(str(hires_path))
 
             result[page_no] = (display_path, hires_path)
