@@ -35,6 +35,7 @@ documents:
 ```bash
 # 1. Serve the model (bf16 or the GPTQ-8bit variant) with vLLM per its model card
 vllm serve btbtyler09/shrew-ocr-preview --trust-remote-code \
+  --served-model-name shrew-ocr-preview \
   --max-model-len 32768 --limit-mm-per-prompt '{"image":1}' --no-enable-prefix-caching
 
 # 2. Run shrew-server against it
