@@ -94,7 +94,8 @@ def test_text_modality_sends_raw_string_not_content_parts():
 
 
 def test_first_pass_sampling_is_greedy_and_bare():
-    """§3.1: exactly temperature 0 and max_tokens 20000 — nothing else. Any
+    """§3.1 (rev 2026-08-16): temperature 0, max_tokens 20000, presence_penalty
+    0.3 — nothing else (see test_generation for the measurement). Any
     decode knob here voids Gate F and smoke_test_preview reports DRIFT. (12000
     was the pre-bucket budget; a B3 page carries ~7k image tokens and the
     median correct newspaper label runs past it — see the e4 spec update.)"""
@@ -103,16 +104,16 @@ def test_first_pass_sampling_is_greedy_and_bare():
     call = c.calls[0]
     assert call["temperature"] == 0
     assert call["max_tokens"] == MAX_TOKENS == 20000
-    assert not call["extra_params"], f"first pass must send no extras, got {call['extra_params']}"
+    assert call["extra_params"] == {"presence_penalty": 0.3}   # §3 rev 2026-08-16
 
 
 def test_no_sampling_knobs_leak_in_for_qwen_named_models():
     """The generic Qwen flag-merge must not touch this stage — the served model
-    could be named anything, and the contract admits no extra params."""
+    could be named anything; only the §3 presence penalty is admitted."""
     c = FakeClient([(GOOD, "stop")])
     c.model = "qwen3.5-35b"
     extract_page("/tmp/fake.png", c)
-    assert not c.calls[0]["extra_params"]
+    assert c.calls[0]["extra_params"] == {"presence_penalty": 0.3}
 
 
 # ── §3 retry tier ───────────────────────────────────────────────────────────

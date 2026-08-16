@@ -329,9 +329,19 @@ ENFORCEMENT_SCHEMA = {
 }
 
 
+# Retry-tier presence penalty (0 disables). The retry must differ from the
+# deterministic first pass; a stronger penalty is the measured lever that
+# breaks repetition ruts (12/12 loop-failed pages rescued at 0.6, VHR
+# 2026-08-16) and it composes with enforcement below.
+RETRY_PP = float(os.environ.get("SHREW_RETRY_PP", "0.6"))
+
+
 def enforcement_params() -> dict:
     """extra_params for the one flagged retry (§3 retry tier)."""
-    return {"structured_outputs": {"json": ENFORCEMENT_SCHEMA}}
+    out = {"structured_outputs": {"json": ENFORCEMENT_SCHEMA}}
+    if RETRY_PP:
+        out["presence_penalty"] = RETRY_PP
+    return out
 
 
 # --------------------------------------------------------------------------- §5.1 degeneration gate
