@@ -1,0 +1,36 @@
+# Self-contained shrew-ocr-preview stack: llama.cpp serves the Q8_0 GGUF
+# (pulled from Hugging Face at build time), shrew-server runs the structured
+# pipeline against it. NVIDIA GPU with >=12 GB VRAM.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ocr.yml up -d --build
+#
+# Prefer vLLM? Serve the model yourself per its model card and use the base
+# compose alone with VLM_URL pointing at your endpoint — shrew-server is
+# backend-agnostic.
+services:
+  shrew-server:
+    environment:
+      - VLM_URL=http://shrew-ocr:8000
+      - VLM_MODEL=shrew-ocr-preview
+    depends_on:
+      shrew-ocr:
+        condition: service_healthy
+
+  shrew-ocr:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ocr-cuda
+    ports:
+      - "${SHREW_OCR_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

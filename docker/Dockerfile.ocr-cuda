@@ -1,0 +1,28 @@
+FROM ghcr.io/ggml-org/llama.cpp:server-cuda
+
+ENV LD_LIBRARY_PATH="/app:${LD_LIBRARY_PATH}"
+
+WORKDIR /models
+
+# shrew-ocr-preview Q8_0 (LM) + f16 vision projector, pulled from the official
+# GGUF repo. Q8_0 is the 12GB-class artifact validated at parity with the
+# GPTQ-8bit vLLM serve (see the model card's Versions section).
+ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/main/shrew-ocr-preview-Q8_0.gguf \
+    /models/shrew-ocr-preview-Q8_0.gguf
+ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/main/shrew-ocr-preview-mmproj-f16.gguf \
+    /models/shrew-ocr-preview-mmproj-f16.gguf
+
+HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]
+EXPOSE 8000
+# -c 32768 -np 1 is REQUIRED, not tuning: the model's serving contract needs
+# the full 32k context on a single slot. Parallel slots split the context
+# per-slot (c/np) and crash the server on dense pages; a smaller context
+# silently truncates large-bucket pages. Validated envelope: model card +
+# github.com/btbtyler09/shrew-server v0.2 line.
+CMD ["--host", "0.0.0.0", "--port", "8000", \
+     "--model", "/models/shrew-ocr-preview-Q8_0.gguf", \
+     "--alias", "shrew-ocr-preview", \
+     "--mmproj", "/models/shrew-ocr-preview-mmproj-f16.gguf", \
+     "-ngl", "99", \
+     "--ctx-size", "32768", \
+     "--parallel", "1"]

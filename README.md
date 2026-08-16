@@ -48,6 +48,16 @@ curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F pipeline_mode=structu
 curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F format=markdown
 ```
 
+No vLLM? A fully self-contained stack (llama.cpp serving the
+[Q8_0 GGUF](https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF) +
+shrew-server) runs on a single ≥12 GB NVIDIA GPU:
+
+```bash
+cd docker
+docker compose -f docker-compose.yml -f docker-compose.ocr.yml up -d --build
+curl -X POST localhost:8080/v1/convert -F file=@doc.pdf
+```
+
 Both the bf16 and GPTQ-8bit model variants work unchanged (the server is
 endpoint-agnostic; follow the model card's serving flags for the variant you
 run). The legacy multi-stage pipeline below (tuned for **Qwen 3.5**) remains
