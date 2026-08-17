@@ -14,15 +14,21 @@ ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/main/shrew-
 
 HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]
 EXPOSE 8000
-# -c 32768 -np 1 is REQUIRED, not tuning: the model's serving contract needs
-# the full 32k context on a single slot. Parallel slots split the context
-# per-slot (c/np) and crash the server on dense pages; a smaller context
-# silently truncates large-bucket pages. Validated envelope: model card +
-# github.com/btbtyler09/shrew-server v0.2 line.
-CMD ["--host", "0.0.0.0", "--port", "8000", \
-     "--model", "/models/shrew-ocr-preview-Q8_0.gguf", \
-     "--alias", "shrew-ocr-preview", \
-     "--mmproj", "/models/shrew-ocr-preview-mmproj-f16.gguf", \
-     "-ngl", "99", \
-     "--ctx-size", "32768", \
-     "--parallel", "1"]
+# The serving contract needs the FULL 32k context per slot — llama-server
+# splits -c across -np slots, so scale them together: -c = NP x 32768.
+# Anything less silently truncates large-bucket pages or crashes on dense
+# ones. Measured envelope on a 12 GB card (50-page gate, fidelity paired
+# against single-slot within +-0.000):
+#   NP=1 CTX=32768  KV_QUANT=      -> ~2.8 pages/min (default, always safe)
+#   NP=2 CTX=65536  KV_QUANT=q8_0  -> ~5.7 pages/min (q8_0 KV REQUIRED at
+#                                     12 GB: f16 KV at 64k crashes under
+#                                     load; KV q8_0 measured fidelity-flat)
+# Larger cards can raise NP/CTX further (keep CTX = NP x 32768).
+ENV NP=1 CTX=32768 KV_QUANT=""
+ENTRYPOINT ["/bin/sh", "-c", "exec /app/llama-server \
+  --host 0.0.0.0 --port 8000 \
+  --model /models/shrew-ocr-preview-Q8_0.gguf \
+  --alias shrew-ocr-preview \
+  --mmproj /models/shrew-ocr-preview-mmproj-f16.gguf \
+  -ngl 99 --ctx-size ${CTX} --parallel ${NP} \
+  ${KV_QUANT:+--cache-type-k ${KV_QUANT} --cache-type-v ${KV_QUANT}}"]

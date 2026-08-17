@@ -20,6 +20,13 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.ocr-cuda
+    # Concurrency: keep CTX = NP x 32768 (full context per slot). On 12 GB
+    # cards NP=2 requires KV_QUANT=q8_0 (measured fidelity-neutral); f16 KV
+    # at 64k crashes under load. NP=1 is the always-safe default.
+    environment:
+      - NP=${OCR_NP:-1}
+      - CTX=${OCR_CTX:-32768}
+      - KV_QUANT=${OCR_KV_QUANT:-}
     ports:
       - "${SHREW_OCR_PORT:-8000}:8000"
     healthcheck:
