@@ -696,6 +696,44 @@ def _raw_deterministic(file_path, output_dir, config, input_class,
     })
 
 
+def _extract_and_caption_media(file_path, output_dir, client) -> list[dict]:
+    """Embedded workbook pictures -> image-modality captions.
+
+    The picture goes through the normal bucket prep + extract_page, and we
+    keep ONLY the caption-ish output (first figure caption, else the page
+    summary) — the model is the semantics source here, never the data source.
+    A failed caption still ships the image, uncaptioned.
+    """
+    from .spreadsheet_extract import extract_spreadsheet_media
+
+    try:
+        media = extract_spreadsheet_media(file_path, output_dir)
+    except Exception as e:
+        logger.warning(f"embedded-media extraction failed: {e}")
+        return []
+
+    out = []
+    for m in media:
+        caption = None
+        try:
+            with Image.open(m["path"]) as img:
+                enh, _bucket = prepare_image_bucketed(img.convert("RGB"))
+            prepped = m["path"] + ".prepped.png"
+            enh.save(prepped)
+            res = extract_page(prepped, client)
+            if res.get("ok") and res.get("structured"):
+                sj = res["structured"]
+                figs = [f for f in (sj.get("figures") or [])
+                        if isinstance(f, dict) and f.get("caption")]
+                caption = (figs[0]["caption"] if figs else None) or sj.get("summary")
+        except Exception as e:
+            logger.warning(f"caption call failed for {m['path']}: {e}")
+        prefix = f"Embedded image (sheet '{m['sheet']}')"
+        m["caption"] = f"{prefix}: {caption}" if caption else prefix
+        out.append(m)
+    return out
+
+
 def _extract_text_pages(file_path, output_dir, config, input_class, client, progress):
     """Text modality: deterministic extractor -> paginate -> per-page model call."""
     if progress is not None:
@@ -771,6 +809,10 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         page_results, total_pages, _ = _extract_text_pages(
             file_path, output_dir, config, input_class, client, progress,
         )
+        spreadsheet_media = (
+            _extract_and_caption_media(file_path, output_dir, client)
+            if input_class == "spreadsheet" else []
+        )
     else:
         with rasterizer.RASTERIZE_LOCK:
             page_images, total_pages, page_dims = prepare_pages(
@@ -827,6 +869,15 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         crops_dir=os.path.join(output_dir, "crops"),
         table_refiner=table_refiner,
     )
+
+    if input_class in TEXT_CLASSES and spreadsheet_media:
+        # Embedded workbook pictures ride the figures list so the response
+        # projection ships them in images[] with their crop data. bbox stays
+        # null: nothing was rendered, so there is no page geometry.
+        doc["figures"].extend({
+            "caption": m["caption"], "page": None, "bbox": None,
+            "crop_path": m["path"],
+        } for m in spreadsheet_media)
 
     if raw:
         # Flat text rendering: no structured.json, so the server omits the

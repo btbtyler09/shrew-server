@@ -267,7 +267,8 @@ def _series_data(wb, series) -> tuple[list[Any] | None, list[Any] | None, bool]:
     categories: list[Any] | None = None
     is_external = False
     try:
-        val = getattr(series, "val", None)
+        # Bar/line/pie series carry values in `val`; scatter/bubble in `yVal`.
+        val = getattr(series, "val", None) or getattr(series, "yVal", None)
         if val is not None:
             num_ref = getattr(val, "numRef", None)
             if num_ref is not None and getattr(num_ref, "f", None):
@@ -290,9 +291,38 @@ def _series_data(wb, series) -> tuple[list[Any] | None, list[Any] | None, bool]:
                 categories = _resolve_values(wb, str_ref.f)
             elif num_ref is not None and getattr(num_ref, "f", None):
                 categories = _resolve_values(wb, num_ref.f)
+        if categories is None:
+            # Scatter/bubble series carry x-values in xVal, not cat — without
+            # this the x column silently vanishes and the table is one-legged.
+            xval = getattr(series, "xVal", None)
+            if xval is not None:
+                num_ref = getattr(xval, "numRef", None)
+                str_ref = getattr(xval, "strRef", None)
+                if num_ref is not None and getattr(num_ref, "f", None):
+                    categories = _resolve_values(wb, num_ref.f)
+                elif str_ref is not None and getattr(str_ref, "f", None):
+                    categories = _resolve_values(wb, str_ref.f)
     except AttributeError:
         pass
+    # Whole-column references resolve to enormous lists; cap like data sheets.
+    if values is not None and len(values) > SPREADSHEET_MAX_ROWS:
+        values = values[:SPREADSHEET_MAX_ROWS]
+    if categories is not None and len(categories) > SPREADSHEET_MAX_ROWS:
+        categories = categories[:SPREADSHEET_MAX_ROWS]
     return values, categories, is_external
+
+
+def _series_source_ref(series) -> str | None:
+    """The cell range a series' values come from, for the chart caption."""
+    try:
+        val = getattr(series, "val", None) or getattr(series, "yVal", None)
+        if val is not None:
+            num_ref = getattr(val, "numRef", None)
+            if num_ref is not None and getattr(num_ref, "f", None):
+                return num_ref.f
+    except AttributeError:
+        pass
+    return None
 
 
 def _axis_label(chart, axis_attr: str) -> str | None:
@@ -302,26 +332,37 @@ def _axis_label(chart, axis_attr: str) -> str | None:
     return _walk_title(getattr(axis, "title", None))
 
 
+def _unit_header(name: str, unit: str | None) -> str:
+    """Column header for a value column: series name with the axis title as a
+    unit suffix — 'Revenue (USD millions)'. Skipped when the name already
+    carries it or there is no axis title."""
+    if not unit or unit.lower() in name.lower():
+        return name
+    return f"{name} ({unit})"
+
+
 def _render_chart(wb, chart) -> str:
+    """Tabularize a chart: the chart IS a view of a table, so emit the table.
+
+    Presentation intent (type, title, source range) survives in the heading
+    line — 'the author showed this as a line chart' is semantic content.
+    Axis titles become column-header units; legend entries become column
+    titles for multi-series charts sharing categories.
+    """
     title = _walk_title(getattr(chart, "title", None)) or "(untitled)"
     ctype = _chart_type(chart)
-    lines = [f"### Chart: {title} ({ctype})"]
 
     x_label: str | None = None
     y_label: str | None = None
-    z_label: str | None = None
     if ctype not in {"pie", "doughnut"}:
         x_label = _axis_label(chart, "x_axis")
         y_label = _axis_label(chart, "y_axis")
-        z_label = _axis_label(chart, "z_axis")
-        if x_label:
-            lines.append(f"**X-axis:** {x_label}")
-        if y_label:
-            lines.append(f"**Y-axis:** {y_label}")
-        if z_label:
-            lines.append(f"**Z-axis:** {z_label}")
 
     series_list = list(getattr(chart, "series", None) or [])
+    src = next((r for r in (_series_source_ref(s) for s in series_list) if r), None)
+    heading = f"### Chart ({ctype}): {title}" + (f" — source: {src}" if src else "")
+    lines = [heading]
+
     if not series_list:
         lines.append("")
         lines.append("_(no series)_")
@@ -343,7 +384,8 @@ def _render_chart(wb, chart) -> str:
     if can_fold:
         cats = records[0][2] or []
         cat_header = x_label or "Category"
-        header = [cat_header] + [name for name, _, _, _ in records]
+        header = [cat_header] + [_unit_header(name, y_label)
+                                 for name, _, _, _ in records]
         lines.append("| " + " | ".join(_esc(h) for h in header) + " |")
         lines.append("| " + " | ".join(["---"] * len(header)) + " |")
         for i, cat in enumerate(cats):
@@ -353,18 +395,19 @@ def _render_chart(wb, chart) -> str:
             lines.append("| " + " | ".join(_esc(c) for c in row) + " |")
     else:
         for name, values, categories, is_external in records:
-            lines.append(f"**Series: {name}**")
             if values is None:
-                lines.append("_(external reference)_" if is_external else "_(no data)_")
+                lines.append(f"**Series: {name}** " +
+                             ("_(external reference)_" if is_external else "_(no data)_"))
                 lines.append("")
                 continue
             if categories and len(categories) == len(values):
-                lines.append("| " + " | ".join(_esc(h) for h in ["Category", name]) + " |")
+                header = [x_label or "Category", _unit_header(name, y_label)]
+                lines.append("| " + " | ".join(_esc(h) for h in header) + " |")
                 lines.append("| --- | --- |")
                 for cat, val in zip(categories, values):
                     lines.append(f"| {_esc(_stringify(cat))} | {_esc(_stringify(val))} |")
             else:
-                lines.append(f"| {_esc(name)} |")
+                lines.append(f"| {_esc(_unit_header(name, y_label))} |")
                 lines.append("| --- |")
                 for val in values:
                     lines.append(f"| {_esc(_stringify(val))} |")
@@ -383,6 +426,58 @@ def _classify_sheet(ws) -> str:
     if has_data and has_charts:
         return "mixed"
     return "data"
+
+
+def extract_spreadsheet_media(path: str, output_dir: str,
+                              max_images: int = 20) -> list[dict]:
+    """Extract embedded pictures (xl/media) from a workbook.
+
+    Charts are deliberately NOT handled here — they are vector XML backed by
+    cell data and get tabularized by extract_spreadsheet. Pictures (pasted
+    photos, logos, diagrams) are the only genuinely visual objects in a
+    workbook; they come out of the container at native resolution, no
+    rendering involved.
+
+    Returns [{"path", "sheet", "index"}]; files land in output_dir/figures/.
+    """
+    from openpyxl import load_workbook
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in {".xlsx", ".xlsm"}:
+        # .xls/.ods go through the LibreOffice round-trip in extract_spreadsheet;
+        # reuse its converted artifact if present, else convert here.
+        converted = os.path.join(
+            output_dir, os.path.splitext(os.path.basename(path))[0] + ".xlsx")
+        path = converted if os.path.exists(converted) else _convert_to_xlsx(path, output_dir)
+
+    try:
+        wb = load_workbook(path)
+    except Exception as e:
+        logger.warning(f"media extraction: could not load workbook: {e}")
+        return []
+
+    fig_dir = os.path.join(output_dir, "figures")
+    out: list[dict] = []
+    for ws in wb.worksheets:
+        for img in (getattr(ws, "_images", None) or []):
+            if len(out) >= max_images:
+                logger.warning(
+                    f"workbook carries more than {max_images} embedded images; "
+                    f"extracting the first {max_images} only")
+                return out
+            try:
+                data = img._data()
+            except Exception as e:
+                logger.warning(f"unreadable embedded image on '{ws.title}': {e}")
+                continue
+            fmt = (getattr(img, "format", None) or "png").lower()
+            os.makedirs(fig_dir, exist_ok=True)
+            fname = f"sheet_{ws.title.replace('/', '_')}_img{len(out)}.{fmt}"
+            fpath = os.path.join(fig_dir, fname)
+            with open(fpath, "wb") as fh:
+                fh.write(data)
+            out.append({"path": fpath, "sheet": ws.title, "index": len(out)})
+    return out
 
 
 def extract_spreadsheet(path: str, output_dir: str) -> str:
