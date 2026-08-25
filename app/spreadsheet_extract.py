@@ -19,6 +19,35 @@ from typing import Any
 logger = logging.getLogger("shrew.spreadsheet_extract")
 
 SPREADSHEET_MAX_ROWS = 10000
+# Column cap for the rendered data table (attacker-controlled width otherwise).
+SPREADSHEET_MAX_COLS = int(os.environ.get("SPREADSHEET_MAX_COLS", "256"))
+# Used-range scan budget — see _find_used_range.
+SPREADSHEET_SCAN_CELL_BUDGET = int(
+    os.environ.get("SPREADSHEET_SCAN_CELL_BUDGET", "5000000"))
+# Reject workbooks whose zip members DECLARE more than this uncompressed —
+# a zip-bomb sheet XML otherwise inflates inside load_workbook itself.
+SPREADSHEET_MAX_UNCOMPRESSED_MB = float(
+    os.environ.get("SPREADSHEET_MAX_UNCOMPRESSED_MB", "512"))
+
+
+def check_workbook_zip_size(path: str) -> None:
+    """Reject zip-container workbooks that declare an absurd uncompressed size.
+
+    Cheap (central-directory read only, no extraction). Non-zip inputs pass —
+    the loader produces its own error for those.
+    """
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            total = sum(i.file_size for i in z.infolist())
+    except (zipfile.BadZipFile, OSError):
+        return
+    cap = SPREADSHEET_MAX_UNCOMPRESSED_MB * 1024 * 1024
+    if total > cap:
+        raise ValueError(
+            f"workbook declares {total / 1e6:.0f} MB uncompressed "
+            f"(cap {SPREADSHEET_MAX_UNCOMPRESSED_MB:.0f} MB) — rejected as a "
+            f"zip-bomb risk (raise SPREADSHEET_MAX_UNCOMPRESSED_MB if legitimate)")
 
 _RANGE_RE = re.compile(
     r"""
@@ -55,27 +84,11 @@ _CHART_TYPE_MAP = {
 
 def _convert_to_xlsx(src_path: str, output_dir: str) -> str:
     """Convert .xls / .ods to .xlsx via LibreOffice headless."""
+    from .rasterizer import run_libreoffice
+
     basename = os.path.basename(src_path)
     logger.info(f"Converting {basename} to xlsx via LibreOffice")
-    try:
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "xlsx",
-             "--outdir", output_dir, src_path],
-            capture_output=True, text=True, timeout=120,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "LibreOffice is not installed. "
-            "Install it to process .xls/.ods spreadsheets: apt install libreoffice"
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"LibreOffice xlsx conversion timed out after 120s for {basename}"
-        )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"LibreOffice xlsx conversion failed for {basename}: {result.stderr}"
-        )
+    run_libreoffice("xlsx", src_path, output_dir)
     stem = os.path.splitext(basename)[0]
     xlsx_path = os.path.join(output_dir, f"{stem}.xlsx")
     if not os.path.exists(xlsx_path):
@@ -132,12 +145,28 @@ def _walk_title(title_obj: Any) -> str | None:
 
 
 def _find_used_range(ws) -> tuple[int, int, int, int] | None:
-    """Return (min_row, min_col, max_row, max_col) 1-indexed inclusive, or None."""
+    """Return (min_row, min_col, max_row, max_col) 1-indexed inclusive, or None.
+
+    The scan is budgeted: a crafted workbook can DECLARE a dimension of
+    A1:XFD1048576 (17 billion cells) and `iter_rows()` would walk all of it —
+    a CPU wedge before any of our clamps run. Row-major top-down iteration
+    means the budget still finds min_row/min_col first; whatever lies beyond
+    the budget is dropped with a warning, which is the same contract as the
+    row cap below.
+    """
+    budget = SPREADSHEET_SCAN_CELL_BUDGET
     max_row = 0
     max_col = 0
     min_row: int | None = None
     min_col: int | None = None
     for row in ws.iter_rows():
+        budget -= len(row)
+        if budget < 0:
+            logger.warning(
+                f"Sheet '{ws.title}' declared dimension exceeds the "
+                f"{SPREADSHEET_SCAN_CELL_BUDGET}-cell scan budget; "
+                f"content beyond the scanned window is dropped")
+            break
         for cell in row:
             v = cell.value
             if v is None:
@@ -163,8 +192,27 @@ def _build_data_table(ws, max_rows: int = SPREADSHEET_MAX_ROWS) -> str:
     if bounds is None:
         return ""
     min_row, min_col, max_row, max_col = bounds
+
+    # Clamp BEFORE allocating: the grid is sized by the used range, and the
+    # used range is attacker-controlled (one value at A1 and one at
+    # XFD1048576 previously demanded a 17-billion-cell allocation — instant
+    # OOM kill, long before the row truncation below was consulted).
+    original_data_rows = max_row - min_row  # excludes header row
+    original_cols = max_col - min_col + 1
+    max_row = min(max_row, min_row + max_rows)  # header + max_rows data rows
+    max_col = min(max_col, min_col + SPREADSHEET_MAX_COLS - 1)
     width = max_col - min_col + 1
     height = max_row - min_row + 1
+    if original_data_rows > max_rows:
+        logger.warning(
+            f"Sheet '{ws.title}' exceeds {max_rows} rows; truncating "
+            f"(had {original_data_rows} data rows)"
+        )
+    if original_cols > SPREADSHEET_MAX_COLS:
+        logger.warning(
+            f"Sheet '{ws.title}' exceeds {SPREADSHEET_MAX_COLS} columns; "
+            f"truncating (had {original_cols})"
+        )
 
     grid: list[list[str]] = [["" for _ in range(width)] for _ in range(height)]
     for r in range(min_row, max_row + 1):
@@ -175,18 +223,11 @@ def _build_data_table(ws, max_rows: int = SPREADSHEET_MAX_ROWS) -> str:
         anchor_val = _stringify(ws.cell(row=merged.min_row, column=merged.min_col).value)
         if not anchor_val:
             continue
-        for r in range(merged.min_row, merged.max_row + 1):
-            for c in range(merged.min_col, merged.max_col + 1):
-                if min_row <= r <= max_row and min_col <= c <= max_col:
-                    grid[r - min_row][c - min_col] = anchor_val
-
-    original_data_rows = height - 1
-    if original_data_rows > max_rows:
-        grid = grid[: max_rows + 1]
-        logger.warning(
-            f"Sheet '{ws.title}' exceeds {max_rows} rows; truncating "
-            f"(had {original_data_rows} data rows)"
-        )
+        # Iterate only the INTERSECTION of the merged range with the clamped
+        # window — a single merged range can legally span millions of cells.
+        for r in range(max(merged.min_row, min_row), min(merged.max_row, max_row) + 1):
+            for c in range(max(merged.min_col, min_col), min(merged.max_col, max_col) + 1):
+                grid[r - min_row][c - min_col] = anchor_val
 
     if not grid:
         return ""
@@ -451,6 +492,7 @@ def extract_spreadsheet_media(path: str, output_dir: str,
         path = converted if os.path.exists(converted) else _convert_to_xlsx(path, output_dir)
 
     try:
+        check_workbook_zip_size(path)
         wb = load_workbook(path)
     except Exception as e:
         logger.warning(f"media extraction: could not load workbook: {e}")
@@ -458,26 +500,29 @@ def extract_spreadsheet_media(path: str, output_dir: str,
 
     fig_dir = os.path.join(output_dir, "figures")
     out: list[dict] = []
-    for ws in wb.worksheets:
-        for img in (getattr(ws, "_images", None) or []):
-            if len(out) >= max_images:
-                logger.warning(
-                    f"workbook carries more than {max_images} embedded images; "
-                    f"extracting the first {max_images} only")
-                return out
-            try:
-                data = img._data()
-            except Exception as e:
-                logger.warning(f"unreadable embedded image on '{ws.title}': {e}")
-                continue
-            fmt = (getattr(img, "format", None) or "png").lower()
-            os.makedirs(fig_dir, exist_ok=True)
-            fname = f"sheet_{ws.title.replace('/', '_')}_img{len(out)}.{fmt}"
-            fpath = os.path.join(fig_dir, fname)
-            with open(fpath, "wb") as fh:
-                fh.write(data)
-            out.append({"path": fpath, "sheet": ws.title, "index": len(out)})
-    return out
+    try:
+        for ws in wb.worksheets:
+            for img in (getattr(ws, "_images", None) or []):
+                if len(out) >= max_images:
+                    logger.warning(
+                        f"workbook carries more than {max_images} embedded images; "
+                        f"extracting the first {max_images} only")
+                    return out
+                try:
+                    data = img._data()
+                except Exception as e:
+                    logger.warning(f"unreadable embedded image on '{ws.title}': {e}")
+                    continue
+                fmt = (getattr(img, "format", None) or "png").lower()
+                os.makedirs(fig_dir, exist_ok=True)
+                fname = f"sheet_{ws.title.replace('/', '_')}_img{len(out)}.{fmt}"
+                fpath = os.path.join(fig_dir, fname)
+                with open(fpath, "wb") as fh:
+                    fh.write(data)
+                out.append({"path": fpath, "sheet": ws.title, "index": len(out)})
+        return out
+    finally:
+        wb.close()
 
 
 def extract_spreadsheet(path: str, output_dir: str) -> str:
@@ -492,6 +537,7 @@ def extract_spreadsheet(path: str, output_dir: str) -> str:
     if ext not in {".xlsx", ".xlsm"}:
         work_path = _convert_to_xlsx(path, output_dir)
 
+    check_workbook_zip_size(work_path)
     try:
         wb = load_workbook(work_path, data_only=True)
     except Exception as e:
@@ -500,18 +546,21 @@ def extract_spreadsheet(path: str, output_dir: str) -> str:
         )
 
     sections: list[str] = []
-    for ws in wb.worksheets:
-        sections.append(f"## Sheet: {ws.title}")
-        klass = _classify_sheet(ws)
-        if klass == "empty":
-            sections.append("_(empty sheet)_")
-            continue
-        if klass in ("data", "mixed"):
-            table_md = _build_data_table(ws)
-            if table_md:
-                sections.append(table_md)
-        if klass in ("chart", "mixed"):
-            for chart in (ws._charts or []):
-                sections.append(_render_chart(wb, chart))
+    try:
+        for ws in wb.worksheets:
+            sections.append(f"## Sheet: {ws.title}")
+            klass = _classify_sheet(ws)
+            if klass == "empty":
+                sections.append("_(empty sheet)_")
+                continue
+            if klass in ("data", "mixed"):
+                table_md = _build_data_table(ws)
+                if table_md:
+                    sections.append(table_md)
+            if klass in ("chart", "mixed"):
+                for chart in (ws._charts or []):
+                    sections.append(_render_chart(wb, chart))
+    finally:
+        wb.close()
 
     return "\n\n".join(sections)

@@ -55,6 +55,12 @@ from .vlm_client import VLMClient
 
 logger = logging.getLogger("shrew.server")
 
+# Upload byte cap, env-tunable. Enforced twice: a Content-Length middleware
+# rejects before the framework spools the body, and _save_upload counts bytes
+# as a backstop for chunked bodies with no declared length.
+MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "100"))
+MAX_FILE_SIZE = int(MAX_UPLOAD_MB * 1024 * 1024)
+
 
 # ── Adapter constants ───────────────────────────────────────────────────────
 
@@ -136,6 +142,19 @@ async def lifespan(app: FastAPI):
 
     start = time.time()
     _config = ServerConfig.from_env()
+    _sweep_stale_tmp()
+
+    # Every throttle in this process (VLM gate, rasterize lock, pipeline
+    # semaphores, the /health empty-200 streak) is PER-PROCESS: uvicorn
+    # spawns workers rather than forking, so nothing is shared. Effective
+    # concurrency multiplies by the worker count (audit issue #14).
+    workers = int(os.environ.get("SHREW_WORKERS", "1") or 1)
+    if workers > 1:
+        logger.warning(
+            f"SHREW_WORKERS={workers}: concurrency gates are per-worker — "
+            f"effective VLM/pipeline concurrency is {workers}x the configured "
+            f"values and the rasterization memory throttle is per-worker. "
+            f"Size VLM_CONCURRENCY/PIPELINE_CONCURRENCY accordingly.")
 
     from concurrent.futures import ThreadPoolExecutor
     _vlm_pool = ThreadPoolExecutor(max_workers=_config.vlm_concurrency)
@@ -242,9 +261,30 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.1",
+    version="0.3.2",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def _reject_oversize_uploads(request, call_next):
+    """Reject oversized convert bodies from the Content-Length header, BEFORE
+    the framework spools the multipart body to disk (it spools first, so the
+    in-handler cap alone still pays the full disk/RAM cost). Chunked bodies
+    without a length fall through to _save_upload's byte-count backstop."""
+    if request.url.path.startswith("/v1/convert"):
+        try:
+            declared = int(request.headers.get("content-length", "0"))
+        except ValueError:
+            declared = 0
+        # 1 MiB margin for multipart framing around the file part.
+        if declared > MAX_FILE_SIZE + 1024 * 1024:
+            return JSONResponse(
+                status_code=413,
+                content={"error": (f"request body {declared // (1024*1024)} MB "
+                                   f"exceeds MAX_UPLOAD_MB={MAX_UPLOAD_MB:.0f}")},
+            )
+    return await call_next(request)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -364,6 +404,43 @@ def _get_figure_converter():
     return _figure_converter
 
 
+def _sweep_stale_tmp(max_age_h: float | None = None) -> int:
+    """Remove stale shrew_* conversion dirs / uploads / LO profiles in tmp.
+
+    Normal requests clean up in their finally blocks — but an OOM-killed
+    worker, a container restart, or a crash mid-conversion leaks the whole
+    tree (upload + per-page PNGs, easily GBs per incident) and nothing else
+    ever deletes it. Runs once at startup; age threshold keeps live
+    conversions of other workers safe.
+    """
+    if max_age_h is None:
+        max_age_h = float(os.environ.get("SHREW_TMP_MAX_AGE_H", "24"))
+    cutoff = time.time() - max_age_h * 3600
+    tmp = tempfile.gettempdir()
+    removed = 0
+    try:
+        names = os.listdir(tmp)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(("shrew_", "shrew_up_", "shrew_lo_")):
+            continue
+        path = os.path.join(tmp, name)
+        try:
+            if os.path.getmtime(path) > cutoff:
+                continue
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        logger.info(f"Swept {removed} stale temp artifact(s) older than {max_age_h:.0f}h")
+    return removed
+
+
 def _save_upload(upload: UploadFile) -> str:
     """Save uploaded file to a temp path and return the path."""
     suffix = os.path.splitext(upload.filename or "doc.pdf")[1].lower()
@@ -372,12 +449,21 @@ def _save_upload(upload: UploadFile) -> str:
             status_code=400,
             detail=f"Unsupported file type: {suffix}",
         )
-    fd, path = tempfile.mkstemp(suffix=suffix)
+    # shrew_up_ prefix makes stale uploads sweepable at startup (issue #11).
+    fd, path = tempfile.mkstemp(prefix="shrew_up_", suffix=suffix)
+    total = 0
     try:
         while True:
             chunk = upload.file.read(1024 * 1024)
             if not chunk:
                 break
+            total += len(chunk)
+            if total > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(f"File too large (max {MAX_UPLOAD_MB:.0f} MB; "
+                            f"set MAX_UPLOAD_MB to raise)"),
+                )
             os.write(fd, chunk)
     except Exception:
         os.close(fd)
@@ -447,8 +533,12 @@ async def convert(
 
     skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
 
-    async with _pipeline_sem:
-        try:
+    # try encloses the semaphore acquisition: a request cancelled while
+    # QUEUED (client gone, server shutdown) must still clean its upload and
+    # output dir — with cleanup inside the async-with body, cancel-at-acquire
+    # leaked both (audit issue #11).
+    try:
+        async with _pipeline_sem:
             loop = asyncio.get_running_loop()
             config = PipelineConfig(
                 vlm_url=vlm_url,
@@ -488,15 +578,16 @@ async def convert(
                                          media_type="text/markdown; charset=utf-8")
             return JSONResponse(content=response)
 
-        except Exception as e:
-            logger.error(f"Pipeline error: {e}", exc_info=True)
-            return JSONResponse(
-                status_code=500,
-                content={"error": str(e)},
-            )
-        finally:
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)},
+        )
+    finally:
+        if os.path.exists(tmp_path):
             os.unlink(tmp_path)
-            shutil.rmtree(output_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 @app.post("/v1/convert/stream")
@@ -609,10 +700,11 @@ async def convert_stream(
 
     async def event_generator():
         thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
-
+        started = False
         loop = asyncio.get_running_loop()
         try:
+            thread.start()
+            started = True
             while True:
                 event = await loop.run_in_executor(None, _drain_queue)
                 if event is None:
@@ -621,7 +713,18 @@ async def convert_stream(
                 yield {"event": evt_name, "data": json.dumps(event)}
         except asyncio.CancelledError:
             progress.cancel()
-            thread.join(timeout=5)
+            # NO thread.join here: this except body runs ON the event loop,
+            # and the pipeline thread rarely exits within seconds — every
+            # disconnect used to freeze ALL requests (SSE, /health, new
+            # connections) for the full join timeout. The worker thread owns
+            # its cleanup (run_in_thread's finally) and exits at the next
+            # page boundary after progress.cancel().
+            if not started:
+                # Cancelled before the worker existed: nothing else will
+                # clean the upload/output dir — do it here (audit issue #11).
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                shutil.rmtree(output_dir, ignore_errors=True)
             raise
 
     return EventSourceResponse(event_generator())

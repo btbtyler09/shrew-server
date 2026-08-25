@@ -17,8 +17,11 @@ import requests
 
 logger = logging.getLogger("shrew.vlm")
 
-# Cross-process VLM concurrency gate.  Created at import time (before
-# uvicorn forks) so all workers share the same POSIX semaphore.
+# VLM concurrency gate. NOTE: this is PER-PROCESS, not cross-process — the
+# original comment assumed uvicorn forks after import, but uvicorn SPAWNS
+# workers, and each fresh interpreter builds its own independent semaphore.
+# With SHREW_WORKERS=N the effective in-flight limit is N x VLM_CONCURRENCY;
+# the server logs a loud warning at startup (audit issue #14).
 _VLM_CONCURRENCY = int(os.environ.get("VLM_CONCURRENCY", "4"))
 _vlm_gate = (
     multiprocessing.Semaphore(_VLM_CONCURRENCY) if _VLM_CONCURRENCY > 0 else None

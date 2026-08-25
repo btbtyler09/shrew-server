@@ -25,12 +25,15 @@ The model client is injectable so tests never hit a live endpoint.
 import base64
 import difflib
 import hashlib
+import logging
 import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
+
+logger = logging.getLogger("shrew.structured_pipeline")
 
 from . import rasterizer
 from .assembly import assemble_document, build_table_composite
@@ -193,8 +196,10 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     # upgrade a page; on any fallback failure the primary record stands.
     if not result["ok"] and fallback_client is not None:
         from . import fallback as fb
+        with Image.open(hires_path) as _hires_img:
+            glyph_px = cached_glyph_height(_hires_img, hires_path)
         data = fb.extract_page_fallback(
-            hires_path, cached_glyph_height(Image.open(hires_path), hires_path),
+            hires_path, glyph_px,
             fallback_client,
             output_path=os.path.join(pages_dir, f"page_{page_no:04d}_fallback.png"),
             page_no=page_no,
@@ -727,8 +732,8 @@ def _extract_and_caption_media(file_path, output_dir, client) -> list[dict]:
             prepped = m["path"] + ".prepped.png"
             enh.save(prepped)
             res = extract_page(prepped, client)
-            if res.get("ok") and res.get("structured"):
-                sj = res["structured"]
+            if res.get("ok") and res.get("data"):
+                sj = res["data"]
                 figs = [f for f in (sj.get("figures") or [])
                         if isinstance(f, dict) and f.get("caption")]
                 caption = (figs[0]["caption"] if figs else None) or sj.get("summary")

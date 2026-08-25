@@ -34,39 +34,41 @@ def _html_or_text_to_markdown(content: str) -> str:
     return content.strip()
 
 
+# Whole-file text inputs are read into memory in one piece (and HTML builds a
+# DOM several times the source size on top), so bound them up front. A file
+# over the cap is REJECTED with a clear error, never silently truncated —
+# same contract as the §5.4 text-page rule.
+MAX_TEXT_MB = float(os.environ.get("MAX_TEXT_MB", "50"))
+
+
+def check_text_size(path: str) -> None:
+    size = os.path.getsize(path)
+    cap = MAX_TEXT_MB * 1024 * 1024
+    if size > cap:
+        raise ValueError(
+            f"{os.path.basename(path)} is {size / 1e6:.0f} MB — text-family "
+            f"inputs are capped at MAX_TEXT_MB={MAX_TEXT_MB:.0f} MB "
+            f"(raise the env var if legitimate)")
+
+
 def extract_txt(path: str) -> str:
+    check_text_size(path)
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
 def extract_md(path: str) -> str:
+    check_text_size(path)
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
 def extract_rtf(path: str, output_dir: str) -> str:
     """Convert RTF to plain text via LibreOffice, then read the result."""
+    from .rasterizer import run_libreoffice
+
     basename = os.path.basename(path)
     logger.info(f"Converting {basename} to text via LibreOffice")
 
-    try:
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "txt",
-             "--outdir", output_dir, path],
-            capture_output=True, text=True, timeout=120,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "LibreOffice is not installed. "
-            "Install it to process RTF documents: apt install libreoffice"
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"LibreOffice conversion timed out after 120s for {basename}"
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"LibreOffice RTF conversion failed for {basename}: {result.stderr}"
-        )
+    run_libreoffice("txt", path, output_dir)
 
     stem = os.path.splitext(basename)[0]
     txt_path = os.path.join(output_dir, f"{stem}.txt")
@@ -79,6 +81,7 @@ def extract_rtf(path: str, output_dir: str) -> str:
 
 def extract_html(path: str) -> str:
     """Parse HTML, strip scripts/styles, convert to markdown."""
+    check_text_size(path)
     from bs4 import BeautifulSoup
     from markdownify import markdownify
 
@@ -95,6 +98,7 @@ def extract_csv(path: str) -> str:
     First row is treated as the header. Rows beyond CSV_MAX_ROWS are dropped
     with a warning.
     """
+    check_text_size(path)
     with open(path, encoding="utf-8", errors="replace", newline="") as f:
         reader = csv.reader(f)
         rows = []
@@ -152,6 +156,7 @@ def _format_email_preamble(
 
 def extract_eml(path: str) -> str:
     """Parse an .eml MIME message into a markdown preamble + body."""
+    check_text_size(path)
     from email import policy
     from email.parser import BytesParser
 
@@ -184,6 +189,7 @@ def extract_eml(path: str) -> str:
 
 def extract_msg(path: str) -> str:
     """Parse a .msg Outlook message into a markdown preamble + body."""
+    check_text_size(path)
     from .msg_extract import read_msg
 
     fields = read_msg(path)

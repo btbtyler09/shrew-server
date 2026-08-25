@@ -82,8 +82,14 @@ class PageMetrics:
     MARGIN = float(os.environ.get("VLM_TIMEOUT_MARGIN", "1.5"))
     RAMP_DOCS = 10               # docs to fully tighten thresholds
 
+    # ONE lock for every instance: each request builds its own PageMetrics
+    # over the same on-disk file, so a per-instance lock serialized nothing —
+    # concurrent docs raced the read-modify-write and could regress the
+    # learned timeouts (audit issue #13).
+    _SHARED_LOCK = threading.Lock()
+
     def __init__(self, vlm_concurrency: int = 4):
-        self._lock = threading.Lock()
+        self._lock = PageMetrics._SHARED_LOCK
         self._vlm_concurrency = vlm_concurrency
         self._concurrency_changed = False
         # Persistent state (loaded from / saved to disk)
@@ -130,7 +136,11 @@ class PageMetrics:
                 "vlm_concurrency": self._vlm_concurrency,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            _METRICS_PATH.write_text(json.dumps(data, indent=2))
+            # Atomic replace: a reader must never observe a half-written file
+            # (a truncate-then-write mid-read reset the whole learned ramp).
+            tmp = _METRICS_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            os.replace(tmp, _METRICS_PATH)
         except Exception as e:
             logger.warning(f"Failed to save page metrics: {e}")
 
@@ -386,7 +396,10 @@ def _crop_and_filter_figures(
     if not figures:
         return []
 
-    img = Image.open(display_path)
+    # Decode to a detached copy so the file handle closes NOW instead of being
+    # held open across the per-figure VLM classification calls below.
+    with Image.open(display_path) as _src:
+        img = _src.convert("RGB")
     figures_dir = os.path.join(output_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
 
@@ -1079,6 +1092,12 @@ def run_pipeline(
                 progress.emit(pct, f"Transcribing pages ({pages_done}/{n_pages})...")
                 if progress.is_cancelled():
                     cancel_event.set()
+                    # Cancel everything still queued: when the caller passed
+                    # the SHARED server-wide pool, orphaned page tasks would
+                    # otherwise keep grinding VLM calls for hours and starve
+                    # every other request (audit issue #12).
+                    for pending in futures:
+                        pending.cancel()
                     raise CancelledException()
 
         metrics.finish_document()

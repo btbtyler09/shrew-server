@@ -12,8 +12,10 @@ this module entirely — see text_extract.py and spreadsheet_extract.py.
 import logging
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -173,6 +175,53 @@ def classify_file(file_path: str) -> str:
     raise ValueError(f"Unsupported file type: {ext}")
 
 
+def run_libreoffice(convert_to: str, src_path: str, outdir: str,
+                    timeout: float = 120.0, binary: str = "libreoffice") -> None:
+    """Run ONE isolated LibreOffice headless conversion. Shared by the
+    office→pdf, xls/ods→xlsx, and rtf→txt call sites.
+
+    Two hardenings over a bare subprocess.run:
+    - a unique ``-env:UserInstallation`` profile per invocation — concurrent
+      conversions otherwise contend on the singleton profile lock and
+      spuriously fail (only one of the three call sites even ran under
+      RASTERIZE_LOCK);
+    - ``start_new_session`` + process-group SIGKILL on timeout —
+      ``subprocess.run(timeout=)`` kills only the wrapper, and an orphaned
+      ``soffice.bin`` holding the profile lock poisons every later
+      conversion on the host.
+    """
+    basename = os.path.basename(src_path)
+    profile = tempfile.mkdtemp(prefix="shrew_lo_")
+    cmd = [binary, "--headless",
+           f"-env:UserInstallation=file://{profile}",
+           "--convert-to", convert_to, "--outdir", outdir, src_path]
+    try:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "LibreOffice is not installed. "
+                "Install it to process office documents: apt install libreoffice")
+        try:
+            _out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            proc.wait()
+            raise RuntimeError(
+                f"LibreOffice conversion timed out after {timeout:.0f}s "
+                f"for {basename}")
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"LibreOffice conversion failed for {basename}: {err}")
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
 def convert_office_to_pdf(office_path: str, output_dir: str) -> str:
     """Convert an office document (docx/pptx/odt/odp/doc/ppt) to PDF
     using LibreOffice headless.
@@ -183,26 +232,7 @@ def convert_office_to_pdf(office_path: str, output_dir: str) -> str:
     basename = os.path.basename(office_path)
     logger.info(f"Converting {basename} to PDF via LibreOffice")
 
-    try:
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", output_dir, office_path],
-            capture_output=True, text=True, timeout=120,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            "LibreOffice is not installed. "
-            "Install it to process office documents: apt install libreoffice"
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"LibreOffice conversion timed out after 120s for {basename}"
-        )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"LibreOffice conversion failed for {basename}: {result.stderr}"
-        )
+    run_libreoffice("pdf", office_path, output_dir)
 
     stem = os.path.splitext(basename)[0]
     pdf_path = os.path.join(output_dir, f"{stem}.pdf")
@@ -215,81 +245,113 @@ def convert_office_to_pdf(office_path: str, output_dir: str) -> str:
     return pdf_path
 
 
+# Frame cap for multi-page TIFF input: page count is otherwise entirely
+# attacker-controlled (a 10k-frame TIFF = 10k rasterizations + 10k VLM calls
+# on one pipeline slot).
+IMAGE_MAX_FRAMES = int(os.environ.get("IMAGE_MAX_FRAMES", "500"))
+
+
+def _image_worker(
+    image_path: str,
+    pages_dir: str,
+    low_dpi: int,
+    high_dpi: int,
+) -> tuple[dict[int, tuple[str, str]], int, dict[int, tuple[float, float]]]:
+    """All native image decoding for one upload (isolated worker).
+
+    Pillow's C codecs (libtiff/libjpeg/libwebp/giflib) fault on crafted
+    inputs exactly like PDFium does — same containment contract as
+    _raster_worker: this runs in the spawned worker so a codec crash costs
+    one conversion, not the server.
+    """
+    basename = os.path.basename(image_path)
+    ext = os.path.splitext(image_path)[1].lower()
+
+    img = Image.open(image_path)
+    try:
+        n_frames = getattr(img, "n_frames", 1)
+        is_multipage_tiff = ext in {".tiff", ".tif"} and n_frames > 1
+        if ext == ".gif" and n_frames > 1:
+            logger.warning(f"Animated GIF ({n_frames} frames) — using first frame only")
+            n_frames = 1
+        if n_frames > IMAGE_MAX_FRAMES:
+            logger.warning(
+                f"{basename}: {n_frames} frames exceeds IMAGE_MAX_FRAMES="
+                f"{IMAGE_MAX_FRAMES}; processing the first {IMAGE_MAX_FRAMES}")
+            n_frames = IMAGE_MAX_FRAMES
+
+        if is_multipage_tiff:
+            logger.info(f"Multi-page TIFF: {n_frames} pages from {basename}")
+        else:
+            logger.info(f"Image input: {basename}")
+
+        # Get native DPI (default 150 if not embedded)
+        dpi_info = img.info.get("dpi")
+        native_dpi = dpi_info[0] if dpi_info and dpi_info[0] > 0 else 150
+
+        display_scale = low_dpi / high_dpi
+        page_images: dict[int, tuple[str, str]] = {}
+        page_dims: dict[int, tuple[float, float]] = {}
+
+        for frame_idx in range(n_frames):
+            if n_frames > 1:
+                img.seek(frame_idx)
+
+            page_no = frame_idx + 1
+            frame = img.convert("RGB")
+
+            # Cap very large images
+            w, h = frame.size
+            if max(w, h) > MAX_IMAGE_DIM:
+                scale = MAX_IMAGE_DIM / max(w, h)
+                frame = frame.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                w, h = frame.size
+                logger.info(f"  Page {page_no}: resized to {w}x{h} (capped at {MAX_IMAGE_DIM}px)")
+
+            # Save hires version (original size or capped)
+            hires_path = os.path.join(pages_dir, f"page_{page_no:04d}_hires.png")
+            frame.save(hires_path)
+
+            # Save display version (scaled down)
+            dw, dh = int(w * display_scale), int(h * display_scale)
+            display = frame.resize((dw, dh), Image.LANCZOS)
+            display_path = os.path.join(pages_dir, f"page_{page_no:04d}_display.png")
+            display.save(display_path)
+            display.close()
+            frame.close()
+
+            page_images[page_no] = (display_path, hires_path)
+            # Dimensions in PDF points (1/72 inch)
+            page_dims[page_no] = (w * 72 / native_dpi, h * 72 / native_dpi)
+
+            if page_no % 10 == 0 or page_no == n_frames:
+                logger.info(f"  Prepared page {page_no}/{n_frames}")
+
+        logger.info(f"Prepared {n_frames} page(s) from {basename}")
+        return page_images, n_frames, page_dims
+    finally:
+        img.close()
+
+
 def prepare_image_pages(
     image_path: str,
     output_dir: str,
     low_dpi: int = 100,
     high_dpi: int = 200,
 ) -> tuple[dict[int, tuple[Path, Path]], int, dict[int, tuple[float, float]]]:
-    """Create display+hires page PNGs from an image file.
+    """Create display+hires page PNGs from an image file (crash-isolated).
 
-    Multi-page TIFFs produce one page per frame. GIFs use first frame only.
+    Multi-page TIFFs produce one page per frame (capped at IMAGE_MAX_FRAMES).
+    GIFs use first frame only.
 
     Returns:
         (page_images, total_pages, page_dims) matching the rasterize_pages contract.
     """
     pages_dir = os.path.join(output_dir, "pages")
     os.makedirs(pages_dir, exist_ok=True)
-
-    img = Image.open(image_path)
-    basename = os.path.basename(image_path)
-    ext = os.path.splitext(image_path)[1].lower()
-
-    # Determine number of frames
-    n_frames = getattr(img, "n_frames", 1)
-    is_multipage_tiff = ext in {".tiff", ".tif"} and n_frames > 1
-    if ext == ".gif" and n_frames > 1:
-        logger.warning(f"Animated GIF ({n_frames} frames) — using first frame only")
-        n_frames = 1
-
-    if is_multipage_tiff:
-        logger.info(f"Multi-page TIFF: {n_frames} pages from {basename}")
-    else:
-        logger.info(f"Image input: {basename}")
-
-    # Get native DPI (default 150 if not embedded)
-    dpi_info = img.info.get("dpi")
-    native_dpi = dpi_info[0] if dpi_info and dpi_info[0] > 0 else 150
-
-    display_scale = low_dpi / high_dpi
-    page_images = {}
-    page_dims = {}
-
-    for frame_idx in range(n_frames):
-        if n_frames > 1:
-            img.seek(frame_idx)
-
-        page_no = frame_idx + 1
-        frame = img.convert("RGB")
-
-        # Cap very large images
-        w, h = frame.size
-        if max(w, h) > MAX_IMAGE_DIM:
-            scale = MAX_IMAGE_DIM / max(w, h)
-            frame = frame.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            w, h = frame.size
-            logger.info(f"  Page {page_no}: resized to {w}x{h} (capped at {MAX_IMAGE_DIM}px)")
-
-        # Save hires version (original size or capped)
-        hires_path = Path(pages_dir) / f"page_{page_no:04d}_hires.png"
-        frame.save(str(hires_path))
-
-        # Save display version (scaled down)
-        dw, dh = int(w * display_scale), int(h * display_scale)
-        display = frame.resize((dw, dh), Image.LANCZOS)
-        display_path = Path(pages_dir) / f"page_{page_no:04d}_display.png"
-        display.save(str(display_path))
-
-        page_images[page_no] = (display_path, hires_path)
-        # Dimensions in PDF points (1/72 inch)
-        page_dims[page_no] = (w * 72 / native_dpi, h * 72 / native_dpi)
-
-        if page_no % 10 == 0 or page_no == n_frames:
-            logger.info(f"  Prepared page {page_no}/{n_frames}")
-
-    img.close()
-    total_pages = n_frames
-    logger.info(f"Prepared {total_pages} page(s) from {basename}")
+    raw_images, total_pages, page_dims = _run_isolated(
+        "_image_worker", image_path, pages_dir, low_dpi, high_dpi)
+    page_images = {n: (Path(d), Path(h)) for n, (d, h) in raw_images.items()}
     return page_images, total_pages, page_dims
 
 
