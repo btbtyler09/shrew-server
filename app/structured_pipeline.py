@@ -178,7 +178,8 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     # ONE page must surface as a page-level failure record, never crash the
     # document (§5.2 discipline — same as parse/schema failures).
     try:
-        result = _page_result(page_no, extract_page(model_png, client), bucket)
+        result = _page_result(page_no, extract_page(model_png, client,
+                                                    page_no=page_no), bucket)
     except Exception as e:
         result = _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
@@ -196,6 +197,7 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
             hires_path, cached_glyph_height(Image.open(hires_path), hires_path),
             fallback_client,
             output_path=os.path.join(pages_dir, f"page_{page_no:04d}_fallback.png"),
+            page_no=page_no,
         )
         if data is not None:
             result = _page_result(page_no, {
@@ -209,7 +211,8 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
     """Run extraction on one paginated block of extracted text."""
     try:
-        return _page_result(page_no, extract_text_page(text, client))
+        return _page_result(page_no, extract_text_page(text, client,
+                                                       page_no=page_no))
     except Exception as e:
         return _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
@@ -288,7 +291,10 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
         # enumeration (seen live on a form-heavy page) is not worth waiting
         # 300s for when a good deterministic merge is already in hand.
         try:
-            res = extract_page(model_png, client, timeout=_REFINE_TIMEOUT_S)
+            # page_no identifies the FIRST page represented by the stitched
+            # cross-page composite.
+            res = extract_page(model_png, client, timeout=_REFINE_TIMEOUT_S,
+                               page_no=prev.get("page"))
         except Exception:
             return None
         if not res["ok"] or not res["data"]:

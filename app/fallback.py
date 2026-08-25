@@ -157,7 +157,8 @@ def _coerce_five_key(sj: dict) -> dict:
     return out
 
 
-def extract_page_fallback(hires_path, glyph_px, client, *, output_path=None) -> dict | None:
+def extract_page_fallback(hires_path, glyph_px, client, *, output_path=None,
+                          page_no: int | None = None) -> dict | None:
     """One flagged fallback attempt on the NATIVE page render.
 
     Returns the coerced 5-key dict on success, None on any failure — the
@@ -186,8 +187,10 @@ def extract_page_fallback(hires_path, glyph_px, client, *, output_path=None) -> 
         if not text.strip() or choice.get("finish_reason") == "length":
             return None
         if zlib_ratio(text) > ZLIB_GATE_RATIO:
-            logger.warning("fallback output degenerate (zlib %.1f) — discarded",
-                           zlib_ratio(text))
+            # No attempt label: the fallback makes a single blocking attempt.
+            context = f"Page {page_no}: " if page_no is not None else ""
+            logger.warning("%sfallback output degenerate (zlib %.1f) — discarded",
+                           context, zlib_ratio(text))
             return None
         parsed, perr = parse_json_lenient(text)
         if parsed is None:

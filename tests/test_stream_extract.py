@@ -221,3 +221,24 @@ def test_wall_clock_excludes_queue_wait(slow_sse_server):
     choice = res["choices"][0]
     assert choice["finish_reason"] == "stop"
     assert choice["message"]["content"] == _SSEHandler.BODY
+
+
+def test_page_context_labels_both_attempts(caplog):
+    """Observability port: with page_no supplied, the first pass and the
+    enforced retry produce distinguishable, page-correlated abort warnings.
+    Behavior (early abort, degenerate verdict, repetition_abort flag) is
+    unchanged and still asserted."""
+    import logging
+    loop = '{"semantic_chunks": [' + '{"chunk_id": "c", "content": "x"},' * 6000
+    client = FakeStreamClient(loop)
+    with caplog.at_level(logging.WARNING, logger="shrew.structured_page"):
+        res = _extract(build_text_messages("x"), client, max_tokens=20000,
+                       page_no=12)
+    assert not res["ok"] and res["status"] == "degenerate"
+    assert res["repetition_abort"] is True
+    warnings = [r.getMessage() for r in caplog.records
+                if "repetition_abort" in r.getMessage()]
+    assert any(w.startswith("Page 12 (attempt 1/2, first pass): repetition_abort")
+               for w in warnings)
+    assert any(w.startswith("Page 12 (attempt 2/2, enforced retry): repetition_abort")
+               for w in warnings)

@@ -423,11 +423,19 @@ class RepetitionGuard:
     def __init__(self, window: int = STREAM_GUARD_WINDOW_CHARS,
                  check_every: int = STREAM_GUARD_CHECK_EVERY_CHARS,
                  threshold: float = STREAM_GUARD_RATIO,
-                 consecutive: int = STREAM_GUARD_CONSECUTIVE):
+                 consecutive: int = STREAM_GUARD_CONSECUTIVE,
+                 page_no: int | None = None,
+                 attempt: str | None = None):
         self.window = window
         self.check_every = check_every
         self.threshold = threshold
         self.consecutive = consecutive
+        # Observability only: pages stream concurrently, so an unprefixed
+        # warning burst can't be correlated with page results. page_no is the
+        # pipeline's one-based document page index (not a number printed on
+        # the page); attempt distinguishes first pass from the enforced retry.
+        self.page_no = page_no
+        self.attempt = attempt
         self.violations = 0
         self.ratio = 0.0
         self.max_ratio = 0.0
@@ -450,10 +458,16 @@ class RepetitionGuard:
             return None
         self.fired = True
         self.position = n
+        context = ""
+        if self.page_no is not None:
+            context = f"Page {self.page_no}"
+            if self.attempt:
+                context += f" ({self.attempt})"
+            context += ": "
         logger.warning(
-            "repetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
+            "%srepetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
             "for %d consecutive windows",
-            n, self.ratio, self.threshold, self.violations,
+            context, n, self.ratio, self.threshold, self.violations,
         )
         return REPETITION_ABORT
 
@@ -586,7 +600,8 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     return parsed, "ok", None
 
 
-def _call(messages, client, *, max_tokens, temperature, extra_params, timeout):
+def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
+          page_no=None, attempt=None):
     """One model call, streamed when the §5.2 guard is on.
 
     Streaming changes nothing about sampling — greedy is greedy — so the eval
@@ -603,7 +618,7 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout):
         choice = result["choices"][0]
         return choice["message"].get("content") or "", choice.get("finish_reason"), None
 
-    guard = RepetitionGuard()
+    guard = RepetitionGuard(page_no=page_no, attempt=attempt)
     result = client.chat_completion_stream(
         messages, max_tokens=max_tokens, temperature=temperature,
         extra_params=extra_params, timeout=timeout, on_delta=guard,
@@ -643,7 +658,7 @@ COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
 
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
-             min_content_chars: int = 0) -> dict:
+             min_content_chars: int = 0, page_no: int | None = None) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry."""
     params = get_generation_params(client.model, "structured_page")
 
@@ -654,6 +669,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         temperature=params["temperature"],
         extra_params=params["extra_params"],
         timeout=timeout,
+        page_no=page_no, attempt="attempt 1/2, first pass",
     )
     parsed, verdict, error = _gate(text, finish_reason, guard)
     _note_completion(verdict == "empty")
@@ -687,6 +703,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         temperature=params["temperature"],
         extra_params={**(params["extra_params"] or {}), **enforcement_params()},
         timeout=timeout,
+        page_no=page_no, attempt="attempt 2/2, enforced retry",
     )
     rparsed, rverdict, rerror = _gate(rtext, rfinish, rguard)
     _note_completion(rverdict == "empty")
@@ -739,7 +756,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 
 
 def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS,
-                  timeout=None) -> dict:
+                  timeout=None, page_no: int | None = None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
     ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
@@ -756,12 +773,13 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
     # legitimately coerces to a tiny result.
     return _extract(build_image_messages(image_path), client,
                     max_tokens=max_tokens, timeout=timeout,
-                    min_content_chars=COERCED_MIN_CHARS)
+                    min_content_chars=COERCED_MIN_CHARS, page_no=page_no)
 
 
 def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        max_model_len: int = MAX_MODEL_LEN,
-                       max_chars: int = TEXT_PAGE_MAX_CHARS, timeout=None) -> dict:
+                       max_chars: int = TEXT_PAGE_MAX_CHARS, timeout=None,
+                       page_no: int | None = None) -> dict:
     """Run structured extraction on one text page (§2 text modality).
 
     §5.4 — never truncate: a page over the size bound is filtered and reported,
@@ -777,7 +795,7 @@ def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        f"text-page bound; filtered rather than truncated",
                        0, len(text))
     return _extract(build_text_messages(text), client,
-                    max_tokens=max_tokens, timeout=timeout)
+                    max_tokens=max_tokens, timeout=timeout, page_no=page_no)
 
 
 # --------------------------------------------------------------------------- text pagination

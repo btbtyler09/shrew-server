@@ -161,3 +161,33 @@ def test_output_room_matches_the_spec_table():
 def test_defaults_are_the_e4_contract():
     assert (MAX_TOKENS, MAX_MODEL_LEN) == (20000, 32768)
     assert BUCKET_IMAGE_TOKENS["B3"] == 7152
+
+
+# ── page/attempt context on the abort warning ──────────────────────────────
+# Pages stream concurrently, so an unprefixed warning burst can't be tied to
+# page results; the prefix is the correlation key. Observability only — the
+# abort behavior itself is pinned by the tests above.
+
+
+def test_page_and_attempt_prefix_the_abort_warning(caplog):
+    import logging
+    guard = RepetitionGuard(page_no=37, attempt="attempt 1/2, first pass")
+    loop = '{"semantic_chunks": [' + '{"chunk_id": "c", "content": "x"},' * 4000
+    with caplog.at_level(logging.WARNING, logger="shrew.structured_page"):
+        stopped_at = _feed(guard, loop)
+    assert stopped_at is not None and guard.fired
+    msgs = [r.getMessage() for r in caplog.records
+            if "repetition_abort" in r.getMessage()]
+    assert msgs and msgs[0].startswith(
+        "Page 37 (attempt 1/2, first pass): repetition_abort")
+
+
+def test_warning_stays_unprefixed_without_page_context(caplog):
+    import logging
+    guard = RepetitionGuard()
+    loop = '{"semantic_chunks": [' + '{"chunk_id": "c", "content": "x"},' * 4000
+    with caplog.at_level(logging.WARNING, logger="shrew.structured_page"):
+        assert _feed(guard, loop) is not None
+    msgs = [r.getMessage() for r in caplog.records
+            if "repetition_abort" in r.getMessage()]
+    assert msgs and msgs[0].startswith("repetition_abort")
