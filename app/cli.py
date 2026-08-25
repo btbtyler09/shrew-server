@@ -185,3 +185,7 @@ def main():
         _run_convert(args)
     else:
         parser.print_help()
+
+
+if __name__ == "__main__":  # pragma: no cover — `python -m app.cli` support
+    main()
