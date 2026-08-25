@@ -20,6 +20,26 @@ def test_retry_composes_enforcement_with_stronger_penalty():
     assert e["presence_penalty"] == 0.6
 
 
+def test_retry_emits_both_backend_dialects():
+    # #15: llama.cpp ignores structured_outputs (vLLM fork field) and only
+    # honors json_schema; emit both so the retry actually enforces on either
+    # backend. Verified live: each backend uses its own key, ignores the other.
+    e = enforcement_params()
+    assert "structured_outputs" in e           # vLLM fork
+    assert "json_schema" in e                  # llama.cpp native
+    assert e["structured_outputs"] == {"json": e["json_schema"]}
+
+
+def test_enforce_dialect_pin(monkeypatch):
+    import app.structured_page as sp
+    monkeypatch.setenv("SHREW_ENFORCE_DIALECT", "llamacpp")
+    e = sp.enforcement_params()
+    assert "json_schema" in e and "structured_outputs" not in e
+    monkeypatch.setenv("SHREW_ENFORCE_DIALECT", "vllm")
+    e = sp.enforcement_params()
+    assert "structured_outputs" in e and "json_schema" not in e
+
+
 def test_retry_penalty_overrides_first_pass_value():
     p = get_generation_params("shrew-ocr-preview", "structured_page")
     merged = {**(p["extra_params"] or {}), **enforcement_params()}
@@ -29,7 +49,7 @@ def test_retry_penalty_overrides_first_pass_value():
 def test_env_zero_disables_penalties(monkeypatch):
     monkeypatch.setenv("SHREW_TRY1_PP", "0")
     monkeypatch.setenv("SHREW_RETRY_PP", "0")
-    import app.generation as g, app.structured_page as sp
+    import app.generation as g, shrew.structured_page as sp
     importlib.reload(g)
     importlib.reload(sp)
     try:

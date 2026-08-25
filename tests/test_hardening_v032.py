@@ -213,3 +213,40 @@ def test_stale_tmp_sweep(monkeypatch, tmp_path):
     assert removed == 2
     assert not old_dir.exists() and not old_up.exists()
     assert fresh.exists() and other.exists()
+
+
+# ── #16: pipeline is cancellable (non-stream disconnect / deadline) ──────────
+
+
+def test_pipeline_honors_precancelled_progress(tmp_path):
+    """The non-stream /v1/convert path threads a ProgressReporter into the
+    pipeline; a cancelled progress must abort BEFORE any VLM call rather than
+    running a big abandoned document to completion (audit issue #16). Uses an
+    unreachable VLM URL — if the pipeline tried to call it, we'd see a
+    connection error instead of the clean CancelledException."""
+    from app.progress import ProgressReporter
+    from app.pipeline import CancelledException
+    from app.structured_pipeline import run_structured_pipeline
+    from app.models import PipelineConfig
+
+    img = tmp_path / "p.png"
+    Image.new("RGB", (800, 1000), "white").save(str(img))
+    prog = ProgressReporter()
+    prog.cancel()
+    cfg = PipelineConfig(vlm_url="http://127.0.0.1:1", vlm_model="x")
+    with pytest.raises(CancelledException):
+        run_structured_pipeline(str(img), str(tmp_path), cfg, progress=prog)
+
+
+# ── #15: enforcement dialects reach the retry on both backends ──────────────
+# (schema-level dialect coverage lives in test_decode_ladder.py; this pins the
+# retry actually merges both keys into the outgoing extra_params.)
+
+
+def test_retry_extra_params_carry_both_dialects():
+    from app.structured_page import enforcement_params
+    from app.generation import get_generation_params
+    first = get_generation_params("shrew-ocr-preview", "structured_page")["extra_params"] or {}
+    retry = {**first, **enforcement_params()}
+    assert "structured_outputs" in retry and "json_schema" in retry
+    assert retry["presence_penalty"] == 0.6   # retry pp overrides first-pass 0.3

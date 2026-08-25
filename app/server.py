@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -261,7 +261,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.2",
+    version="0.3.3",
     lifespan=lifespan,
 )
 
@@ -481,6 +481,7 @@ def _resolve_model(model_field: Optional[str]) -> tuple[str, str, Optional[str]]
 
 @app.post("/v1/convert")
 async def convert(
+    request: Request,
     file: UploadFile = File(...),
     pipeline_mode: str = Form("structured"),
     model: Optional[str] = Form(None),
@@ -537,6 +538,39 @@ async def convert(
     # QUEUED (client gone, server shutdown) must still clean its upload and
     # output dir — with cleanup inside the async-with body, cancel-at-acquire
     # leaked both (audit issue #11).
+    # The pipeline is made cancellable via this ProgressReporter (audit issue
+    # #16). Two triggers can cancel it:
+    #  1. best-effort client-disconnect detection — RELIABLE ONLY behind a
+    #     proxy that resets the upstream socket; bare uvicorn does NOT deliver
+    #     http.disconnect to a non-streaming handler while it computes the
+    #     response. For GUARANTEED mid-request cancellation, use
+    #     /v1/convert/stream, whose streamed response lets uvicorn see the
+    #     disconnect.
+    #  2. an optional hard wall-clock deadline (SHREW_CONVERT_DEADLINE_S, 0 =
+    #     off) — the reliable bound on an abandoned or runaway single request.
+    #     Left off by default so legitimate large books are never truncated.
+    progress = ProgressReporter()
+    deadline_s = float(os.environ.get("SHREW_CONVERT_DEADLINE_S", "0") or 0)
+
+    async def _watch_cancel():
+        waited = 0.0
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("Client disconnected — cancelling /v1/convert")
+                    progress.cancel()
+                    return
+                if deadline_s and waited >= deadline_s:
+                    logger.warning(
+                        f"/v1/convert exceeded SHREW_CONVERT_DEADLINE_S={deadline_s:.0f}s "
+                        f"— cancelling")
+                    progress.cancel()
+                    return
+                await asyncio.sleep(1.0)
+                waited += 1.0
+        except asyncio.CancelledError:
+            return
+
     try:
         async with _pipeline_sem:
             loop = asyncio.get_running_loop()
@@ -562,14 +596,20 @@ async def convert(
                     return run_structured_pipeline(
                         tmp_path, output_dir, config,
                         raw=(pipeline_mode == "raw"),
+                        progress=progress,
                     )
                 return run_pipeline(
                     tmp_path, output_dir, config,
                     figure_converter=_get_figure_converter(),
                     vlm_pool=_vlm_pool,
+                    progress=progress,
                 )
 
-            result = await loop.run_in_executor(None, _run)
+            watcher = asyncio.ensure_future(_watch_cancel())
+            try:
+                result = await loop.run_in_executor(None, _run)
+            finally:
+                watcher.cancel()
             response = _build_response(result, skip_extraction)
             if format == "markdown":
                 # structured markdown only — same assembly the JSON carries in
@@ -578,6 +618,11 @@ async def convert(
                                          media_type="text/markdown; charset=utf-8")
             return JSONResponse(content=response)
 
+    except CancelledException:
+        # Client went away and the pipeline unwound at a page boundary. The
+        # response is moot (nobody is listening); log quietly, don't 500.
+        logger.info("Pipeline cancelled before completion (disconnect or deadline)")
+        return JSONResponse(status_code=499, content={"error": "conversion cancelled"})
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
         return JSONResponse(

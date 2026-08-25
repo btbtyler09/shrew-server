@@ -337,8 +337,28 @@ RETRY_PP = float(os.environ.get("SHREW_RETRY_PP", "0.6"))
 
 
 def enforcement_params() -> dict:
-    """extra_params for the one flagged retry (§3 retry tier)."""
-    out = {"structured_outputs": {"json": ENFORCEMENT_SCHEMA}}
+    """extra_params for the one flagged retry (§3 retry tier).
+
+    Emits BOTH schema-enforcement dialects so the retry actually constrains
+    on whichever backend is serving:
+    - ``structured_outputs: {"json": ...}`` — our vLLM fork's field (OpenAI
+      ``guided_json`` is silently ignored by the fork; see the ENFORCEMENT_SCHEMA
+      note).
+    - ``json_schema`` — llama.cpp's native field. Without this a GGUF deployment
+      retried with the penalty ALONE and no grammar (measured 2026-08-25).
+
+    Each backend honors its own key and tolerates the other's (both verified
+    live: vLLM returns conforming output and ignores the stray json_schema;
+    llama.cpp enforces json_schema and ignores structured_outputs). Env
+    ``SHREW_ENFORCE_DIALECT`` can pin to "vllm" or "llamacpp" if a future
+    backend rejects the unknown field.
+    """
+    dialect = os.environ.get("SHREW_ENFORCE_DIALECT", "both").lower()
+    out: dict = {}
+    if dialect in ("both", "vllm"):
+        out["structured_outputs"] = {"json": ENFORCEMENT_SCHEMA}
+    if dialect in ("both", "llamacpp"):
+        out["json_schema"] = ENFORCEMENT_SCHEMA
     if RETRY_PP:
         out["presence_penalty"] = RETRY_PP
     return out
