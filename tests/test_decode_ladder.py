@@ -49,7 +49,7 @@ def test_retry_penalty_overrides_first_pass_value():
 def test_env_zero_disables_penalties(monkeypatch):
     monkeypatch.setenv("SHREW_TRY1_PP", "0")
     monkeypatch.setenv("SHREW_RETRY_PP", "0")
-    import app.generation as g, shrew.structured_page as sp
+    import app.generation as g, app.structured_page as sp
     importlib.reload(g)
     importlib.reload(sp)
     try:
