@@ -245,12 +245,37 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning(f"Doc Processing model: {_config.shrew_vllm_url} — no adapters found")
 
+    # Background readiness refresher (audit issue #17): keeps a readiness stamp
+    # warm so the per-request gate consults the cache instead of running an
+    # inference that would queue behind real OCR under load and false-503.
+    # Runs the deep probe (optionally incl. a tiny inference) off the request
+    # path, so admission never pays for it.
+    from .vlm_client import READINESS_TTL_S
+
+    async def _readiness_refresher():
+        interval = max(5.0, READINESS_TTL_S / 2)
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                probe = VLMClient(base_url=_config.vlm_url, model=_config.vlm_model,
+                                  api_key=_config.api_key)
+                await loop.run_in_executor(None, probe.probe)
+                if _config.shrew_vllm_url:
+                    sp = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
+                    await loop.run_in_executor(None, sp.probe)
+            except Exception as e:
+                logger.warning(f"Readiness refresher error: {e}")
+            await asyncio.sleep(interval)
+
+    _readiness_task = asyncio.ensure_future(_readiness_refresher())
+
     startup_time = time.time() - start
     logger.info(f"Server ready in {startup_time:.1f}s")
     logger.info("=" * 60)
 
     yield
 
+    _readiness_task.cancel()
     if _vlm_pool:
         _vlm_pool.shutdown(wait=True)
     logger.info("Shrew server stopped")
@@ -261,7 +286,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.3",
+    version="0.3.4",
     lifespan=lifespan,
 )
 
@@ -316,11 +341,11 @@ def _fallback_health() -> dict:
 async def health():
     unavailable = []
     vlm = VLMClient(base_url=_config.vlm_url, model=_config.vlm_model, api_key=_config.api_key)
-    if not vlm.health_check():
+    if not vlm.is_ready():
         unavailable.append("vlm")
     if _config.shrew_vllm_url:
         shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
-        if not shrew_vlm.health_check():
+        if not shrew_vlm.is_ready():
             unavailable.append("shrew_vlm")
     if unavailable:
         return JSONResponse(
@@ -357,6 +382,7 @@ async def health():
             "consecutive": STREAM_GUARD_CONSECUTIVE,
         },
         "fallback": _fallback_health(),
+        "vlm_readiness": vlm.readiness_snapshot(),
     }
     if not capacity["ok"]:
         body["status"] = "degraded"
@@ -518,11 +544,11 @@ async def convert(
 
     # Pre-flight VLM health check
     vlm = VLMClient(base_url=vlm_url, model=vlm_model, api_key=api_key)
-    if not vlm.health_check():
+    if not vlm.is_ready():
         return JSONResponse(status_code=503, content={"error": "VLM server unavailable"})
     if _config.shrew_vllm_url:
         shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
-        if not shrew_vlm.health_check():
+        if not shrew_vlm.is_ready():
             return JSONResponse(status_code=503, content={"error": "Shrew VLM server unavailable"})
 
     tmp_path = _save_upload(file)
@@ -670,11 +696,11 @@ async def convert_stream(
 
     # Pre-flight VLM health check
     vlm = VLMClient(base_url=vlm_url, model=vlm_model, api_key=api_key)
-    if not vlm.health_check():
+    if not vlm.is_ready():
         raise HTTPException(status_code=503, detail="VLM server unavailable")
     if _config.shrew_vllm_url:
         shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
-        if not shrew_vlm.health_check():
+        if not shrew_vlm.is_ready():
             raise HTTPException(status_code=503, detail="Shrew VLM server unavailable")
 
     tmp_path = _save_upload(file)

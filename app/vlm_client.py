@@ -27,6 +27,25 @@ _vlm_gate = (
     multiprocessing.Semaphore(_VLM_CONCURRENCY) if _VLM_CONCURRENCY > 0 else None
 )
 
+# ── Cached readiness (fixes false-503-under-load, audit issue #17) ───────────
+# A per-request inference probe queues behind real OCR under load and times
+# out, wrongly declaring the model "unavailable" exactly when the server is
+# busiest. Instead, a background task keeps a readiness stamp fresh and the
+# per-request gate consults the CACHE. A merely slow/busy backend never
+# rejects work (fail-open); only a DEFINITE fault (model absent from
+# /v1/models, or an auth/config rejection) does.
+READINESS_TTL_S = float(os.environ.get("VLM_READINESS_TTL_S", "60"))
+# Whether the (background) deep probe includes a tiny inference. The
+# per-request path NEVER runs inference regardless of this.
+READINESS_PROBE_INFERENCE = os.environ.get(
+    "VLM_READINESS_PROBE_INFERENCE", "1").lower() in ("1", "true", "yes")
+# {key: {"ok": bool, "ts": float, "ever_ok": bool}}
+_readiness: dict[str, dict] = {}
+
+
+def _readiness_key(base_url: str, model: str) -> str:
+    return f"{base_url}::{model}"
+
 
 def _encode_image(image_path: Path | str, format: str = "png") -> str:
     """Encode an image file as a base64 data URI."""
@@ -353,39 +372,112 @@ class VLMClient:
 
         return content.strip()
 
-    def health_check(self, timeout: int = 10) -> bool:
-        """Check that the VLM server is reachable and the model can run inference."""
+    def probe(self, timeout: int = 10, do_inference: bool | None = None) -> tuple[str, str | None]:
+        """Actively probe the backend and update the readiness cache.
+
+        Returns (verdict, reason):
+          "ok"   — reachable, model listed, (optional) inference succeeded.
+          "hard" — a DEFINITE fault: model absent from /v1/models, or an
+                   auth/config rejection (401/403/404). Admission should
+                   reject on this.
+          "soft" — reachable check failed transiently (timeout, connection
+                   error, 5xx, inference slow). The backend may just be busy;
+                   admission FAILS OPEN on this.
+
+        Meant for the background refresher and monitoring — NOT the per-request
+        path (see is_ready). do_inference defaults to READINESS_PROBE_INFERENCE.
+        """
+        if do_inference is None:
+            do_inference = READINESS_PROBE_INFERENCE
+        key = _readiness_key(self.base_url, self.model)
         try:
-            # 1. Verify the configured model is listed
             resp = requests.get(
                 f"{self.base_url}/v1/models", timeout=timeout,
                 headers=self._headers(),
             )
+            if resp.status_code in (401, 403):
+                logger.warning(f"Readiness probe: auth rejected ({resp.status_code})")
+                self._mark_readiness(key, False)
+                return "hard", f"auth {resp.status_code}"
             resp.raise_for_status()
-            data = resp.json()
             model_ids = {
                 item.get("id")
-                for item in data.get("data", [])
+                for item in resp.json().get("data", [])
                 if isinstance(item, dict)
             }
             if self.model and self.model not in model_ids:
-                logger.warning(f"Health check: model '{self.model}' not in {model_ids}")
-                return False
+                logger.warning(f"Readiness probe: model '{self.model}' not in {model_ids}")
+                self._mark_readiness(key, False)
+                return "hard", "model not served"
 
-            # 2. Tiny inference to prove the model is actually working
-            resp = requests.post(
-                f"{self.base_url}/v1/chat/completions",
-                headers=self._headers(),
-                json={
-                    "model": self.model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 1,
-                    "temperature": 0,
-                },
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            return True
+            if do_inference:
+                r2 = requests.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    headers=self._headers(),
+                    json={"model": self.model,
+                          "messages": [{"role": "user", "content": "hi"}],
+                          "max_tokens": 1, "temperature": 0},
+                    timeout=timeout,
+                )
+                if r2.status_code in (401, 403, 404):
+                    self._mark_readiness(key, False)
+                    return "hard", f"inference {r2.status_code}"
+                r2.raise_for_status()
+
+            self._mark_readiness(key, True)
+            return "ok", None
         except Exception as e:
-            logger.warning(f"Health check failed: {e}")
+            # Timeout / connection reset / 5xx — busy or transiently down, not
+            # a definite fault. Leave a prior healthy stamp in place.
+            logger.warning(f"Readiness probe soft-failed: {e}")
+            return "soft", str(e)
+
+    @staticmethod
+    def _mark_readiness(key: str, ok: bool) -> None:
+        prev = _readiness.get(key, {})
+        _readiness[key] = {
+            "ok": ok,
+            "ts": time.time(),
+            "ever_ok": prev.get("ever_ok", False) or ok,
+        }
+
+    def is_ready(self) -> bool:
+        """Per-request admission gate. NEVER runs inference.
+
+        Fast path: a fresh healthy cache stamp (kept warm by the background
+        refresher) → admit. Cold/stale path: one lightweight /v1/models check
+        (no inference). A soft failure fails OPEN when the backend was ever
+        healthy — a busy backend must not reject queued work (issue #17).
+        """
+        key = _readiness_key(self.base_url, self.model)
+        entry = _readiness.get(key)
+        if entry and entry["ok"] and (time.time() - entry["ts"]) < READINESS_TTL_S:
+            return True
+        # Cache cold or stale — cheap reachability only, never inference.
+        verdict, _reason = self.probe(timeout=5, do_inference=False)
+        if verdict == "ok":
+            return True
+        if verdict == "hard":
             return False
+        # soft: busy/transient. Admit if we have ever seen this backend healthy;
+        # the pipeline's own per-page error handling covers a genuine outage.
+        ever_ok = (entry or {}).get("ever_ok", False)
+        if ever_ok:
+            logger.warning(
+                "Readiness probe slow/unreachable but backend was healthy "
+                "before — admitting (fail-open); pipeline handles per-page errors")
+        return ever_ok
+
+    # Back-compat: monitoring callers that want a boolean deep check.
+    def health_check(self, timeout: int = 10) -> bool:
+        return self.probe(timeout=timeout)[0] == "ok"
+
+    def readiness_snapshot(self) -> dict:
+        """Cached readiness for the /health endpoint (no live inference)."""
+        key = _readiness_key(self.base_url, self.model)
+        entry = _readiness.get(key)
+        if not entry:
+            return {"ready": None, "age_s": None, "ever_ok": False}
+        return {"ready": entry["ok"],
+                "age_s": round(time.time() - entry["ts"], 1),
+                "ever_ok": entry["ever_ok"]}

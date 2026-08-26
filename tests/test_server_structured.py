@@ -47,6 +47,15 @@ class FakeVLMClient:
     def health_check(self, timeout=10):
         return True
 
+    def is_ready(self):
+        return True
+
+    def readiness_snapshot(self):
+        return {"ready": True, "age_s": 0.0, "ever_ok": True}
+
+    def probe(self, timeout=10, do_inference=None):
+        return ("ok", None)
+
     def chat_completion(self, messages, max_tokens=8192, temperature=0.2,
                          timeout=None, extra_params=None):
         return {"choices": [{"finish_reason": "stop",
