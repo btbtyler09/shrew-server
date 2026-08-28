@@ -164,3 +164,85 @@ def test_new_lease_falls_back_to_null_on_unusable_dir(tmp_path, monkeypatch):
     assert isinstance(lease, cc.NullLease)
     lease.mark_running()  # all no-ops, no error
     lease.release()
+
+
+# ── cross-process VLM slot gate ─────────────────────────────────────────────
+
+
+def test_vlm_slot_acquire_release(lease_dir):
+    s = cc.acquire_vlm_slot(2)
+    assert s is not None
+    assert cc.vlm_in_flight() == 1
+    s2 = cc.acquire_vlm_slot(2)
+    assert cc.vlm_in_flight() == 2
+    # Limit reached: a non-blocking attempt reports no slot.
+    assert cc.acquire_vlm_slot(2, block=False) is None
+    s.release()
+    assert cc.vlm_in_flight() == 1
+    s3 = cc.acquire_vlm_slot(2, block=False)
+    assert s3 is not None
+    s2.release(); s3.release()
+    assert cc.vlm_in_flight() == 0
+
+
+def test_vlm_slot_release_is_idempotent(lease_dir):
+    s = cc.acquire_vlm_slot(1)
+    s.release()
+    s.release()
+    assert cc.vlm_in_flight() == 0
+
+
+_SLOT_HOLDER = textwrap.dedent("""
+    import sys, time
+    sys.path.insert(0, {src!r})
+    from app import concurrency as cc
+    s = cc.acquire_vlm_slot(1)
+    print("held", flush=True)
+    time.sleep({hold})
+""")
+
+
+def test_vlm_slot_is_cross_process(lease_dir):
+    """A slot held by ANOTHER process consumes the shared limit — the whole
+    point: N uvicorn workers cannot exceed VLM_CONCURRENCY combined."""
+    import subprocess as sp
+    src = os.path.abspath(os.path.join(os.path.dirname(cc.__file__), ".."))
+    proc = sp.Popen(
+        [sys.executable, "-c", _SLOT_HOLDER.format(src=src, hold=15)],
+        env={**os.environ, "SHREW_CONCURRENCY_DIR": str(lease_dir)},
+        stdout=sp.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "held"
+        assert cc.vlm_in_flight() == 1
+        assert cc.acquire_vlm_slot(1, block=False) is None, \
+            "limit-1 slot held by another process must block us"
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+    # Kernel dropped the dead process's flock: slot immediately reusable.
+    s = cc.acquire_vlm_slot(1, block=False)
+    assert s is not None
+    s.release()
+
+
+def test_vlm_slot_zero_limit_disables_gate(lease_dir):
+    assert cc.acquire_vlm_slot(0) is None
+    assert cc.acquire_vlm_slot(0, block=False) is None
+
+
+def test_vlm_slot_blocking_waits_for_free_slot(lease_dir):
+    import threading as th
+    s = cc.acquire_vlm_slot(1)
+    got = {}
+
+    def _waiter():
+        got["slot"] = cc.acquire_vlm_slot(1)
+
+    t = th.Thread(target=_waiter)
+    t.start()
+    t.join(timeout=0.3)
+    assert t.is_alive(), "acquire must still be waiting while the slot is held"
+    s.release()
+    t.join(timeout=10)
+    assert not t.is_alive() and got["slot"] is not None
+    got["slot"].release()

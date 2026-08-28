@@ -7,7 +7,6 @@ Handles multimodal messages with base64-encoded images.
 import base64
 import json
 import logging
-import multiprocessing
 import os
 import time
 from pathlib import Path
@@ -15,17 +14,22 @@ from typing import Callable, Optional
 
 import requests
 
+from . import concurrency as _cc
+
 logger = logging.getLogger("shrew.vlm")
 
-# VLM concurrency gate. NOTE: this is PER-PROCESS, not cross-process — the
-# original comment assumed uvicorn forks after import, but uvicorn SPAWNS
-# workers, and each fresh interpreter builds its own independent semaphore.
-# With SHREW_WORKERS=N the effective in-flight limit is N x VLM_CONCURRENCY;
-# the server logs a loud warning at startup (audit issue #14).
-_VLM_CONCURRENCY = int(os.environ.get("VLM_CONCURRENCY", "4"))
-_vlm_gate = (
-    multiprocessing.Semaphore(_VLM_CONCURRENCY) if _VLM_CONCURRENCY > 0 else None
-)
+# VLM concurrency gate — CROSS-PROCESS (v0.3.8). The model server has a
+# fixed number of serving slots, so VLM_CONCURRENCY bounds in-flight calls
+# across ALL uvicorn workers combined, not per worker. Enforced with flock
+# slot files (concurrency.acquire_vlm_slot): crash-safe (the kernel drops a
+# dead process's locks) and needs no shared parent process — the previous
+# multiprocessing.Semaphore was rebuilt per SPAWNED worker, silently making
+# the real limit N x VLM_CONCURRENCY (audit issue #14). Read per call so the
+# limit is testable and env changes need no reimport. 0 disables the gate.
+
+
+def _vlm_limit() -> int:
+    return int(os.environ.get("VLM_CONCURRENCY", "4"))
 
 # ── Cached readiness (fixes false-503-under-load, audit issue #17) ───────────
 # A per-request inference probe queues behind real OCR under load and times
@@ -156,11 +160,7 @@ class VLMClient:
         t = timeout or self.default_timeout
         start = time.time()
 
-        gate = _vlm_gate
-        if gate is not None:
-            if not gate.acquire(block=False):
-                logger.debug("VLM gate full, waiting for slot...")
-                gate.acquire()
+        slot = _cc.acquire_vlm_slot(_vlm_limit())
         try:
             resp = requests.post(
                 f"{self.base_url}/v1/chat/completions",
@@ -190,8 +190,8 @@ class VLMClient:
             logger.error(f"VLM request failed: {e}")
             raise
         finally:
-            if gate is not None:
-                gate.release()
+            if slot is not None:
+                slot.release()
 
     def chat_completion_stream(
         self,
@@ -240,11 +240,7 @@ class VLMClient:
         finish_reason = None
         aborted = None
 
-        gate = _vlm_gate
-        if gate is not None:
-            if not gate.acquire(block=False):
-                logger.debug("VLM gate full, waiting for slot...")
-                gate.acquire()
+        slot = _cc.acquire_vlm_slot(_vlm_limit())
         try:
             with requests.post(
                 f"{self.base_url}/v1/chat/completions",
@@ -300,8 +296,8 @@ class VLMClient:
             logger.error(f"VLM stream failed: {e}")
             raise
         finally:
-            if gate is not None:
-                gate.release()
+            if slot is not None:
+                slot.release()
 
         text = "".join(parts)
         logger.debug(f"VLM stream: {time.time() - start:.1f}s, "

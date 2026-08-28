@@ -154,10 +154,11 @@ async def lifespan(app: FastAPI):
     workers = int(os.environ.get("SHREW_WORKERS", "1") or 1)
     if workers > 1:
         logger.warning(
-            f"SHREW_WORKERS={workers}: concurrency gates are per-worker — "
-            f"effective VLM/pipeline concurrency is {workers}x the configured "
-            f"values and the rasterization memory throttle is per-worker. "
-            f"Size VLM_CONCURRENCY/PIPELINE_CONCURRENCY accordingly.")
+            f"SHREW_WORKERS={workers}: the pipeline gate and rasterization "
+            f"memory throttle are per-worker (effective pipeline concurrency "
+            f"= {workers}x PIPELINE_CONCURRENCY). The VLM gate is "
+            f"cross-process: VLM_CONCURRENCY bounds in-flight model calls "
+            f"across all workers combined.")
 
     from concurrent.futures import ThreadPoolExecutor
     _vlm_pool = ThreadPoolExecutor(max_workers=_config.vlm_concurrency)
@@ -295,7 +296,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.7",
+    version="0.3.8",
     lifespan=lifespan,
 )
 
@@ -347,10 +348,13 @@ def _fallback_health() -> dict:
 
 
 def _concurrency_health() -> dict:
-    """Non-secret capacity + live activity for /health. Configured limits are
-    PER WORKER (uvicorn workers are separate processes); effective limits
-    multiply by the worker count. Conversion counts aggregate across all
-    workers via the lease directory — no live inference involved."""
+    """Non-secret capacity + live activity for /health. The pipeline gate is
+    PER WORKER (uvicorn workers are separate processes), so its effective
+    limit multiplies by the worker count. The VLM gate is CROSS-PROCESS
+    (flock slot files, v0.3.8): VLM_CONCURRENCY bounds in-flight model calls
+    across all workers combined, and in_flight reports the live machine-wide
+    count. Conversion counts aggregate across all workers via the lease
+    directory — no live inference involved."""
     if _config is not None:
         workers = _config.workers
         pl, vl = _config.pipeline_concurrency, _config.vlm_concurrency
@@ -360,13 +364,15 @@ def _concurrency_health() -> dict:
         vl = int(os.environ.get("VLM_CONCURRENCY", "4"))
     try:
         conversions = _leases.snapshot()
+        in_flight = _leases.vlm_in_flight()
     except Exception as e:  # noqa: BLE001 — /health must never fail on this
         logger.warning(f"lease snapshot failed: {e}")
         conversions = {"running": 0, "queued": 0}
+        in_flight = 0
     return {
         "workers": workers,
         "pipeline": {"per_worker_limit": pl, "effective_limit": workers * pl},
-        "vlm": {"per_worker_limit": vl, "effective_limit": workers * vl},
+        "vlm": {"limit": vl, "cross_process": True, "in_flight": in_flight},
         "conversions": conversions,
     }
 

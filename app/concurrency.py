@@ -34,6 +34,7 @@ import logging
 import os
 import stat
 import tempfile
+import time
 import uuid
 
 logger = logging.getLogger("shrew.concurrency")
@@ -182,3 +183,114 @@ def snapshot(prune: bool = True) -> dict:
 def prune_stale() -> None:
     """Startup sweep: drop crashed workers' leases, keep live ones."""
     snapshot(prune=True)
+
+
+# ── cross-process VLM slot gate ─────────────────────────────────────────────
+# VLM_CONCURRENCY must bound in-flight VLM calls across ALL uvicorn workers —
+# the model server has a fixed number of serving slots, and N spawned workers
+# each holding their own N-sized semaphore multiply the real load by N (the
+# audit-#14 bug). The gate is a row of slot files: holding slot i = holding
+# an exclusive flock on slot-i.lock. Crash-safe like the leases (the kernel
+# drops a dead process's flocks), no shared parent process required, and the
+# same 0700/0600 + O_NOFOLLOW|O_CLOEXEC discipline.
+
+
+def _slots_dir() -> str:
+    d = os.path.join(ensure_dir(), "vlm-slots")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    return d
+
+
+class VlmSlot:
+    """A held VLM serving slot. release() in a finally, always."""
+
+    def __init__(self, fd: int):
+        self._fd = fd
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            os.close(self._fd)  # drops the flock; the slot file persists
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def _try_slot(d: str, i: int):
+    path = os.path.join(d, f"slot-{i:03d}.lock")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | _OPEN_FLAGS, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return VlmSlot(fd)
+
+
+def acquire_vlm_slot(limit: int, block: bool = True,
+                     poll_s: float = 0.025) -> VlmSlot | None:
+    """Take one of `limit` machine-wide VLM slots.
+
+    limit <= 0 disables the gate (returns None — caller proceeds ungated).
+    block=True waits until a slot frees (a VLM call parked here is exactly a
+    call that would otherwise be queueing inside the saturated model server);
+    block=False returns None when all slots are held.
+    """
+    if limit <= 0:
+        return None
+    d = _slots_dir()
+    waiting_logged = False
+    while True:
+        for i in range(limit):
+            slot = _try_slot(d, i)
+            if slot is not None:
+                return slot
+        if not block:
+            return None
+        if not waiting_logged:
+            logger.debug("VLM gate full (cross-process), waiting for a slot...")
+            waiting_logged = True
+        time.sleep(poll_s)
+
+
+def vlm_in_flight() -> int:
+    """How many VLM slots are currently held, machine-wide. Counts every
+    slot file ever created (a stale higher-limit file is only counted while
+    some process actually holds its lock)."""
+    try:
+        d = _slots_dir()
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    held = 0
+    for name in names:
+        if not (name.startswith("slot-") and name.endswith(".lock")):
+            continue
+        path = os.path.join(d, name)
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+                continue
+            fd = os.open(path, os.O_RDONLY | _OPEN_FLAGS)
+        except OSError:
+            continue
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                if e.errno in (errno.EAGAIN, errno.EACCES):
+                    held += 1
+        finally:
+            os.close(fd)
+    return held

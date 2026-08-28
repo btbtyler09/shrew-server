@@ -192,7 +192,7 @@ Configure in `docker/.env` or pass with `-e`:
 | `VLM_URL` | URL of your main VLM for page transcription | `http://localhost:8000` |
 | `VLM_MODEL` | Model name at VLM_URL (auto-detected if not set) | — |
 | `VLM_API_KEY` | API key for VLM endpoint (needed for OpenRouter) | — |
-| `VLM_CONCURRENCY` | Max concurrent VLM calls **per uvicorn worker** | `4` |
+| `VLM_CONCURRENCY` | Max in-flight VLM calls **across all uvicorn workers combined** (cross-process flock gate) | `4` |
 | `PIPELINE_CONCURRENCY` | Max concurrent document pipelines **per uvicorn worker** (one gate shared by `/v1/convert` and `/v1/convert/stream`) | `3` |
 | `SHREW_VLLM_URL` | URL of Doc Processing model (set automatically by compose) | — |
 | `SHREW_ASYNC_STAGE3` | Run extraction tasks in parallel (set automatically by compose) | — |
@@ -216,7 +216,7 @@ VLM_API_KEY=sk-or-...
 Parameters you can adjust in the Dockerfiles for your hardware:
 
 **Server container** (`Dockerfile.server`):
-- `VLM_CONCURRENCY` — Max concurrent VLM calls **per uvicorn worker**. Uvicorn workers are separate processes, so with `SHREW_WORKERS=N` the effective in-flight VLM ceiling is `N × VLM_CONCURRENCY` — size it for your VLM server's headroom with that multiplication in mind. Default `4`.
+- `VLM_CONCURRENCY` — Max in-flight VLM calls **across all uvicorn workers combined**. The model server has a fixed number of serving slots, so this is a machine-wide gate (crash-safe flock slot files under `SHREW_CONCURRENCY_DIR`) — `SHREW_WORKERS` does **not** multiply it. Size it to your VLM server's slot count. Default `4`. (Before v0.3.8 the gate was accidentally per-worker: real load was `SHREW_WORKERS ×` the configured value.)
 - `PIPELINE_CONCURRENCY` — How many documents process simultaneously **per uvicorn worker**; effective capacity is `SHREW_WORKERS × PIPELINE_CONCURRENCY`. One gate covers both `/v1/convert` and `/v1/convert/stream` (they never had separate capacity from v0.3.7 on). Default `3`. `/health`'s `concurrency` section reports both the per-worker and effective limits plus live running/queued conversion counts.
 - `VLM_TIMEOUT_MARGIN` — Multiplier for the adaptive timeout. Shrew tracks per-page VLM response times and flags pages that exceed `max_observed * margin` as outliers for retry. Default `1.5` (50% above max). Increase if your VLM has high latency variance under load.
 
@@ -384,7 +384,7 @@ activity aggregated across all uvicorn workers:
   "concurrency": {
     "workers": 2,
     "pipeline": {"per_worker_limit": 3, "effective_limit": 6},
-    "vlm": {"per_worker_limit": 4, "effective_limit": 8},
+    "vlm": {"limit": 4, "cross_process": true, "in_flight": 2},
     "conversions": {"running": 2, "queued": 1}
   }
 }
@@ -395,8 +395,9 @@ pipeline gate, and `running` until it completes, fails, is cancelled, or the
 client disconnects. Counts are tracked in a crash-safe lease directory
 (`SHREW_CONCURRENCY_DIR`, default `<tmpdir>/shrew-concurrency`, `0700`) —
 a worker that dies drops its flock, and its leases are pruned rather than
-counted, so no stale count survives a crash or restart. Reading `/health`
-never triggers model inference.
+counted, so no stale count survives a crash or restart. `vlm.in_flight` is
+the live machine-wide count of VLM calls holding a slot of the cross-process
+`VLM_CONCURRENCY` gate. Reading `/health` never triggers model inference.
 
 ## CLI
 

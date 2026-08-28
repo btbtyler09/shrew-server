@@ -125,7 +125,7 @@ def test_health_reports_capacity_and_effective_limits(api_client):
     conc = body["concurrency"]
     assert conc["workers"] == 2
     assert conc["pipeline"] == {"per_worker_limit": 1, "effective_limit": 2}
-    assert conc["vlm"] == {"per_worker_limit": 4, "effective_limit": 8}
+    assert conc["vlm"] == {"limit": 4, "cross_process": True, "in_flight": 0}
     assert conc["conversions"] == {"running": 0, "queued": 0}
 
 
@@ -260,3 +260,40 @@ def test_health_never_calls_inference(api_client, monkeypatch):
     for _ in range(3):
         api_client.get("/health")
     assert calls == []
+
+
+def test_vlm_gate_serializes_across_clients(monkeypatch, tmp_path):
+    """VLM_CONCURRENCY=1: two concurrent chat_completion calls must serialize
+    on the machine-wide slot gate — never overlap."""
+    import app.vlm_client as vc
+    monkeypatch.setenv("SHREW_CONCURRENCY_DIR", str(tmp_path / "leases"))
+    monkeypatch.setenv("VLM_CONCURRENCY", "1")
+
+    active = []
+    overlap = []
+
+    def _fake_post(url, headers=None, json=None, timeout=None):
+        active.append(1)
+        if len(active) > 1:
+            overlap.append(len(active))
+        time.sleep(0.15)
+        active.pop()
+
+        class R:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"choices": [{"finish_reason": "stop",
+                                      "message": {"content": "{}"}}],
+                        "usage": {}}
+        return R()
+
+    monkeypatch.setattr(vc.requests, "post", _fake_post)
+    client = vc.VLMClient("http://unused", "m")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [pool.submit(client.chat_completion, [{"role": "user", "content": "x"}])
+                for _ in range(3)]
+        for f in futs:
+            f.result(timeout=30)
+    assert overlap == [], f"calls overlapped despite VLM_CONCURRENCY=1: {overlap}"
