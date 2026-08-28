@@ -920,6 +920,11 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
             "crop_path": m["path"],
         } for m in spreadsheet_media)
 
+    # Fidelity cross-check BEFORE rendering: evidence-backed identifier
+    # corrections must land in the doc record so markdown/structured.json
+    # ship the corrected spellings.
+    fidelity_report = _fidelity_check(doc, file_path, output_dir, input_class)
+
     if raw:
         # Flat text rendering: no structured.json, so the server omits the
         # stage-3 keys rather than returning empty ones.
@@ -946,4 +951,43 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         },
     }
 
+    if fidelity_report is not None:
+        processing_log["fidelity"] = fidelity_report
+
     return PipelineResult(clean_markdown, structured_json, processing_log)
+
+
+def _fidelity_check(doc, file_path, output_dir, input_class) -> dict | None:
+    """Cross-check model output against the source's deterministic text layer,
+    and apply evidence-backed identifier corrections to the doc in place.
+
+    Available for born-digital PDFs and office docs (the LibreOffice PDF that
+    prepare_pages produced carries a text layer; it sits in output_dir).
+    Scanned PDFs and image uploads have no deterministic source → None, and
+    the response carries no fidelity key: "unavailable", never "all clear".
+    Best-effort — a failure here must never fail a conversion. Corrections
+    (unique-match identifiers only — see fidelity.apply_corrections) are
+    recorded per flag; SHREW_FIDELITY_CORRECT=0 keeps flags but rewrites
+    nothing; SHREW_FIDELITY=0 disables the whole layer.
+    """
+    if os.environ.get("SHREW_FIDELITY", "1") == "0":
+        return None
+    if input_class == "pdf":
+        src_pdf = file_path
+    elif input_class == "office":
+        stem = os.path.splitext(os.path.basename(file_path))[0]
+        src_pdf = os.path.join(output_dir, f"{stem}.pdf")
+    else:
+        return None
+    try:
+        if not os.path.exists(src_pdf):
+            return None
+        from .fidelity import apply_corrections, check_document
+        source_text = rasterizer.extract_pdf_text(src_pdf)
+        report = check_document(doc, source_text)
+        if report is not None:
+            report["corrected"] = apply_corrections(doc, report)
+        return report
+    except Exception as e:  # noqa: BLE001 — advisory layer, never fatal
+        logger.warning(f"fidelity check skipped: {e}")
+        return None

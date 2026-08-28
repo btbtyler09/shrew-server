@@ -295,6 +295,14 @@ Convert a document to markdown + structured JSON.
       "degenerate": 0, "repetition_aborted": 0, "wall_clock_aborts": 0,
       "coerced_empty": 0, "fallback_pages": 0,
       "buckets": {"B1": 8, "B2": 4}
+    },
+    "fidelity": {
+      "flagged": [
+        {"token": "DCRrectifierControl_PH", "closest": "DCRectifierControl_PH",
+         "distance": 1, "where": "doc_summary", "count": 1,
+         "class": "ident", "ambiguous": false, "corrected": true}
+      ],
+      "vocab_size": 412, "checked": 38, "corrected": 1
     }
   }
 }
@@ -315,6 +323,30 @@ Notes on the shape:
   (first-pass successes, schema coercions, repetition/degeneration aborts,
   bucket routing counts). A page that fails every tier is counted in
   `failed_pages` and omitted from content — never silently filled.
+- `processing_log.fidelity` (born-digital PDFs and office docs only) is a
+  cross-check of the model output against the source's deterministic text
+  layer. `flagged` lists precision tokens — identifiers, acronyms, standard
+  references, part codes, section/version numbers — that appear in the output
+  but are not backed by the source, each with the closest source spelling when
+  one is near (`closest`/`distance`) and the output field it appeared in
+  (`where`). VLMs can corrupt such strings when *composing* summaries or
+  paraphrases (transcription is far more reliable), so downstream consumers
+  should treat flagged tokens as unverified rather than quoting them as
+  document fact. Flagged tokens with a **unique** source match are
+  deterministically corrected in the shipped output (markdown, chunks,
+  tables, captions) and marked `"corrected": true` — the source is ground
+  truth for its own precision strings. Corrected classes: identifiers
+  (`DCRrectifierControl_PH`→`DCRectifierControl_PH`, truncations, case-only
+  mangling like `DCRECTIFIERCONTROL_PH`) and structured codes — versions,
+  hex addresses, part codes, standard refs (`v2.4.3`→`v2.14.3`,
+  `IEC-61850-7-5`→`-7-4`). Never rewritten: **bare numeric values** (`22.4`
+  near `22.5` might be legitimately different — changing a number is the one
+  unforgivable failure), **pure acronyms** (source says `HTTP`, model says
+  `HTTPS` — possibly correct added knowledge), and any token with an
+  ambiguous (tied) match. Absent for scanned PDFs and image uploads (no
+  deterministic source — unavailable, not "all clear").
+  `SHREW_FIDELITY_CORRECT=0` keeps flags but disables correction;
+  `SHREW_FIDELITY=0` disables the whole layer.
 
 The **legacy multi-stage pipeline** (`pipeline_mode=vlm` or `conventional`)
 returns the pre-v2 shape without `tables`, bboxes, or `gates`.

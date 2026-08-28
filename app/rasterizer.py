@@ -484,6 +484,39 @@ def _dims_worker(pdf_path: str) -> tuple[int, dict[int, tuple[float, float]]]:
         doc.close()
 
 
+def _pdftext_worker(pdf_path: str) -> str:
+    """Text-layer extraction (no rendering). Same lifetime rules as
+    _raster_worker: textpage closes before its page, pages before the doc.
+    Born-digital PDFs (LibreOffice exports included) carry a text layer;
+    scanned PDFs return empty text — the caller treats that as
+    "no deterministic source available"."""
+    doc = pypdfium2.PdfDocument(pdf_path)
+    try:
+        parts = []
+        for i in range(len(doc)):
+            page = doc[i]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    parts.append(textpage.get_text_bounded())
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+        return "\n".join(parts)
+    finally:
+        doc.close()
+
+
+def extract_pdf_text(pdf_path: str) -> str:
+    """Extract the PDF's embedded text layer (crash-isolated).
+
+    Returns "" for scanned PDFs (no text layer). Used by the fidelity
+    cross-check, never as a content source — the model output stays canonical.
+    """
+    return _run_isolated("_pdftext_worker", pdf_path)
+
+
 def rasterize_pages(
     pdf_path: str,
     output_dir: str,
