@@ -245,7 +245,7 @@ Convert a document to markdown + structured JSON.
 |-------|------|---------|-------------|
 | `file` | file | required | PDF, image, or office document |
 | `model` | string | server default | VLM model name override |
-| `pages` | string | all | Page range, e.g. `1-5` or `3` |
+| `pages` | string | all | Page range, e.g. `1-5` or `3`. Bounds work for every input type: PDF/image pages, and paginated text/CSV/spreadsheet blocks. Page numbers keep their original (1-indexed, whole-document) values; `source_pages`/`processing_log.total_pages` always report the full document, not the size of the requested slice. A range past the end is clamped; one starting past the end processes nothing. |
 | `format` | str | `json` | `json` (full response) or `markdown` (text/markdown body of the structured markdown only) |
 | `skip_extraction` | bool | `false` | Skip structured extraction (metadata/summary/chunking). `skip_stage3` is a deprecated alias. |
 | `high_dpi` | int | `200` | DPI for page images sent to VLM |

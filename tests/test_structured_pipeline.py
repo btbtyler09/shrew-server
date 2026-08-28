@@ -308,6 +308,115 @@ def test_large_text_input_is_paginated_into_page_sized_requests(tmp_path):
     assert result.processing_log["total_pages"] == len(client.calls)
 
 
+def _numbered_blocks_doc(tmp_path, n=10):
+    """A text file that paginates to exactly n one-paragraph blocks, each tagged
+    with its 1-indexed marker. Each paragraph is well over half the page cap, so
+    no two ever pack into one block — block K carries MARK{K}."""
+    from app.structured_page import TEXT_PAGE_MAX_CHARS
+    para = lambda k: f"MARK{k:02d} " + ("word " * 1600)  # ~8000 chars each
+    assert len(para(1)) > TEXT_PAGE_MAX_CHARS / 2
+    doc_path = tmp_path / "workbook.md"
+    doc_path.write_text("\n\n".join(para(k) for k in range(1, n + 1)))
+    return doc_path
+
+
+def test_text_modality_honors_page_range_before_scheduling(tmp_path):
+    """pages=1-3 on a many-block workbook must schedule model work for blocks
+    1-3 only, never the whole document (prod: an .xlsm expanded to ~3,500 text
+    pages and every block was submitted, exhausting OCR capacity)."""
+    doc_path = _numbered_blocks_doc(tmp_path, n=10)
+    # Exactly 3 canned replies: scheduling a 4th block pops from an empty list
+    # and the test fails loudly.
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")] * 3)
+    config = _make_config(page_range=(1, 3))
+
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), config, client=client,
+    )
+
+    assert len(client.calls) == 3, "only the 3 requested blocks are scheduled"
+    seen = " ".join(c["messages"][1]["content"] for c in client.calls)
+    assert "MARK01" in seen and "MARK02" in seen and "MARK03" in seen
+    for k in range(4, 11):
+        assert f"MARK{k:02d}" not in seen, f"block {k} beyond the range was scheduled"
+    # total_pages reports the WHOLE document (like image modality), not the size
+    # of the requested slice.
+    assert result.processing_log["total_pages"] == 10
+
+
+def test_text_modality_page_range_preserves_original_page_numbers(tmp_path):
+    """A mid-document range keeps the original 1-indexed page numbers: pages=2-3
+    processes blocks 2 and 3, not a renumbered 1 and 2."""
+    doc_path = _numbered_blocks_doc(tmp_path, n=6)
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")] * 2)
+    config = _make_config(page_range=(2, 3))
+
+    run_structured_pipeline(str(doc_path), str(tmp_path / "out"), config, client=client)
+
+    seen = " ".join(c["messages"][1]["content"] for c in client.calls)
+    assert "MARK02" in seen and "MARK03" in seen
+    assert "MARK01" not in seen and "MARK04" not in seen
+
+
+def test_text_modality_page_range_clamps_past_the_end(tmp_path):
+    """A range that runs past the last block clamps to the document, and one
+    that starts past the end schedules nothing (no error)."""
+    doc_path = _numbered_blocks_doc(tmp_path, n=4)
+
+    # 3-6 on a 4-block doc -> blocks 3 and 4 only.
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")] * 2)
+    run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out"), _make_config(page_range=(3, 6)),
+        client=client,
+    )
+    assert len(client.calls) == 2
+
+    # Entirely past the end -> nothing scheduled, total_pages still the whole doc.
+    empty = FakeClient([])  # must never be called
+    result = run_structured_pipeline(
+        str(doc_path), str(tmp_path / "out2"), _make_config(page_range=(9, 12)),
+        client=empty,
+    )
+    assert empty.calls == []
+    assert result.processing_log["total_pages"] == 4
+
+
+def test_spreadsheet_page_range_bounds_model_work(tmp_path):
+    """The reported prod input was an .xlsm; build a workbook whose extraction
+    paginates into several blocks and prove pages=1-2 schedules exactly two
+    model calls through the spreadsheet text-modality path."""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for r in range(1, 1001):
+        ws.append([f"r{r}c{c}val" for c in range(1, 9)])
+    xlsx = tmp_path / "big.xlsx"
+    wb.save(str(xlsx))
+
+    client = FakeClient([(GOOD_PAGE_JSON, "stop")] * 2)
+    result = run_structured_pipeline(
+        str(xlsx), str(tmp_path / "out"), _make_config(page_range=(1, 2)),
+        client=client,
+    )
+
+    assert result.processing_log["modality"] == "text"
+    assert len(client.calls) == 2, "only the 2 requested blocks are scheduled"
+    assert result.processing_log["total_pages"] > 2, "the whole workbook is counted"
+
+
+def test_text_modality_cancel_schedules_no_model_work(tmp_path):
+    """A request cancelled before extraction must abort with no model calls
+    left running — cleanup leaves no background OCR work."""
+    doc_path = _numbered_blocks_doc(tmp_path, n=5)
+    client = FakeClient([])  # must never be called
+    with pytest.raises(CancelledException):
+        run_structured_pipeline(
+            str(doc_path), str(tmp_path / "out"), _make_config(),
+            progress=_CancelledProgress(), client=client,
+        )
+    assert client.calls == []
+
+
 def test_pdf_class_still_uses_the_image_modality(tmp_path):
     doc_path = tmp_path / "doc.png"
     Image.new("RGB", (1700, 2200), "white").save(doc_path)

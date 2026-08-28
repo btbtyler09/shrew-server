@@ -745,36 +745,66 @@ def _extract_and_caption_media(file_path, output_dir, client) -> list[dict]:
     return out
 
 
+def _select_text_blocks(blocks, page_range):
+    """Pick the (page_no, block) pairs inside a 1-indexed inclusive page_range.
+
+    Mirrors the image modality (rasterizer._raster_worker): page numbers stay
+    the original block indices, bounds are clamped to [1, len(blocks)], and a
+    range starting past the last block — or reversed — selects nothing. None
+    means the whole document.
+    """
+    numbered = list(enumerate(blocks, start=1))
+    if not page_range:
+        return numbered
+    start, end = page_range
+    start = max(1, start)
+    end = min(end, len(blocks))
+    return [pair for pair in numbered if start <= pair[0] <= end]
+
+
 def _extract_text_pages(file_path, output_dir, config, input_class, client, progress):
-    """Text modality: deterministic extractor -> paginate -> per-page model call."""
+    """Text modality: deterministic extractor -> paginate -> per-page model call.
+
+    Honors config.page_range (1-indexed inclusive) exactly like the image
+    modality: only blocks inside the range are scheduled for model work, page
+    numbers keep their original block indices, and the returned total_pages is
+    always the whole document's block count (matching prepare_pages(), which
+    reports len(doc) regardless of the requested slice). Without this a
+    spreadsheet that expands to thousands of blocks submitted every one — a
+    pages=1-3 request would still run the full workbook.
+    """
     if progress is not None:
         progress.emit(5, f"Reading {input_class} input...")
 
     text = extract_text(file_path, input_class, output_dir)
     blocks = paginate_text(text)
+    total_pages = len(blocks)
+
+    # Bound model work to the requested range BEFORE anything is submitted.
+    selected = _select_text_blocks(blocks, config.page_range)
 
     if progress is not None:
-        progress.emit(10, f"Extracting pages (0/{len(blocks)})...")
+        progress.emit(10, f"Extracting pages (0/{len(selected)})...")
 
     results: dict[int, dict] = {}
     with ThreadPoolExecutor(max_workers=max(1, config.vlm_concurrency)) as pool:
         futures = {
             pool.submit(_process_one_text_page, i, block, client): i
-            for i, block in enumerate(blocks, start=1)
+            for i, block in selected
         }
         done = 0
         for fut in as_completed(futures):
             results[futures[fut]] = fut.result()
             done += 1
             if progress is not None:
-                progress.emit(10 + int(75 * done / max(1, len(blocks))),
-                              f"Extracting pages ({done}/{len(blocks)})...")
+                progress.emit(10 + int(75 * done / max(1, len(selected))),
+                              f"Extracting pages ({done}/{len(selected)})...")
                 if progress.is_cancelled():
                     for pending in futures:
                         pending.cancel()
                     raise CancelledException()
 
-    return [results[i] for i in sorted(results)], len(blocks), text
+    return [results[i] for i in sorted(results)], total_pages, text
 
 
 def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
