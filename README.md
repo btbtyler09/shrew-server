@@ -192,8 +192,8 @@ Configure in `docker/.env` or pass with `-e`:
 | `VLM_URL` | URL of your main VLM for page transcription | `http://localhost:8000` |
 | `VLM_MODEL` | Model name at VLM_URL (auto-detected if not set) | — |
 | `VLM_API_KEY` | API key for VLM endpoint (needed for OpenRouter) | — |
-| `VLM_CONCURRENCY` | Max concurrent VLM calls across all workers (cross-process gate) | `4` |
-| `PIPELINE_CONCURRENCY` | Max concurrent document pipelines | `3` |
+| `VLM_CONCURRENCY` | Max concurrent VLM calls **per uvicorn worker** | `4` |
+| `PIPELINE_CONCURRENCY` | Max concurrent document pipelines **per uvicorn worker** (one gate shared by `/v1/convert` and `/v1/convert/stream`) | `3` |
 | `SHREW_VLLM_URL` | URL of Doc Processing model (set automatically by compose) | — |
 | `SHREW_ASYNC_STAGE3` | Run extraction tasks in parallel (set automatically by compose) | — |
 | `VLM_TIMEOUT_MARGIN` | Multiplier for adaptive timeout threshold (e.g. `1.5` = 50% above observed max) | `1.5` |
@@ -216,8 +216,8 @@ VLM_API_KEY=sk-or-...
 Parameters you can adjust in the Dockerfiles for your hardware:
 
 **Server container** (`Dockerfile.server`):
-- `VLM_CONCURRENCY` — Max concurrent VLM calls across all workers. This is a cross-process semaphore: even with multiple uvicorn workers (`SHREW_WORKERS`), the total in-flight VLM requests never exceeds this number. Higher = faster but more VRAM pressure on your VLM server. Default `4`, increase to `8-20` if your VLM has headroom.
-- `PIPELINE_CONCURRENCY` — How many documents process simultaneously per worker. All pipelines share the global `VLM_CONCURRENCY` gate, so this controls how many documents compete for VLM slots. Default `3`.
+- `VLM_CONCURRENCY` — Max concurrent VLM calls **per uvicorn worker**. Uvicorn workers are separate processes, so with `SHREW_WORKERS=N` the effective in-flight VLM ceiling is `N × VLM_CONCURRENCY` — size it for your VLM server's headroom with that multiplication in mind. Default `4`.
+- `PIPELINE_CONCURRENCY` — How many documents process simultaneously **per uvicorn worker**; effective capacity is `SHREW_WORKERS × PIPELINE_CONCURRENCY`. One gate covers both `/v1/convert` and `/v1/convert/stream` (they never had separate capacity from v0.3.7 on). Default `3`. `/health`'s `concurrency` section reports both the per-worker and effective limits plus live running/queued conversion counts.
 - `VLM_TIMEOUT_MARGIN` — Multiplier for the adaptive timeout. Shrew tracks per-page VLM response times and flags pages that exceed `max_observed * margin` as outliers for retry. Default `1.5` (50% above max). Increase if your VLM has high latency variance under load.
 
 **Doc Processing model container** (`Dockerfile.cuda` / `Dockerfile.rocm` / `Dockerfile.vulkan`):
@@ -374,6 +374,29 @@ Returns `{"status": "ok"}` when all VLM backends are reachable. Returns `503` wi
 ```
 
 Both `/v1/convert` and `/v1/convert/stream` also run a pre-flight VLM health check and return `503` if the VLM is unreachable.
+
+Every `/health` response — healthy, degraded, or unhealthy — carries a
+`concurrency` section reporting configured capacity and live conversion
+activity aggregated across all uvicorn workers:
+
+```json
+{
+  "concurrency": {
+    "workers": 2,
+    "pipeline": {"per_worker_limit": 3, "effective_limit": 6},
+    "vlm": {"per_worker_limit": 4, "effective_limit": 8},
+    "conversions": {"running": 2, "queued": 1}
+  }
+}
+```
+
+A conversion counts as `queued` from admission until it acquires its worker's
+pipeline gate, and `running` until it completes, fails, is cancelled, or the
+client disconnects. Counts are tracked in a crash-safe lease directory
+(`SHREW_CONCURRENCY_DIR`, default `<tmpdir>/shrew-concurrency`, `0700`) —
+a worker that dies drops its flock, and its leases are pruned rather than
+counted, so no stale count survives a crash or restart. Reading `/health`
+never triggers model inference.
 
 ## CLI
 

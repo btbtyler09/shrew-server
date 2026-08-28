@@ -88,7 +88,6 @@ def api_client(monkeypatch):
     monkeypatch.setattr(server_module, "_shrew_lora_map", None)
     monkeypatch.setattr(server_module, "_shrew_lora_format", "none")
     monkeypatch.setattr(server_module, "_vlm_pool", ThreadPoolExecutor(max_workers=2))
-    monkeypatch.setattr(server_module, "_pipeline_sem", asyncio.Semaphore(3))
     monkeypatch.setattr(server_module, "_pipeline_gate", threading.Semaphore(3))
 
     return TestClient(app)

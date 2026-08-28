@@ -25,6 +25,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from sse_starlette.sse import EventSourceResponse
 
+from . import concurrency as _leases
 from .cli import parse_page_range
 from .models import PipelineConfig, PipelineResult
 from .pipeline import CancelledException, run_pipeline
@@ -117,7 +118,9 @@ _figure_converter = None
 _shrew_lora_map: Optional[dict] = None
 _shrew_lora_format: str = "none"
 _vlm_pool = None
-_pipeline_sem: Optional[asyncio.Semaphore] = None
+# ONE per-worker pipeline gate shared by /v1/convert AND /v1/convert/stream.
+# (Until v0.3.7 the two routes had separate semaphores of the same size, so
+# the real per-worker cap was 2x PIPELINE_CONCURRENCY.)
 _pipeline_gate: Optional[threading.Semaphore] = None
 # Context length the VLM is actually serving, read from /v1/models at startup.
 # None means the probe failed; the configured constant is used as a fallback.
@@ -130,7 +133,7 @@ _served_max_model_len: Optional[int] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load models at startup, clean up on shutdown."""
-    global _config, _figure_converter, _vlm_pool, _pipeline_sem, _pipeline_gate
+    global _config, _figure_converter, _vlm_pool, _pipeline_gate
 
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     shrew_logger = logging.getLogger("shrew")
@@ -158,8 +161,14 @@ async def lifespan(app: FastAPI):
 
     from concurrent.futures import ThreadPoolExecutor
     _vlm_pool = ThreadPoolExecutor(max_workers=_config.vlm_concurrency)
-    _pipeline_sem = asyncio.Semaphore(_config.pipeline_concurrency)
     _pipeline_gate = threading.Semaphore(_config.pipeline_concurrency)
+
+    # Conversion-activity leases (/health "concurrency"): sweep footprints of
+    # crashed workers; live workers' leases hold their flocks and survive.
+    try:
+        _leases.prune_stale()
+    except Exception as e:  # noqa: BLE001 — advisory, never blocks startup
+        logger.warning(f"lease-dir startup prune failed: {e}")
 
     # Auto-detect the VLM model name and the served context length. The context
     # length is not cosmetic: `max_model_len` bounds prompt + output together, so
@@ -286,7 +295,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.6",
+    version="0.3.7",
     lifespan=lifespan,
 )
 
@@ -337,8 +346,34 @@ def _fallback_health() -> dict:
             "max_long_edge": fb.FALLBACK_MAX_LONG_EDGE}
 
 
+def _concurrency_health() -> dict:
+    """Non-secret capacity + live activity for /health. Configured limits are
+    PER WORKER (uvicorn workers are separate processes); effective limits
+    multiply by the worker count. Conversion counts aggregate across all
+    workers via the lease directory — no live inference involved."""
+    if _config is not None:
+        workers = _config.workers
+        pl, vl = _config.pipeline_concurrency, _config.vlm_concurrency
+    else:
+        workers = int(os.environ.get("SHREW_WORKERS", "1") or 1)
+        pl = int(os.environ.get("PIPELINE_CONCURRENCY", "3"))
+        vl = int(os.environ.get("VLM_CONCURRENCY", "4"))
+    try:
+        conversions = _leases.snapshot()
+    except Exception as e:  # noqa: BLE001 — /health must never fail on this
+        logger.warning(f"lease snapshot failed: {e}")
+        conversions = {"running": 0, "queued": 0}
+    return {
+        "workers": workers,
+        "pipeline": {"per_worker_limit": pl, "effective_limit": workers * pl},
+        "vlm": {"per_worker_limit": vl, "effective_limit": workers * vl},
+        "conversions": conversions,
+    }
+
+
 @app.get("/health")
 async def health():
+    concurrency = _concurrency_health()
     unavailable = []
     vlm = VLMClient(base_url=_config.vlm_url, model=_config.vlm_model, api_key=_config.api_key)
     if not vlm.is_ready():
@@ -350,7 +385,8 @@ async def health():
     if unavailable:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "unavailable": unavailable},
+            content={"status": "unhealthy", "unavailable": unavailable,
+                     "concurrency": concurrency},
         )
 
     # §5.3 empty-200 watch: consecutive blank completions returned with HTTP
@@ -361,7 +397,8 @@ async def health():
         return JSONResponse(
             status_code=503,
             content={"status": "degraded", "empty_200_streak": streak,
-                     "detail": "consecutive empty completions — restart the model server"},
+                     "detail": "consecutive empty completions — restart the model server",
+                     "concurrency": concurrency},
         )
 
     # Serving-contract config. `capacity.ok` false means the served
@@ -383,6 +420,7 @@ async def health():
         },
         "fallback": _fallback_health(),
         "vlm_readiness": vlm.readiness_snapshot(),
+        "concurrency": concurrency,
     }
     if not capacity["ok"]:
         body["status"] = "degraded"
@@ -597,52 +635,74 @@ async def convert(
         except asyncio.CancelledError:
             return
 
-    try:
-        async with _pipeline_sem:
-            loop = asyncio.get_running_loop()
-            config = PipelineConfig(
-                vlm_url=vlm_url,
-                vlm_model=vlm_model,
-                api_key=api_key,
-                high_dpi=high_dpi,
-                vlm_concurrency=_config.vlm_concurrency,
-                skip_stage3=skip_extraction,
-                skip_chunking=skip_chunking,
-                page_range=page_range,
-                accurate=not _config.shrew_vllm_url,
-                shrew_vllm_url=_config.shrew_vllm_url,
-                shrew_lora_map=_shrew_lora_map,
-                shrew_lora_format=_shrew_lora_format,
-                shrew_async_stage3=os.environ.get("SHREW_ASYNC_STAGE3", "").lower() in ("1", "true", "yes"),
-                section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
-            )
+    async def _acquire_pipeline_gate() -> bool:
+        """Wait for this worker's pipeline gate WITHOUT blocking the event
+        loop (the wait runs in an executor thread, polling so a cancelled
+        request stops queueing). Returns False if cancelled while queued."""
+        loop = asyncio.get_running_loop()
 
-            def _run():
-                if pipeline_mode in _STRUCTURED_MODES and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
-                    return run_structured_pipeline(
-                        tmp_path, output_dir, config,
-                        raw=(pipeline_mode == "raw"),
-                        progress=progress,
-                    )
-                return run_pipeline(
+        def _poll():
+            while True:
+                if _pipeline_gate.acquire(timeout=0.25):
+                    return True
+                if progress.is_cancelled():
+                    return False
+
+        return await loop.run_in_executor(None, _poll)
+
+    # Activity lease: queued now (admitted, waiting for the gate); running
+    # after the gate is acquired; released in the finally regardless of
+    # completion, failure, cancellation, or disconnect.
+    lease = _leases.new_lease()
+    # The watcher covers the QUEUED phase too: a disconnect or deadline while
+    # waiting for capacity must release the slot, not hold it.
+    watcher = asyncio.ensure_future(_watch_cancel())
+    acquired = False
+    try:
+        acquired = await _acquire_pipeline_gate()
+        if not acquired:
+            raise CancelledException()
+        lease.mark_running()
+        loop = asyncio.get_running_loop()
+        config = PipelineConfig(
+            vlm_url=vlm_url,
+            vlm_model=vlm_model,
+            api_key=api_key,
+            high_dpi=high_dpi,
+            vlm_concurrency=_config.vlm_concurrency,
+            skip_stage3=skip_extraction,
+            skip_chunking=skip_chunking,
+            page_range=page_range,
+            accurate=not _config.shrew_vllm_url,
+            shrew_vllm_url=_config.shrew_vllm_url,
+            shrew_lora_map=_shrew_lora_map,
+            shrew_lora_format=_shrew_lora_format,
+            shrew_async_stage3=os.environ.get("SHREW_ASYNC_STAGE3", "").lower() in ("1", "true", "yes"),
+            section_max_tokens=int(os.environ.get("SECTION_MAX_TOKENS", "6000")),
+        )
+
+        def _run():
+            if pipeline_mode in _STRUCTURED_MODES and classify_file(tmp_path) in _STRUCTURED_ELIGIBLE_CLASSES:
+                return run_structured_pipeline(
                     tmp_path, output_dir, config,
-                    figure_converter=_get_figure_converter(),
-                    vlm_pool=_vlm_pool,
+                    raw=(pipeline_mode == "raw"),
                     progress=progress,
                 )
+            return run_pipeline(
+                tmp_path, output_dir, config,
+                figure_converter=_get_figure_converter(),
+                vlm_pool=_vlm_pool,
+                progress=progress,
+            )
 
-            watcher = asyncio.ensure_future(_watch_cancel())
-            try:
-                result = await loop.run_in_executor(None, _run)
-            finally:
-                watcher.cancel()
-            response = _build_response(result, skip_extraction)
-            if format == "markdown":
-                # structured markdown only — same assembly the JSON carries in
-                # its "markdown" key, as a text/markdown body
-                return PlainTextResponse(response["markdown"],
-                                         media_type="text/markdown; charset=utf-8")
-            return JSONResponse(content=response)
+        result = await loop.run_in_executor(None, _run)
+        response = _build_response(result, skip_extraction)
+        if format == "markdown":
+            # structured markdown only — same assembly the JSON carries in
+            # its "markdown" key, as a text/markdown body
+            return PlainTextResponse(response["markdown"],
+                                     media_type="text/markdown; charset=utf-8")
+        return JSONResponse(content=response)
 
     except CancelledException:
         # Client went away and the pipeline unwound at a page boundary. The
@@ -656,6 +716,10 @@ async def convert(
             content={"error": str(e)},
         )
     finally:
+        watcher.cancel()
+        if acquired:
+            _pipeline_gate.release()
+        lease.release()
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -713,9 +777,14 @@ async def convert_stream(
     skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
 
     progress = ProgressReporter()
+    # Activity lease: queued now; running once the worker thread acquires the
+    # SHARED pipeline gate (same gate as /v1/convert — one per-worker limit,
+    # not a separate stream capacity). Released by whichever cleanup path runs.
+    lease = _leases.new_lease()
 
     def run_in_thread():
         _pipeline_gate.acquire()
+        lease.mark_running()
         try:
             config = PipelineConfig(
                 vlm_url=vlm_url,
@@ -757,6 +826,9 @@ async def convert_stream(
             progress.emit_error(str(e))
         finally:
             _pipeline_gate.release()
+            # Lease release is unlink+close — instant file ops, and this runs
+            # on the worker thread, never the event loop.
+            lease.release()
             os.unlink(tmp_path)
             shutil.rmtree(output_dir, ignore_errors=True)
             progress.sentinel()
@@ -793,6 +865,7 @@ async def convert_stream(
             if not started:
                 # Cancelled before the worker existed: nothing else will
                 # clean the upload/output dir — do it here (audit issue #11).
+                lease.release()
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
                 shutil.rmtree(output_dir, ignore_errors=True)
