@@ -583,6 +583,37 @@ def _result(ok, data, status, error, attempts, raw_len, *,
     }
 
 
+def validate_types(sj: dict) -> list[str]:
+    """Server-side TYPE conformance for the fields validate_schema only checks
+    for PRESENCE (GitLab #23). Kept separate so the vendored validate_schema
+    stays byte-identical to the eval copy it is synced from.
+
+    The first pass runs unenforced, so the model can emit ``"caption": 42``
+    or ``"content": null`` and still satisfy a presence check — then
+    assemble_document() dies in table_flat_text()/_is_prose() with a
+    TypeError. fallback._coerce_five_key already re-types exactly these
+    fields; this guards the primary door the same way, by turning a bad type
+    into a "schema" verdict (retry/fallback ladder) instead of a crash.
+    Only str-or-None is accepted where the schema means text; null caption
+    and null title are legal; a missing keywords key is legal.
+    """
+    errs: list[str] = []
+    for c in (sj.get("semantic_chunks") or []):
+        if not isinstance(c, dict):
+            continue
+        if not isinstance(c.get("content"), str):
+            errs.append("chunk:bad-content-type")
+        if not isinstance(c.get("title"), (str, type(None))):
+            errs.append("chunk:bad-title-type")
+        if "keywords" in c and not isinstance(c["keywords"], list):
+            errs.append("chunk:bad-keywords-type")
+    for lk in ("figures", "tables"):
+        for o in (sj.get(lk) or []):
+            if isinstance(o, dict) and not isinstance(o.get("caption"), (str, type(None))):
+                errs.append(f"{lk}:bad-caption-type")
+    return errs
+
+
 def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" = None):
     """Run the §5 gates over one completion.
 
@@ -615,6 +646,11 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     if parsed is None:
         return None, "parse", perr
     schema_ok, serrs = validate_schema(parsed)
+    if schema_ok:
+        # Presence passed; now the field TYPES the downstream assembly relies
+        # on (GitLab #23). Same verdict, same ladder.
+        serrs = validate_types(parsed)
+        schema_ok = not serrs
     if not schema_ok:
         return parsed, "schema", "schema:" + ";".join(serrs)
     return parsed, "ok", None

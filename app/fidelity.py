@@ -297,9 +297,11 @@ def _correctable(f: dict) -> bool:
 
 def _field_refs(doc: dict):
     """(container, key, where) for every mutable output text field — the
-    write-side twin of iter_output_texts. Table html AND flat_text are both
-    yielded: a correction must land in whichever representation a consumer
-    reads."""
+    write-side twin of iter_output_texts. Table caption, html AND flat_text
+    are all yielded: a correction must land in whichever representation a
+    consumer reads, and the caption is ALSO the first line of flat_text — if
+    only flat_text were rewritten the two would ship contradictory spellings
+    of the same identifier in one record (GitLab #23)."""
     if doc.get("doc_summary"):
         yield doc, "doc_summary", "doc_summary"
     meta = doc.get("metadata") or {}
@@ -312,7 +314,7 @@ def _field_refs(doc: dict):
         if c.get("content"):
             yield c, "content", where
     for i, t in enumerate(doc.get("tables") or []):
-        for key in ("html", "flat_text"):
+        for key in ("caption", "html", "flat_text"):
             if t.get(key):
                 yield t, key, f"table[{i}].{key}"
     for i, f in enumerate(doc.get("figures") or []):

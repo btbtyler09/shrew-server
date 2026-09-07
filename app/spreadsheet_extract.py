@@ -513,12 +513,28 @@ def extract_spreadsheet_media(path: str, output_dir: str,
                 except Exception as e:
                     logger.warning(f"unreadable embedded image on '{ws.title}': {e}")
                     continue
-                fmt = (getattr(img, "format", None) or "png").lower()
+                # Normalise to a real PNG (GitLab #23). openpyxl hands back
+                # the ORIGINAL bytes for gif/jpeg/png (it only converts other
+                # formats), yet build_structured_json labels every figure
+                # ``format: "png"`` — so a pasted JPEG shipped as mislabelled
+                # JPEG bytes. Every crop_path this pipeline emits is a PNG we
+                # wrote ourselves; hold embedded pictures to the same rule.
+                try:
+                    import io
+                    from PIL import Image as _PILImage
+                    with _PILImage.open(io.BytesIO(data)) as pic:
+                        pic.load()
+                        norm = pic.convert("RGBA") if pic.mode in ("P", "LA", "RGBA") \
+                            else pic.convert("RGB")
+                except Exception as e:
+                    # Not decodable → it could be neither captioned nor
+                    # shipped meaningfully; skip rather than emit a bad image.
+                    logger.warning(f"undecodable embedded image on '{ws.title}': {e}")
+                    continue
                 os.makedirs(fig_dir, exist_ok=True)
-                fname = f"sheet_{ws.title.replace('/', '_')}_img{len(out)}.{fmt}"
+                fname = f"sheet_{ws.title.replace('/', '_')}_img{len(out)}.png"
                 fpath = os.path.join(fig_dir, fname)
-                with open(fpath, "wb") as fh:
-                    fh.write(data)
+                norm.save(fpath, "PNG")
                 out.append({"path": fpath, "sheet": ws.title, "index": len(out)})
         return out
     finally:
