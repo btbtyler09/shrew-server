@@ -320,6 +320,27 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
     return refine
 
 
+def _validate_document(doc: dict) -> None:
+    """Guard the invariant the markdown/structured projection relies on: every
+    figure carries a unique figure_id.
+
+    assemble_document() stamps ids on page figures, but figures appended after
+    it (embedded spreadsheet media) must be stamped by the caller. A missing or
+    duplicate id is an assembly defect — fail loudly here, naming the offending
+    figure, rather than as a bare ``KeyError: 'figure_id'`` deep inside
+    synthesize_markdown() where it looks like model output (GitLab #8).
+    """
+    seen: set = set()
+    for i, f in enumerate(doc.get("figures", [])):
+        fid = f.get("figure_id")
+        if not fid:
+            raise ValueError(
+                f"figure[{i}] has no figure_id (caption={f.get('caption')!r})")
+        if fid in seen:
+            raise ValueError(f"duplicate figure_id {fid!r} in assembled document")
+        seen.add(fid)
+
+
 def build_structured_json(doc: dict, total_pages: int) -> dict:
     """Build the back-compat structured.json shape (plus a new `tables` key)
     from a doc record produced by assemble_document.
@@ -510,6 +531,26 @@ def synthesize_markdown(doc: dict) -> str:
                 # crop from). An ![](img:N) ref here would point at an image
                 # that isn't in the response.
                 parts.append(f"[Figure: {caption or 'untitled'}]")
+        inner = "\n\n".join(parts)
+        blocks.append(f"<page {p}>\n{inner}\n</page {p}>")
+
+    # Figures with no home in the page loop above — embedded spreadsheet media
+    # carry page=None (nothing was rasterized), so they fall under no real page.
+    # Emit them in a trailing block at the document end so the markdown retains
+    # them (GitLab #8). The <page N> tag must stay numeric — the UI parser only
+    # matches /^<page (\d+)>$/ — so we use the page after the last rendered one.
+    rendered = {page["page"] for page in doc["pages"]}
+    orphans = [f for f in doc["figures"]
+               if f["page"] not in rendered and f["figure_id"] not in placed]
+    if orphans:
+        parts = []
+        for f in orphans:
+            caption = f.get("caption") or ""
+            if f.get("crop_path"):
+                parts.append(f"![{caption}](img:{fig_index[f['figure_id']]})")
+            else:
+                parts.append(f"[Figure: {caption or 'untitled'}]")
+        p = max((x for x in rendered if isinstance(x, int)), default=0) + 1
         inner = "\n\n".join(parts)
         blocks.append(f"<page {p}>\n{inner}\n</page {p}>")
 
@@ -914,16 +955,27 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     if input_class in TEXT_CLASSES and spreadsheet_media:
         # Embedded workbook pictures ride the figures list so the response
         # projection ships them in images[] with their crop data. bbox stays
-        # null: nothing was rendered, so there is no page geometry.
+        # null: nothing was rendered, so there is no page geometry. They are
+        # appended AFTER assemble_document(), which is the only thing that
+        # stamps figure_id, so we stamp them here — deterministically, from the
+        # doc_id, with an embedded-media suffix that cannot collide with the
+        # page figures' ``{doc_id}_p{page}_f{i}`` scheme. synthesize_markdown()
+        # indexes every figure by figure_id (GitLab #8: a missing one KeyError'd
+        # the whole conversion).
         doc["figures"].extend({
+            "figure_id": f"{doc_id}_embedded_f{i}",
             "caption": m["caption"], "page": None, "bbox": None,
             "crop_path": m["path"],
-        } for m in spreadsheet_media)
+        } for i, m in enumerate(spreadsheet_media, start=1))
 
     # Fidelity cross-check BEFORE rendering: evidence-backed identifier
     # corrections must land in the doc record so markdown/structured.json
     # ship the corrected spellings.
     fidelity_report = _fidelity_check(doc, file_path, output_dir, input_class)
+
+    # Fail fast on an assembly defect (e.g. a figure with no figure_id) with a
+    # descriptive error rather than a bare KeyError inside the projection.
+    _validate_document(doc)
 
     if raw:
         # Flat text rendering: no structured.json, so the server omits the
