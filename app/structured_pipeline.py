@@ -36,6 +36,7 @@ from PIL import Image
 logger = logging.getLogger("shrew.structured_pipeline")
 
 from . import rasterizer
+from . import telemetry
 from .assembly import assemble_document, build_table_composite
 from .models import PipelineResult
 from .pipeline import CancelledException
@@ -848,8 +849,21 @@ def _extract_text_pages(file_path, output_dir, config, input_class, client, prog
     return [results[i] for i in sorted(results)], total_pages, text
 
 
+def _trace_page(trace, page_no, pr, ms):
+    """Record one page's completion — number + status enum only, never content.
+    Telemetry is advisory: a bad status or a write failure must never surface
+    into the conversion."""
+    try:
+        status = pr.get("status") if pr.get("status") in telemetry.PAGE_STATUSES else "failed"
+        trace.page(page_no, status, ms, bucket=pr.get("bucket"),
+                   retry_tier="coerced" if pr.get("schema_coerced") else None,
+                   fallback=bool(pr.get("fallback_used")))
+    except Exception:  # noqa: BLE001 — telemetry never breaks a conversion
+        pass
+
+
 def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
-                             client=None, raw=False) -> PipelineResult:
+                             client=None, raw=False, trace=None) -> PipelineResult:
     """Turn an uploaded file into a shrew-ocr-preview PipelineResult.
 
     Image modality (pdf/image/office):
@@ -870,6 +884,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     start_time = time.time()
     os.makedirs(output_dir, exist_ok=True)
     input_class = classify_file(file_path)
+    trace = trace or telemetry.NullTrace()
 
     if raw and os.path.splitext(file_path)[1].lower() in RAW_DETERMINISTIC_EXTENSIONS:
         return _raw_deterministic(file_path, output_dir, config, input_class,
@@ -888,20 +903,25 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     hires_images: dict[int, str] | None = None
 
     if input_class in TEXT_CLASSES:
+        trace.phase("transcribe_start")
         page_results, total_pages, _ = _extract_text_pages(
             file_path, output_dir, config, input_class, client, progress,
         )
+        trace.mark_pages_done(len(page_results))
+        trace.phase("transcribe_done")
         spreadsheet_media = (
             _extract_and_caption_media(file_path, output_dir, client)
             if input_class == "spreadsheet" else []
         )
     else:
+        trace.phase("rasterize_start")
         with rasterizer.RASTERIZE_LOCK:
             page_images, total_pages, page_dims = prepare_pages(
                 file_path, output_dir,
                 low_dpi=config.low_dpi, high_dpi=config.high_dpi,
                 page_range=config.page_range,
             )
+        trace.phase("rasterize_done")
 
         page_numbers = sorted(page_images.keys())
         n_pages = len(page_numbers)
@@ -909,8 +929,10 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         if progress is not None:
             progress.emit(5, f"Extracting pages (0/{n_pages})...")
 
+        trace.phase("transcribe_start")
         page_results_map: dict[int, dict] = {}
         with ThreadPoolExecutor(max_workers=max(1, config.vlm_concurrency)) as pool:
+            submitted_at = time.time()
             futures = {
                 pool.submit(
                     _process_one_page, pno, page_images[pno][1], config, output_dir,
@@ -921,8 +943,13 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
             pages_done = 0
             for fut in as_completed(futures):
                 pno = futures[fut]
-                page_results_map[pno] = fut.result()
+                pr = fut.result()
+                page_results_map[pno] = pr
                 pages_done += 1
+                # Latency here is queue+exec wall time — a rising trend across
+                # completions is the signal that the model server is backing up.
+                _trace_page(trace, pno, pr, int((time.time() - submitted_at) * 1000))
+                trace.mark_pages_done(pages_done)
                 if progress is not None:
                     pct = 5 + int(80 * pages_done / n_pages)
                     progress.emit(pct, f"Extracting pages ({pages_done}/{n_pages})...")
@@ -931,6 +958,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
                     for pending in futures:
                         pending.cancel()
                     raise CancelledException()
+        trace.phase("transcribe_done")
 
         # Collect in ascending page order regardless of completion order.
         page_results = [page_results_map[pno] for pno in page_numbers]
@@ -941,6 +969,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
 
     # Model-refined table stitching needs the hires renders — image modality
     # only (text-modality tables have null bboxes and never stitch anyway).
+    trace.phase("assemble_start")
     stitch_stats: dict = {}
     table_refiner = (make_table_refiner(hires_images, output_dir, client, stitch_stats)
                      if hires_images else None)
@@ -971,12 +1000,14 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     # Fidelity cross-check BEFORE rendering: evidence-backed identifier
     # corrections must land in the doc record so markdown/structured.json
     # ship the corrected spellings.
+    trace.phase("fidelity")
     fidelity_report = _fidelity_check(doc, file_path, output_dir, input_class)
 
     # Fail fast on an assembly defect (e.g. a figure with no figure_id) with a
     # descriptive error rather than a bare KeyError inside the projection.
     _validate_document(doc)
 
+    trace.phase("json_build")
     if raw:
         # Flat text rendering: no structured.json, so the server omits the
         # stage-3 keys rather than returning empty ones.

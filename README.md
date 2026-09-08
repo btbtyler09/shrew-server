@@ -399,6 +399,44 @@ counted, so no stale count survives a crash or restart. `vlm.in_flight` is
 the live machine-wide count of VLM calls holding a slot of the cross-process
 `VLM_CONCURRENCY` gate. Reading `/health` never triggers model inference.
 
+`conversions.active` lists each in-flight run's live progress, so a long
+document (hundreds/thousands of pages) can be watched in real time:
+
+```json
+{"conversions": {"running": 1, "queued": 0, "active": [
+  {"phase": "transcribe_start", "pages_done": 1840, "total_pages": 3500,
+   "rss_mb": 5120.4, "elapsed_s": 1830.0}
+]}}
+```
+
+### Run diagnostics (telemetry)
+
+Each conversion writes a **content-free, crash-surviving** diagnostic trace —
+server state and failure evidence only, never document content. A run that
+dies mid-transcription (OOM-kill, disk-full, a VLM connection storm) used to
+return nothing; the trace makes the failure visible after the fact.
+
+Each run is one JSONL file (appended and flushed per event, so a hard kill
+loses only the last line) under `SHREW_TELEMETRY_DIR`
+(default `<tmpdir>/shrew-telemetry`, `0700`), named by a content-derived run
+id — never the filename. Events:
+
+- `phase` — `rasterize_done`, `transcribe_start/done`, `assemble_start`,
+  `fidelity`, `json_build`, `serialize_start/done`.
+- `page` — page **number**, status enum, latency ms, glyph bucket. No text.
+- `sample` — a resource heartbeat (`rss_mb`, `open_fds`, `threads`,
+  `disk_free_mb`, `pages_done`) every `SHREW_TELEMETRY_SAMPLE_S` seconds
+  (default `10`), so a hung run still leaves a trail.
+- `died_at` — on failure: the phase, the exception **class name** and a fixed
+  **category** (`oom` / `disk_full` / `timeout` / `connection` / `parse` /
+  `fd_exhausted` / …). The raw exception message is never stored (it can echo
+  model output); the run is keyed by a hash, never the filename.
+
+To post-mortem a failed run, read the last lines of its trace: the `died_at`
+(or the final `sample` before the trace simply stops) names where and in what
+server state it died. Set `SHREW_TELEMETRY=0` to disable the layer entirely.
+Telemetry is advisory — a failure to write it never fails a conversion.
+
 ## CLI
 
 The `shrew convert` CLI runs the **legacy multi-stage pipeline** (hence the

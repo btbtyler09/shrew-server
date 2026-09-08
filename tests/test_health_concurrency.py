@@ -96,7 +96,10 @@ def _wait_until(pred, timeout=15.0, msg="condition"):
 
 
 def _conversions(api_client):
-    return api_client.get("/health").json()["concurrency"]["conversions"]
+    # These tests assert the lease COUNTS; the additive `active` live-telemetry
+    # list (GitLab #24) is exercised in test_health_telemetry.py.
+    conv = api_client.get("/health").json()["concurrency"]["conversions"]
+    return {k: conv[k] for k in ("running", "queued")}
 
 
 class _BlockingPipeline:
@@ -108,7 +111,7 @@ class _BlockingPipeline:
         self.entered = threading.Event()
 
     def __call__(self, tmp_path, output_dir, config, progress=None, raw=False,
-                 client=None):
+                 client=None, trace=None):
         self.entered.set()
         while not self.release.wait(timeout=0.05):
             if progress is not None and progress.is_cancelled():
@@ -126,7 +129,7 @@ def test_health_reports_capacity_and_effective_limits(api_client):
     assert conc["workers"] == 2
     assert conc["pipeline"] == {"per_worker_limit": 1, "effective_limit": 2}
     assert conc["vlm"] == {"limit": 4, "cross_process": True, "in_flight": 0}
-    assert conc["conversions"] == {"running": 0, "queued": 0}
+    assert {k: conc["conversions"][k] for k in ("running", "queued")} == {"running": 0, "queued": 0}
 
 
 def test_unhealthy_response_still_carries_concurrency(api_client):

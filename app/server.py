@@ -26,6 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from sse_starlette.sse import EventSourceResponse
 
 from . import concurrency as _leases
+from . import telemetry as _tel
 from .cli import parse_page_range
 from .models import PipelineConfig, PipelineResult
 from .pipeline import CancelledException, run_pipeline
@@ -296,7 +297,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.10",
+    version="0.3.11",
     lifespan=lifespan,
 )
 
@@ -369,6 +370,19 @@ def _concurrency_health() -> dict:
         logger.warning(f"lease snapshot failed: {e}")
         conversions = {"running": 0, "queued": 0}
         in_flight = 0
+    try:
+        # Live in-flight run telemetry (GitLab #24): phase + progress + RSS for
+        # each running conversion, so a long book can be watched in real time.
+        # Content-free; advisory (a live worker's own liveness is not proven).
+        active = [
+            {"phase": r.get("phase"), "pages_done": r.get("pages_done"),
+             "total_pages": r.get("total_pages"), "rss_mb": r.get("rss_mb"),
+             "elapsed_s": r.get("elapsed_s")}
+            for r in _tel.read_live()
+        ]
+        conversions = {**conversions, "active": active}
+    except Exception as e:  # noqa: BLE001 — /health must never fail on this
+        logger.warning(f"live telemetry read failed: {e}")
     return {
         "workers": workers,
         "pipeline": {"per_worker_limit": pl, "effective_limit": workers * pl},
@@ -549,6 +563,28 @@ def _resolve_model(model_field: Optional[str]) -> tuple[str, str, Optional[str]]
     return _config.vlm_url, model_field or _config.vlm_model, _config.api_key
 
 
+def _run_id(path: str) -> str:
+    """A stable, content-DERIVED id for a run — never the filename. Cheap: file
+    size plus the first 64 KiB, so the same document correlates across retries
+    without hashing gigabytes. Not reversible to document content."""
+    import hashlib as _h
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(65536)
+        return _h.sha256(str(size).encode() + head).hexdigest()[:16]
+    except OSError:
+        return _h.sha256(os.urandom(16)).hexdigest()[:16]
+
+
+def _tel_sample_s() -> float:
+    """Resource-sample heartbeat for the run trace (seconds)."""
+    try:
+        return float(os.environ.get("SHREW_TELEMETRY_SAMPLE_S", "10"))
+    except ValueError:
+        return 10.0
+
+
 @app.post("/v1/convert")
 async def convert(
     request: Request,
@@ -664,11 +700,18 @@ async def convert(
     # waiting for capacity must release the slot, not hold it.
     watcher = asyncio.ensure_future(_watch_cancel())
     acquired = False
+    trace = _tel.NullTrace()
+    trace_status = "done"
     try:
         acquired = await _acquire_pipeline_gate()
         if not acquired:
             raise CancelledException()
         lease.mark_running()
+        # Crash-surviving diagnostics for this run (GitLab #24). Content-free:
+        # keyed by a cheap content hash (never the filename), records only
+        # server state + failure evidence. A NullTrace stands in if disabled.
+        trace = _tel.new_trace(_run_id(tmp_path),
+                               sample_interval_s=_tel_sample_s())
         loop = asyncio.get_running_loop()
         config = PipelineConfig(
             vlm_url=vlm_url,
@@ -693,6 +736,7 @@ async def convert(
                     tmp_path, output_dir, config,
                     raw=(pipeline_mode == "raw"),
                     progress=progress,
+                    trace=trace,
                 )
             return run_pipeline(
                 tmp_path, output_dir, config,
@@ -702,7 +746,9 @@ async def convert(
             )
 
         result = await loop.run_in_executor(None, _run)
+        trace.phase("serialize_start")
         response = _build_response(result, skip_extraction)
+        trace.phase("serialize_done")
         if format == "markdown":
             # structured markdown only — same assembly the JSON carries in
             # its "markdown" key, as a text/markdown body
@@ -714,14 +760,18 @@ async def convert(
         # Client went away and the pipeline unwound at a page boundary. The
         # response is moot (nobody is listening); log quietly, don't 500.
         logger.info("Pipeline cancelled before completion (disconnect or deadline)")
+        trace_status = "cancelled"
         return JSONResponse(status_code=499, content={"error": "conversion cancelled"})
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
+        trace_status = "failed"
+        trace.died(trace.current_phase, e)  # phase + category, never content
         return JSONResponse(
             status_code=500,
             content={"error": str(e)},
         )
     finally:
+        trace.close(trace_status)
         watcher.cancel()
         if acquired:
             _pipeline_gate.release()
@@ -791,6 +841,8 @@ async def convert_stream(
     def run_in_thread():
         _pipeline_gate.acquire()
         lease.mark_running()
+        trace = _tel.new_trace(_run_id(tmp_path), sample_interval_s=_tel_sample_s())
+        trace_status = "done"
         try:
             config = PipelineConfig(
                 vlm_url=vlm_url,
@@ -813,6 +865,7 @@ async def convert_stream(
                 result = run_structured_pipeline(
                     tmp_path, output_dir, config, progress=progress,
                     raw=(pipeline_mode == "raw"),
+                    trace=trace,
                 )
             else:
                 result = run_pipeline(
@@ -822,15 +875,21 @@ async def convert_stream(
                     vlm_pool=_vlm_pool,
                 )
 
+            trace.phase("serialize_start")
             response = _build_response(result, skip_extraction)
+            trace.phase("serialize_done")
             progress.emit_complete(response)
 
         except CancelledException:
             logger.info("Pipeline cancelled (client disconnected)")
+            trace_status = "cancelled"
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
+            trace_status = "failed"
+            trace.died(trace.current_phase, e)  # phase + category, never content
             progress.emit_error(str(e))
         finally:
+            trace.close(trace_status)
             _pipeline_gate.release()
             # Lease release is unlink+close — instant file ops, and this runs
             # on the worker thread, never the event loop.
