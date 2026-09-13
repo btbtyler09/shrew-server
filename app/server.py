@@ -51,7 +51,11 @@ from .structured_page import (
     empty_200_streak,
     warn_if_budget_unreachable,
 )
-from .structured_pipeline import IMAGE_TRANSFORM, run_structured_pipeline
+from .structured_pipeline import (
+    IMAGE_TRANSFORM,
+    ModelBackendDownError,
+    run_structured_pipeline,
+)
 from .ui import UI_HTML
 from .vlm_client import VLMClient
 
@@ -297,7 +301,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.11",
+    version="0.3.12",
     lifespan=lifespan,
 )
 
@@ -762,6 +766,15 @@ async def convert(
         logger.info("Pipeline cancelled before completion (disconnect or deadline)")
         trace_status = "cancelled"
         return JSONResponse(status_code=499, content={"error": "conversion cancelled"})
+    except ModelBackendDownError as e:
+        # The model backend died mid-run. Fail LOUD with a 503 instead of a
+        # misleading 200 on a mostly-empty document (GitLab #25).
+        logger.error(f"Model backend down: {e}")
+        trace_status = "failed"
+        return JSONResponse(
+            status_code=503,
+            content={"error": str(e), "reason": "model_backend_unavailable"},
+        )
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
         trace_status = "failed"
@@ -883,6 +896,10 @@ async def convert_stream(
         except CancelledException:
             logger.info("Pipeline cancelled (client disconnected)")
             trace_status = "cancelled"
+        except ModelBackendDownError as e:
+            logger.error(f"Model backend down: {e}")
+            trace_status = "failed"
+            progress.emit_error(f"model_backend_unavailable: {e}")
         except Exception as e:
             logger.error(f"Pipeline error: {e}", exc_info=True)
             trace_status = "failed"

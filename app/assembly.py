@@ -483,6 +483,28 @@ def assemble_document(doc_id, file_path, source, page_results,
                         crop.save(crop_path)
                         figure["crop_path"] = crop_path
 
+    # never-skip (GitLab #25): a page that failed transcription must still
+    # appear in the output — ship its rendered image rather than a silent gap
+    # or a blank page block. A human can read the page even when the model
+    # couldn't. Image modality only (text modality has no render to fall back
+    # to); bbox null (the whole page), crop_path is the hires render.
+    if hires_images:
+        for pr in page_results:
+            if pr.get("ok"):
+                continue
+            page = pr["page"]
+            render = hires_images.get(page)
+            if not render:
+                continue
+            figures.append({
+                "figure_id": f"{doc_id}_p{page}_pagefail",
+                "page": page,
+                "bbox": None,
+                "caption": f"[Page {page}: transcription unavailable "
+                           f"({pr.get('status', 'failed')})]",
+                "crop_path": render,
+            })
+
     return {
         "doc_id": doc_id,
         "file_path": file_path,

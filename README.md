@@ -437,6 +437,32 @@ To post-mortem a failed run, read the last lines of its trace: the `died_at`
 server state it died. Set `SHREW_TELEMETRY=0` to disable the layer entirely.
 Telemetry is advisory — a failure to write it never fails a conversion.
 
+### Failure handling (large-document resilience)
+
+Two behaviors keep a long conversion honest when things go wrong mid-run:
+
+- **Circuit-break on a dead backend.** If the model backend (the VLM engine)
+  becomes unreachable, shrew-server does **not** grind through every remaining
+  page and return a misleadingly-successful, mostly-empty document. After
+  `SHREW_BACKEND_DOWN_STREAK` consecutive `transport_error` pages (default
+  `25`) it aborts with **HTTP 503** `{"reason": "model_backend_unavailable"}`.
+  A retry once the backend is healthy converts the whole document. (This is
+  the failure mode of a 3,500-page book on a 12 GB GPU: vLLM's engine OOMs and
+  dies ~2/3 of the way through — size `--max-num-seqs` / `--gpu-memory-utilization`
+  to your VRAM to avoid it.)
+- **Never skip a page.** A page that fails transcription while the backend is
+  healthy (a repetition loop, or output that won't conform after retry) is
+  **not** dropped — its rendered page image ships in `images[]` and as an
+  inline image reference in the markdown, captioned
+  `[Page N: transcription unavailable (<status>)]`. A human can still read the
+  page the model couldn't.
+- **Re-roll on a repetition loop.** On a batched backend greedy decode is not
+  deterministic across batch compositions: a dense page that loops on one
+  batch draw decodes clean on another, and the enforced-retry never recovers
+  these. So on a `repetition_abort` the page is re-run with the **same**
+  first-pass config first — `SHREW_ABORT_REROLL` re-rolls (default `1`, `0` to
+  disable) — before the enforced retry, which stays as the last rung.
+
 ## CLI
 
 The `shrew convert` CLI runs the **legacy multi-stage pipeline** (hence the

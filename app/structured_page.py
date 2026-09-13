@@ -745,11 +745,38 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
                        f"({len(text)} chars emitted)",
                        1, len(text), loop_guard=guard.stats() if guard else None)
 
+    # ── Re-roll tier: repetition_abort is a loop the streaming guard caught.
+    # The old assumption "greedy is deterministic, so an identical request
+    # reproduces the identical failure" does NOT hold on a batched backend:
+    # measured on the gfx908 TP=4 stack, the same request decodes clean on a
+    # different batch composition (the loop RATE holds; WHICH borderline pages
+    # loop shuffles). The enforced pp-0.6 retry never recovers these dense
+    # loops (2/74 → 0/72), so on a repetition_abort we re-run the SAME
+    # first-pass config first — the only thing that recovers this class. N is
+    # tunable (SHREW_ABORT_REROLL); the enforced retry stays as the last rung.
+    rerolls = int(os.environ.get("SHREW_ABORT_REROLL", "1")) if aborted else 0
+    attempt = 1
+    while aborted and rerolls > 0:
+        rerolls -= 1
+        attempt += 1
+        text, finish_reason, guard = _call(
+            messages, client,
+            max_tokens=max_tokens,
+            temperature=params["temperature"],
+            extra_params=params["extra_params"],
+            timeout=timeout,
+            page_no=page_no, attempt=f"attempt {attempt}, re-roll (same config)",
+        )
+        parsed, verdict, error = _gate(text, finish_reason, guard)
+        _note_completion(verdict == "empty")
+        aborted = finish_reason == REPETITION_ABORT
+        if verdict == "ok":
+            return _result(True, parsed, "ok", None, attempt, len(text),
+                           loop_guard=guard.stats() if guard else None)
+
     # ── Retry tier: ONE attempt, enforcement on, flagged ────────────────────
-    # Greedy is deterministic: an identical request reproduces the identical
-    # failure, so the retry MUST differ, and enforcement is the only permitted
-    # difference. Never retry at temperature > 0 (§3.3) — that output is a
-    # lottery ticket nobody evaluated.
+    # Enforcement is for FORM failures (parse/schema) a changed request can fix,
+    # and is the last rung after any re-rolls above.
     first_verdict = verdict
     first_error = error
 

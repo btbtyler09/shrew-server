@@ -46,6 +46,20 @@ from .structured_page import extract_page, extract_text_page, paginate_text
 from .text_extract import extract_text
 from .vlm_client import VLMClient
 
+class ModelBackendDownError(RuntimeError):
+    """The model backend (VLM engine) is unreachable — a run of consecutive
+    transport failures, not a per-page stumble. Raised to ABORT a conversion
+    fast instead of grinding through every remaining page and returning a
+    misleadingly-successful, mostly-empty document (GitLab #25: the vLLM
+    engine died at page ~2014 of a 3,500-page book, and shrew-server ran the
+    remaining ~1,490 pages into transport_error then returned HTTP 200)."""
+
+
+# How many CONSECUTIVE transport failures mean the backend is gone (vs a
+# sporadic timeout under queue pressure). Tunable; the dead-backend calls fail
+# fast, so this trips within seconds of an engine death.
+BACKEND_DOWN_STREAK = int(os.environ.get("SHREW_BACKEND_DOWN_STREAK", "25"))
+
 # Classes with a deterministic extractor: these go through the text modality
 # rather than being rasterized.
 TEXT_CLASSES = {"text", "csv", "spreadsheet"}
@@ -931,6 +945,9 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
 
         trace.phase("transcribe_start")
         page_results_map: dict[int, dict] = {}
+        down_streak = int(os.environ.get("SHREW_BACKEND_DOWN_STREAK",
+                                         str(BACKEND_DOWN_STREAK)))
+        consecutive_transport = 0
         with ThreadPoolExecutor(max_workers=max(1, config.vlm_concurrency)) as pool:
             submitted_at = time.time()
             futures = {
@@ -953,6 +970,23 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
                 if progress is not None:
                     pct = 5 + int(80 * pages_done / n_pages)
                     progress.emit(pct, f"Extracting pages ({pages_done}/{n_pages})...")
+                # Circuit-break on a dead backend: a run of consecutive
+                # transport failures is the engine gone, not a page stumble.
+                # Abort loudly (the server maps this to a 5xx) rather than
+                # failing every remaining page and faking a 200 (GitLab #25).
+                if pr.get("status") == "transport_error":
+                    consecutive_transport += 1
+                    if consecutive_transport >= down_streak:
+                        for pending in futures:
+                            pending.cancel()
+                        trace.died("transcribe_start",
+                                   ModelBackendDownError("backend down"))
+                        raise ModelBackendDownError(
+                            f"model backend unreachable: {consecutive_transport} "
+                            f"consecutive transport failures (through page {pno}) "
+                            f"— aborting rather than failing every remaining page")
+                else:
+                    consecutive_transport = 0
                 # Abort on client disconnect: cancel pending pages and stop.
                 if progress is not None and progress.is_cancelled():
                     for pending in futures:
