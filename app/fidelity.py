@@ -250,6 +250,11 @@ def iter_output_texts(doc: dict):
     for i, f in enumerate(doc.get("figures") or []):
         if f.get("caption"):
             yield f"figure[{i}].caption (page {f.get('page')})", f["caption"]
+        # v0.3.13: scan the description too — a precision token corrupted only
+        # in the description must still be flagged (and corrected via
+        # _field_refs), not just when it also appears in the caption.
+        if f.get("description"):
+            yield f"figure[{i}].description (page {f.get('page')})", f["description"]
 
 
 def check_document(doc: dict, source_text: str | None) -> dict | None:
@@ -320,6 +325,11 @@ def _field_refs(doc: dict):
     for i, f in enumerate(doc.get("figures") or []):
         if f.get("caption"):
             yield f, "caption", f"figure[{i}].caption"
+        # v0.3.13: description ships beside caption, so it must be corrected
+        # in step with it — otherwise a corrected caption sits next to an
+        # uncorrected description (the v0.3.10 paired-field desync again).
+        if f.get("description"):
+            yield f, "description", f"figure[{i}].description"
 
 
 def apply_corrections(doc: dict, report: dict | None) -> int:

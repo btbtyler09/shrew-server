@@ -440,6 +440,10 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "page": page,
                 "bbox": figure.get("bbox"),
                 "caption": figure.get("caption"),
+                # The model emits a per-figure description (93% of labels); it
+                # was generated at full cost and dropped here until v0.3.13
+                # (GitLab #26). Additive: None when the model omits it.
+                "description": figure.get("description"),
                 "crop_path": None,
             })
 
@@ -502,6 +506,7 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "bbox": None,
                 "caption": f"[Page {page}: transcription unavailable "
                            f"({pr.get('status', 'failed')})]",
+                "description": None,  # no model output to describe it
                 "crop_path": render,
             })
 

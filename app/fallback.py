@@ -149,7 +149,9 @@ def _coerce_five_key(sj: dict) -> dict:
     for f in (sj.get("figures") or []):
         if isinstance(f, dict):
             out["figures"].append({"bbox": _bbox(f.get("bbox")),
-                                   "caption": f.get("caption") if isinstance(f.get("caption"), (str, type(None))) else None})
+                                   "caption": f.get("caption") if isinstance(f.get("caption"), (str, type(None))) else None,
+                                   # v0.3.13: a fallback-rescued page keeps its description too
+                                   "description": f.get("description") if isinstance(f.get("description"), (str, type(None))) else None})
     for t in (sj.get("tables") or []):
         if isinstance(t, dict) and isinstance(t.get("html"), str):
             out["tables"].append({"bbox": _bbox(t.get("bbox")), "html": t["html"],

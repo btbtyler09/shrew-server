@@ -401,6 +401,9 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
             "data": data,
             "format": "png" if data else None,
             "caption": f["caption"],
+            # v0.3.13: the model's per-figure description now reaches the
+            # output (and so the retrieval index). None when not emitted.
+            "description": f.get("description"),
             "page": f["page"],
             "bbox": f["bbox"],
         })
@@ -1028,6 +1031,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         doc["figures"].extend({
             "figure_id": f"{doc_id}_embedded_f{i}",
             "caption": m["caption"], "page": None, "bbox": None,
+            "description": None,  # captioned by prefix, no model description
             "crop_path": m["path"],
         } for i, m in enumerate(spreadsheet_media, start=1))
 

@@ -609,8 +609,14 @@ def validate_types(sj: dict) -> list[str]:
             errs.append("chunk:bad-keywords-type")
     for lk in ("figures", "tables"):
         for o in (sj.get(lk) or []):
-            if isinstance(o, dict) and not isinstance(o.get("caption"), (str, type(None))):
+            if not isinstance(o, dict):
+                continue
+            if not isinstance(o.get("caption"), (str, type(None))):
                 errs.append(f"{lk}:bad-caption-type")
+            # v0.3.13: description is carried through to the output and the
+            # fidelity regex — a non-string there would crash downstream.
+            if not isinstance(o.get("description"), (str, type(None))):
+                errs.append(f"{lk}:bad-description-type")
     return errs
 
 

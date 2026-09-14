@@ -283,7 +283,7 @@ Convert a document to markdown + structured JSON.
   "images": [
     {
       "index": 0, "data": "<base64 figure crop>", "format": "png",
-      "caption": "...", "page": 2, "bbox": [557.1, 155.0, 830.0, 300.0]
+      "caption": "...", "description": "...", "page": 2, "bbox": [557.1, 155.0, 830.0, 300.0]
     }
   ],
   "processing_log": {
