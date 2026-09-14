@@ -39,10 +39,12 @@ GOOD = ('{"metadata":{"title":null,"authors":[],"organization":null,"year":null,
         '"title":"Body","section_type":"technical_content","content":"' + _BODY +
         '"}],"figures":[],"tables":[]}')
 
-# Parses and passes the schema, but bad section_type -> schema gate failure.
+# Parses, but a chunk is missing its `content` key -> schema gate failure.
+# (v0.3.14: an unknown section_type is normalized, no longer a schema failure —
+# see tests/test_section_taxonomy.py.)
 BAD_SCHEMA = ('{"metadata":{"title":null,"authors":[],"organization":null,'
               '"year":null,"doc_type":null},"summary":"s","semantic_chunks":'
-              '[{"chunk_id":"1","title":"t","content":"c","section_type":"bogus"}],'
+              '[{"chunk_id":"1","title":"t","section_type":"body"}],'
               '"figures":[],"tables":[]}')
 
 

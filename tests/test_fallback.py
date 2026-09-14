@@ -99,7 +99,8 @@ def test_coercion_normalizes_stray_shapes_to_the_serving_schema():
     assert ok, errs
     assert out["metadata"]["authors"] == ["Single Author"]
     assert out["semantic_chunks"][0]["chunk_id"] == "1"
-    assert out["semantic_chunks"][0]["section_type"] == "technical_content"
+    # v0.3.14: an unknown label folds onto the taxonomy fallback, not technical_content
+    assert out["semantic_chunks"][0]["section_type"] == "other"
     assert len(out["semantic_chunks"]) == 1
     assert out["figures"][0]["bbox"] is None
     assert len(out["tables"]) == 1

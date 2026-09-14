@@ -30,6 +30,7 @@ import zlib
 from pathlib import Path
 
 from .generation import get_generation_params
+from .section_types import SECTION_SET, canonical
 from .vlm_client import make_image_content
 
 logger = logging.getLogger("shrew.structured_page")
@@ -212,10 +213,29 @@ def parse_json_lenient(text: str):
 
 # --------------------------------------------------------------------------- vendored: schema (metrics_v2.py)
 
-SECTION_ENUM = {
-    "abstract", "introduction", "methodology", "results",
-    "discussion", "conclusion", "technical_content", "appendix",
-}
+# The model's TRAINED taxonomy (v0.3.14, GitLab #27). section_types.py is
+# vendored raw-identical from shrew_ocr/section_types.py — THE contract the
+# labels, the eval and this server all derive from (36 values, 2026-09-14);
+# tests/test_section_taxonomy.py fails if the copies diverge. validate_schema
+# gates on SECTION_ENUM AND the enforced-retry grammar (ENFORCEMENT_SCHEMA)
+# derives from it, so the two can never disagree again.
+#
+# History: the server carried only the 8-value v2 set while 100% of broadsheet
+# rows and ~99% of dense rows were trained on the wider taxonomy. A CORRECT
+# first pass therefore failed schema (496/541 errors = `body`, 38 =
+# `news_article`), the retry grammar forced a wrong v2 value, and the page
+# landed "coerced" with mislabeled chunks after a second full generation —
+# 1,138 pages, 13% of the corpus, most of the newspaper first-pass loss.
+# Never map labels DOWN: the model is trained on these values.
+SECTION_ENUM = SECTION_SET
+
+# A section_type outside SECTION_ENUM is normalized in place by canonical()
+# (legacy/near-duplicate labels fold onto their canonical value, e.g.
+# article→news_article, contents→index; anything unmatched and a missing value
+# land on SECTION_FALLBACK) and logged in the gate log — the page is NEVER
+# failed for it. A stray label is a labeling-drift signal, not a reason to
+# burn a second full generation.
+SECTION_FALLBACK = canonical(None)
 FIVE_KEYS = ("metadata", "summary", "semantic_chunks", "figures", "tables")
 META_FIELDS = ("title", "authors", "organization", "year", "doc_type")
 
@@ -620,6 +640,34 @@ def validate_types(sj: dict) -> list[str]:
     return errs
 
 
+def normalize_section_types(parsed) -> list[str]:
+    """Rewrite any chunk ``section_type`` outside SECTION_ENUM (or missing) to
+    its canonical() value, in place. Returns the original stray values, one per
+    chunk touched, and logs each so the drift stays visible in the gate log
+    without burning a second full generation on the page (GitLab #27).
+
+    Only dict chunks with a str-or-missing section_type are touched; anything
+    else is left for validate_schema/validate_types to report as before.
+    """
+    stray: list[str] = []
+    chunks = parsed.get("semantic_chunks") if isinstance(parsed, dict) else None
+    if not isinstance(chunks, list):
+        return stray
+    for i, c in enumerate(chunks):
+        if not isinstance(c, dict):
+            continue
+        st = c.get("section_type")
+        if st in SECTION_ENUM:
+            continue
+        if st is not None and not isinstance(st, str):
+            continue
+        c["section_type"] = canonical(st)
+        stray.append("<missing>" if st is None else st)
+        logger.info("chunk %d: section_type %r not in taxonomy -> %r",
+                    i, st, c["section_type"])
+    return stray
+
+
 def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" = None):
     """Run the §5 gates over one completion.
 
@@ -651,6 +699,10 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     parsed, perr = parse_json_lenient(text)
     if parsed is None:
         return None, "parse", perr
+    # GitLab #27: a section_type outside the taxonomy is a labeling-drift
+    # signal, not a failed page. Normalize BEFORE validate_schema so the
+    # vendored gate stays byte-identical to the eval copy and never sees it.
+    normalize_section_types(parsed)
     schema_ok, serrs = validate_schema(parsed)
     if schema_ok:
         # Presence passed; now the field TYPES the downstream assembly relies

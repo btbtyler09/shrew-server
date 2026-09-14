@@ -309,9 +309,14 @@ Convert a document to markdown + structured JSON.
 ```
 
 Notes on the shape:
-- `section_type` is one of the model's trained categories (`abstract`,
-  `introduction`, `methodology`, `results`, `discussion`, `conclusion`,
-  `technical_content`, `appendix`).
+- `section_type` is one of the model's trained categories — the 36-value
+  taxonomy in `app/section_types.py` (document structure such as `abstract` /
+  `methodology` / `appendix`, generic `body`, and newspaper/magazine regions
+  such as `news_article`, `feature_article`, `opinion`, `photo_caption`,
+  `stat_box`, `advertisement`, `masthead`, plus the fallback `other`). A value
+  outside the taxonomy is folded onto its canonical value (`article` →
+  `news_article`) or `other` and logged; it never fails the page or triggers a
+  retry (v0.3.14).
 - Bounding boxes are `[x0, y0, x1, y1]` on a 0–1000 grid normalized to the
   page image. `images` are figure crops cut from the hires page render using
   those boxes; `tables` carry both the crop and the model's `html` /

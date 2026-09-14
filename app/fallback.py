@@ -31,12 +31,12 @@ import os
 
 from PIL import Image
 
+from .section_types import SECTION_TYPES, canonical
 from .structured_page import (
     ZLIB_GATE_RATIO,
     parse_json_lenient,
     validate_schema,
     zlib_ratio,
-    SECTION_ENUM,
 )
 
 logger = logging.getLogger("shrew.fallback")
@@ -70,7 +70,7 @@ FALLBACK_SYSTEM = """You convert a single document page image into a structured 
 
 - metadata: {title, authors, organization, year, doc_type} — a field's value ONLY if it physically appears on this page; otherwise null. Never guess from context. authors is a list. year is a 4-digit string, only if a publication/revision date is printed. doc_type one of [Research Paper, Technical Manual, Technical Report, News Article, Proposal, Contract, Calculation Package, Planning Document, Acceptance Report, Regulation, Book], only if confidently inferable from this page; else null.
 - summary: a concise 1-2 sentence summary of what this page contains. Unlike metadata, you SYNTHESIZE this.
-- semantic_chunks: self-contained retrieval units in natural reading order — each {chunk_id ("c1","c2",...), title (short descriptive title you write), content (the transcribed text of the unit), keywords (3-6), section_type (one of: abstract, introduction, methodology, results, discussion, conclusion, technical_content, appendix)}. For two-column layouts, read the entire left column top-to-bottom, then the right column. Merge tiny fragments into coherent units; do NOT put table grids in chunk content.
+- semantic_chunks: self-contained retrieval units in natural reading order — each {chunk_id ("c1","c2",...), title (short descriptive title you write), content (the transcribed text of the unit), keywords (3-6), section_type (one of: __SECTION_TYPES__)}. For two-column layouts, read the entire left column top-to-bottom, then the right column. Merge tiny fragments into coherent units; do NOT put table grids in chunk content.
 - figures: one entry per genuine visual on the page; each {bbox: [x1,y1,x2,y2], caption: the printed caption line exactly, or "" if none}.
 - tables: one entry per genuine data grid; each {bbox: [x1,y1,x2,y2], html: a complete HTML <table>, caption: the printed caption or null}.
 
@@ -92,6 +92,10 @@ The bbox of a figure or table is [x1, y1, x2, y2] with coordinates normalized to
 General: skip page headers/footers (page numbers, running heads, repeated banners). If a sentence is cut off at the page boundary, include it as-is. If text is illegible, use [illegible] rather than guessing. Return ONLY the JSON object — no commentary, no fences.
 
 Leader lines — runs of repeated dots/periods/middots/dashes/underscores that connect a label to a page number or value (common in tables-of-contents, indices, lists-of-figures, exhibit/reference lists, form fields) — are DECORATIVE fill. NEVER reproduce the leader characters, even when leaders separate several columns within one row. Emit each entry as its meaningful parts joined by ' — ', dropping every leader run: e.g. '- Introduction — 14'; for a multi-column row '- Brown v. Piper — 91 U. S. 37 — 2'; for a form field 'Serial No. —'. Use just the label if no value follows."""
+# v0.3.14: the fallback model is offered the same taxonomy the primary model
+# was trained on (single source of truth: section_types.py), not the 8-value
+# v2 subset it used to be pinned to.
+FALLBACK_SYSTEM = FALLBACK_SYSTEM.replace("__SECTION_TYPES__", ", ".join(SECTION_TYPES))
 
 FALLBACK_USER = "Extract the structured document from this page image per the rules. Return only the JSON object."
 
@@ -137,9 +141,10 @@ def _coerce_five_key(sj: dict) -> dict:
             "title": c.get("title") if isinstance(c.get("title"), (str, type(None))) else None,
             "content": c["content"],
             "keywords": c.get("keywords") if isinstance(c.get("keywords"), list) else [],
-            "section_type": (c.get("section_type")
-                             if c.get("section_type") in SECTION_ENUM
-                             else "technical_content"),
+            # v0.3.14: fold onto the taxonomy like the primary path does
+            # (article→news_article, unknown→other) instead of flattening
+            # everything unfamiliar to technical_content
+            "section_type": canonical(c.get("section_type")),
         })
     def _bbox(b):
         if (isinstance(b, list) and len(b) == 4
