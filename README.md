@@ -455,6 +455,18 @@ Two behaviors keep a long conversion honest when things go wrong mid-run:
   the failure mode of a 3,500-page book on a 12 GB GPU: vLLM's engine OOMs and
   dies ~2/3 of the way through — size `--max-num-seqs` / `--gpu-memory-utilization`
   to your VRAM to avoid it.)
+- **Readiness fails closed after transport errors.** `/health` keeps a cached
+  readiness stamp so a merely *busy* backend never rejects queued work — but a
+  backend whose socket has gone away (a model-serve swap, an engine crash)
+  used to keep reading `"ok"` from that warm cache while every page came back
+  `transport_error`. After `VLM_TRANSPORT_TRIP` consecutive `transport_error`
+  pages (default `3`) readiness is *tripped*: the cache is bypassed, the socket
+  is re-probed, and if the probe fails `/health` returns **HTTP 503**
+  `{"status": "degraded", "transport_errors": {...}}` until a probe succeeds.
+  The `transport_errors` block (`consecutive`, `recent` within
+  `VLM_TRANSPORT_WINDOW_S`, `tripped`) is always present in `/health`. Still:
+  after swapping a model serve, prove it with a real `/v1/convert`, not the
+  health probe.
 - **Never skip a page.** A page that fails transcription while the backend is
   healthy (a repetition loop, or output that won't conform after retry) is
   **not** dropped — its rendered page image ships in `images[]` and as an

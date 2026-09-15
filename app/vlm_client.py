@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -46,9 +47,75 @@ READINESS_PROBE_INFERENCE = os.environ.get(
 # {key: {"ok": bool, "ts": float, "ever_ok": bool}}
 _readiness: dict[str, dict] = {}
 
+# v0.3.15 (GitLab #28): the fail-open admission above has a hole — once a backend
+# was EVER healthy, a fresh cache stamp keeps /health "ok" and admits work while the
+# backend socket is actually gone, so every page comes back transport_error and a
+# whole gate run reads as a 0% first pass. The pipeline reports its transport
+# outcomes here; after VLM_TRANSPORT_TRIP consecutive failures the readiness
+# entry is TRIPPED: the fast path is bypassed, the socket is re-probed, and a
+# failed probe fails CLOSED (ever_ok no longer admits) until a probe succeeds.
+VLM_TRANSPORT_TRIP = int(os.environ.get("VLM_TRANSPORT_TRIP", "3"))
+# Sliding window for the /health "recent transport errors" count.
+VLM_TRANSPORT_WINDOW_S = float(os.environ.get("VLM_TRANSPORT_WINDOW_S", "300"))
+# {key: {"consecutive": int, "recent": [ts...], "tripped": bool, "last_error_ts": float|None}}
+_transport: dict[str, dict] = {}
+_transport_lock = threading.Lock()
+
 
 def _readiness_key(base_url: str, model: str) -> str:
     return f"{base_url}::{model}"
+
+
+def _transport_entry(key: str) -> dict:
+    return _transport.setdefault(key, {"consecutive": 0, "recent": [], "tripped": False,
+                                       "last_error_ts": None})
+
+
+def note_transport_error(base_url: str, model: str) -> int:
+    """Record one transport_error page outcome. Returns the consecutive count."""
+    key = _readiness_key(base_url, model)
+    now = time.time()
+    with _transport_lock:
+        e = _transport_entry(key)
+        e["consecutive"] += 1
+        e["last_error_ts"] = now
+        e["recent"] = [t for t in e["recent"] if now - t < VLM_TRANSPORT_WINDOW_S] + [now]
+        if e["consecutive"] >= VLM_TRANSPORT_TRIP and not e["tripped"]:
+            e["tripped"] = True
+            logger.warning(
+                f"Readiness TRIPPED for {model}: {e['consecutive']} consecutive transport "
+                f"errors — failing closed until a socket probe succeeds")
+        return e["consecutive"]
+
+
+def note_transport_ok(base_url: str, model: str) -> None:
+    """Record a page that reached the backend and got a completion (any verdict)."""
+    key = _readiness_key(base_url, model)
+    with _transport_lock:
+        e = _transport_entry(key)
+        e["consecutive"] = 0
+        e["tripped"] = False
+
+
+def transport_snapshot(base_url: str, model: str) -> dict:
+    key = _readiness_key(base_url, model)
+    now = time.time()
+    with _transport_lock:
+        e = _transport_entry(key)
+        recent = [t for t in e["recent"] if now - t < VLM_TRANSPORT_WINDOW_S]
+        return {"consecutive": e["consecutive"], "recent": len(recent),
+                "window_s": VLM_TRANSPORT_WINDOW_S, "tripped": e["tripped"],
+                "trip_at": VLM_TRANSPORT_TRIP,
+                "last_error_age_s": (round(now - e["last_error_ts"], 1)
+                                     if e["last_error_ts"] else None)}
+
+
+def reset_transport(base_url: str | None = None, model: str | None = None) -> None:
+    with _transport_lock:
+        if base_url is None:
+            _transport.clear()
+        else:
+            _transport.pop(_readiness_key(base_url, model or ""), None)
 
 
 def _encode_image(image_path: Path | str, format: str = "png") -> str:
@@ -447,13 +514,23 @@ class VLMClient:
         """
         key = _readiness_key(self.base_url, self.model)
         entry = _readiness.get(key)
-        if entry and entry["ok"] and (time.time() - entry["ts"]) < READINESS_TTL_S:
+        tripped = transport_snapshot(self.base_url, self.model)["tripped"]
+        if not tripped and entry and entry["ok"] and (time.time() - entry["ts"]) < READINESS_TTL_S:
             return True
-        # Cache cold or stale — cheap reachability only, never inference.
+        # Cache cold or stale (or tripped) — cheap reachability only, never inference.
         verdict, _reason = self.probe(timeout=5, do_inference=False)
         if verdict == "ok":
+            if tripped:
+                logger.info(f"Readiness probe OK after transport trip for {self.model} — clearing trip")
+                note_transport_ok(self.base_url, self.model)
             return True
         if verdict == "hard":
+            return False
+        if tripped:
+            # The pipeline just saw consecutive transport failures AND the socket
+            # probe cannot confirm the backend: fail CLOSED (GitLab #28).
+            logger.warning(
+                f"Readiness probe failed while tripped ({_reason}) — {self.model} not ready")
             return False
         # soft: busy/transient. Admit if we have ever seen this backend healthy;
         # the pipeline's own per-page error handling covers a genuine outage.
@@ -472,8 +549,10 @@ class VLMClient:
         """Cached readiness for the /health endpoint (no live inference)."""
         key = _readiness_key(self.base_url, self.model)
         entry = _readiness.get(key)
+        transport = transport_snapshot(self.base_url, self.model)
         if not entry:
-            return {"ready": None, "age_s": None, "ever_ok": False}
+            return {"ready": None, "age_s": None, "ever_ok": False, "transport_errors": transport}
         return {"ready": entry["ok"],
                 "age_s": round(time.time() - entry["ts"], 1),
-                "ever_ok": entry["ever_ok"]}
+                "ever_ok": entry["ever_ok"],
+                "transport_errors": transport}

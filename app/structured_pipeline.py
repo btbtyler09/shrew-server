@@ -198,7 +198,9 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     try:
         result = _page_result(page_no, extract_page(model_png, client,
                                                     page_no=page_no), bucket)
+        _note_transport(client, ok=True)
     except Exception as e:
+        _note_transport(client, ok=False)
         result = _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
             "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
@@ -231,13 +233,28 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
 def _process_one_text_page(page_no: int, text: str, client) -> dict:
     """Run extraction on one paginated block of extracted text."""
     try:
-        return _page_result(page_no, extract_text_page(text, client,
-                                                       page_no=page_no))
+        r = _page_result(page_no, extract_text_page(text, client, page_no=page_no))
+        _note_transport(client, ok=True)
+        return r
     except Exception as e:
+        _note_transport(client, ok=False)
         return _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
             "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
         })
+
+
+def _note_transport(client, ok: bool) -> None:
+    """Feed the readiness trip (vlm_client, GitLab #28) with this page's transport
+    outcome. Advisory: a client without base_url/model (test fakes) is skipped."""
+    base_url = getattr(client, "base_url", None); model = getattr(client, "model", None)
+    if not base_url or model is None:
+        return
+    try:
+        from .vlm_client import note_transport_error, note_transport_ok
+        (note_transport_ok if ok else note_transport_error)(base_url, model)
+    except Exception:  # never let bookkeeping fail a page
+        pass
 
 
 def _count_rows(html: str) -> int:

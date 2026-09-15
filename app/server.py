@@ -301,7 +301,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.14",
+    version="0.3.15",
     lifespan=lifespan,
 )
 
@@ -406,11 +406,23 @@ async def health():
         shrew_vlm = VLMClient(base_url=_config.shrew_vllm_url, model="Qwen3.5-2B")
         if not shrew_vlm.is_ready():
             unavailable.append("shrew_vlm")
+    transport = vlm.readiness_snapshot().get("transport_errors", {})
     if unavailable:
+        # v0.3.15 (GitLab #28): a tripped readiness (consecutive transport errors
+        # AND a failed socket re-probe) is reported as "degraded" with the counts,
+        # so a dead backend behind a warm cache can no longer read as "ok".
+        if transport.get("tripped"):
+            return JSONResponse(
+                status_code=503,
+                content={"status": "degraded", "unavailable": unavailable,
+                         "detail": (f"model backend unreachable: {transport.get('consecutive')} "
+                                    "consecutive transport errors and the socket probe failed"),
+                         "transport_errors": transport, "concurrency": concurrency},
+            )
         return JSONResponse(
             status_code=503,
             content={"status": "unhealthy", "unavailable": unavailable,
-                     "concurrency": concurrency},
+                     "transport_errors": transport, "concurrency": concurrency},
         )
 
     # §5.3 empty-200 watch: consecutive blank completions returned with HTTP
@@ -444,6 +456,7 @@ async def health():
         },
         "fallback": _fallback_health(),
         "vlm_readiness": vlm.readiness_snapshot(),
+        "transport_errors": transport,
         "concurrency": concurrency,
     }
     if not capacity["ok"]:
