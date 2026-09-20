@@ -103,6 +103,9 @@ def _page_result(page_no: int, res: dict, bucket: str | None = None) -> dict:
         "schema_coerced": res.get("schema_coerced", False),
         "degenerate": res.get("degenerate", False),
         "repetition_abort": res.get("repetition_abort", False),
+        # Stopped by the JSON-close guard (top-level object closed, model still
+        # going). Carried as its own flag so gate_metrics can count it per doc.
+        "json_close": bool(((res.get("loop_guard") or {}).get("json_close") or {}).get("fired")),
         "bucket": bucket,
     }
 
@@ -748,6 +751,10 @@ def gate_metrics(page_results: list[dict]) -> dict:
         # the validated e4 distribution — downstream can filter on this.
         "fallback_pages": sum(1 for s in statuses if s == "fallback_ok"),
         "empty_completions": sum(1 for s in statuses if s == "empty_completion"),
+        # Pages whose stream was stopped by the JSON-close guard (top-level
+        # object closed, generation still going). Counted even when zero so a
+        # guard that never fires is visibly never firing, not silently absent.
+        "json_close_stops": sum(1 for pr in page_results if pr.get("json_close")),
         "overlong_failed": sum(1 for s in statuses if s == "overlong_failed"),
         "first_pass_fail_rate": round((n - sum(1 for s in statuses if s == "ok")) / n, 4) if n else 0.0,
         "degeneration_rate": round(degenerate / n, 4) if n else 0.0,

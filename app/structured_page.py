@@ -522,6 +522,147 @@ class RepetitionGuard:
         }
 
 
+# Stop-at-JSON-close (Tyler, 2026-09-20). Belt and braces against "close the
+# top-level object, then keep generating until the cap" — a case that is
+# THEORETICAL (unobserved in the paired eval, no reward gradient toward it), so
+# this is cheap insurance, not a fix. It cannot touch the loop failure, which
+# happens INSIDE the JSON before it ever closes: on those pages there is no
+# closing brace to stop on and the repetition guard above stays the instrument.
+# Serving path only — never the RL rollouts (cutting completions there hid loops
+# from the penalty and selected for early-stoppers, the leg-1 rollback) and never
+# screen_dense.py (the eval contract). Deliberately NOT grammar-constrained
+# decoding, which changes the sampled distribution and costs latency on every
+# token for a guard that should almost never fire. Kill switch:
+# SHREW_JSON_CLOSE_GUARD=0.
+JSON_CLOSE = "json_close"
+JSON_CLOSE_GUARD_ENABLED = os.environ.get("SHREW_JSON_CLOSE_GUARD", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+
+
+class JsonCloseGuard:
+    """Streaming brace-depth counter; fires when the model keeps generating
+    AFTER the top-level object has closed.
+
+    Tracks string state and escapes so a ``}`` inside a string value does not
+    count. Depth counts both ``{}`` and ``[]``; counting arms at the first
+    opener and the guard is inert if that opener was ``[`` (a top-level array
+    is not the contract — the parse gate owns it). When depth returns to 0 the
+    close is RECORDED (``closed``, ``close_index`` = length of the accumulated
+    text through the closing brace) but the stream is not aborted: a model
+    that stops on its own produces its natural ``stop`` one delta later, so a
+    firing guard means exactly one thing — non-whitespace content arrived
+    after the close. That is what keeps the ``json_close`` count informative:
+    it is the count of the case the guard exists for, not of every page.
+    """
+
+    def __init__(self):
+        self.depth = 0
+        self.armed = False          # first opener seen
+        self.inert = False          # first opener was `[` -> never fire
+        self.in_string = False
+        self.escape = False
+        self.closed = False         # top-level object has closed
+        self.close_index = 0        # accumulated length through the closing brace
+        self.fired = False          # content arrived after the close
+        self.trailing = 0           # non-dropped chars seen after the close at fire time
+        self._seen = 0              # chars consumed so far
+
+    def __call__(self, chunk: str, accumulated: str):
+        if self.fired or self.inert:
+            return None
+        base = self._seen
+        self._seen += len(chunk)
+        for i, ch in enumerate(chunk):
+            if self.closed:
+                if not ch.isspace():
+                    self.fired = True
+                    self.trailing = len(accumulated) - self.close_index
+                    return JSON_CLOSE
+                continue
+            if self.in_string:
+                if self.escape:
+                    self.escape = False
+                elif ch == "\\":
+                    self.escape = True
+                elif ch == '"':
+                    self.in_string = False
+                continue
+            if ch == '"':
+                self.in_string = True
+            elif ch in "{[":
+                if not self.armed:
+                    self.armed = True
+                    if ch == "[":
+                        self.inert = True
+                        return None
+                self.depth += 1
+            elif ch in "}]":
+                if not self.armed:
+                    continue        # stray closer before any opener: not ours
+                self.depth -= 1
+                if self.depth == 0:
+                    self.closed = True
+                    self.close_index = base + i + 1
+        return None
+
+    def stats(self) -> dict:
+        return {
+            "fired": self.fired,
+            "closed": self.closed,
+            "close_chars": self.close_index,
+            "trailing_chars_dropped": self.trailing,
+        }
+
+
+class StreamGuards:
+    """Composite ``on_delta``: the JSON-close guard first (cheap, exact), then
+    the repetition guard. On a never-closing loop the first never fires and the
+    second behaves exactly as before; ``stats()`` keeps the repetition guard's
+    shape and adds a ``json_close`` block so a fired — or never-fired — close
+    guard is countable per page.
+    """
+
+    def __init__(self, repetition: "RepetitionGuard", json_close: "JsonCloseGuard | None"):
+        self.repetition = repetition
+        self.json_close = json_close
+
+    def __call__(self, chunk: str, accumulated: str):
+        if self.json_close is not None:
+            reason = self.json_close(chunk, accumulated)
+            if reason:
+                context = ""
+                if self.repetition.page_no is not None:
+                    context = f"Page {self.repetition.page_no}"
+                    if self.repetition.attempt:
+                        context += f" ({self.repetition.attempt})"
+                    context += ": "
+                logger.warning("%sjson_close at %d chars (%d trailing chars dropped)",
+                               context, self.json_close.close_index, self.json_close.trailing)
+                return reason
+        return self.repetition(chunk, accumulated)
+
+    # RepetitionGuard attributes the gate and the ladder read directly.
+    @property
+    def ratio(self):
+        return self.repetition.ratio
+
+    @property
+    def position(self):
+        return self.repetition.position
+
+    @property
+    def fired(self):
+        return self.repetition.fired
+
+    def stats(self) -> dict:
+        out = self.repetition.stats()
+        out["json_close"] = (self.json_close.stats() if self.json_close is not None
+                             else {"fired": False, "closed": False, "close_chars": 0,
+                                   "trailing_chars_dropped": 0})
+        return out
+
+
 # --------------------------------------------------------------------------- message construction
 
 
@@ -732,14 +873,21 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
         choice = result["choices"][0]
         return choice["message"].get("content") or "", choice.get("finish_reason"), None
 
-    guard = RepetitionGuard(page_no=page_no, attempt=attempt)
+    rep = RepetitionGuard(page_no=page_no, attempt=attempt)
+    guard = StreamGuards(rep, JsonCloseGuard()) if JSON_CLOSE_GUARD_ENABLED else rep
     result = client.chat_completion_stream(
         messages, max_tokens=max_tokens, temperature=temperature,
         extra_params=extra_params, timeout=timeout, on_delta=guard,
         wall_clock_s=STREAM_WALL_CLOCK_S,
     )
     choice = result["choices"][0]
-    return choice["message"].get("content") or "", choice.get("finish_reason"), guard
+    text = choice["message"].get("content") or ""
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == JSON_CLOSE and isinstance(guard, StreamGuards):
+        # The abort lands mid-chunk: keep the document, drop what followed the
+        # closing brace in that same chunk. The object itself is untouched.
+        text = text[:guard.json_close.close_index]
+    return text, finish_reason, guard
 
 
 def _content_chars(sj: dict) -> int:
