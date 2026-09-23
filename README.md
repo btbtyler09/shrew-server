@@ -205,6 +205,8 @@ Configure in `docker/.env` or pass with `-e`:
 | `LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 | `SHREW_DOC_SUMMARY_MAX_CHARS` | Hard budget for the document `summary`, in **characters** (structured mode) | `4000` |
 | `SHREW_DOC_SUMMARY_MODE` | How a multi-page document's `summary` is built (structured mode) — see below | `deterministic` |
+| `SHREW_DOC_SUMMARY_BLOCK_CHARS` | `contract_sos` block size in characters (the model's trained text-page bound; larger values are clamped to the context capacity and logged) | `11000` |
+| `SHREW_DOC_SUMMARY_CONCURRENCY` | `contract_sos` block calls in flight per level | `4` |
 
 **Document summary (structured mode).** Each page's model call returns a page
 summary; the document `summary` is built from them and is always bounded by
@@ -216,10 +218,22 @@ concatenation of page summaries; treat `null` as "no summary".
 | `SHREW_DOC_SUMMARY_MODE` | What it does | Model calls |
 |---|---|---|
 | `deterministic` (default) | First page's summary, then the pages the model labelled abstract / introduction / conclusion; near-duplicate sentences dropped | 0 |
-| `contract_sos` | The page summaries go through the model's normal text-page contract; its `summary` key is used | 1 |
+| `contract_sos` | Hierarchical: page summaries in blocks of ≤ 11,000 chars through the model's normal text-page contract, then the block summaries the same way, up to one root summary | 1 per ~35 pages, + a few (≈ 85 for 3,000 pages) |
 | `summary_of_summaries` | A free-form summary prompt over the page summaries | 1 |
 | `model` | The legacy pipeline's free-form summary prompt over the first ~8k tokens of the document | 1 |
 | `off` | `summary` is `null` for multi-page documents | 0 |
+
+**Per request.** `POST /v1/convert` and `POST /v1/convert/stream` accept two
+optional form fields that override the environment for that request only:
+`summary_mode` (one of the modes above) and `summary_max_chars` (200–20000).
+An invalid value returns HTTP 400. Omit them to use the server's settings —
+e.g. `deterministic` for bulk ingests and `summary_mode=contract_sos` for large
+reference books, without a restart:
+
+```bash
+curl -X POST localhost:8080/v1/convert -F file=@handbook.pdf \
+     -F summary_mode=contract_sos -F summary_max_chars=3000
+```
 
 With shrew-ocr-preview, `summary_of_summaries` and `model` return `null`: the
 model answers free-form prompts in its structured JSON contract. They are

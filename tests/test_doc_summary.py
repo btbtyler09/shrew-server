@@ -340,3 +340,191 @@ def test_contract_sos_blocking_client_parses_the_summary_key(monkeypatch):
     doc = _big_doc(n_pages=10)
     report = ds.apply_document_summary(doc, "", _ReplyClient(_contract_answer("A bounded abstract.")))
     assert report["status"] == "ok" and doc["doc_summary"] == "A bounded abstract."
+
+
+# ── contract_sos is hierarchical: blocks -> level summaries -> one root ─────
+
+class _TreeClient:
+    """Thread-safe streaming mock. Every call answers with a 5-key contract
+    whose summary is ~360 chars and whose chunk list is long, so an early stop
+    is observable. fail_every=N makes every Nth call return a null summary."""
+    model = "shrew-ocr-preview"
+
+    def __init__(self, fail_every=0, fail_root=False):
+        import threading
+        self.lock = threading.Lock()
+        self.n = 0
+        self.inputs = []
+        self.generated = []
+        self.fail_every, self.fail_root = fail_every, fail_root
+
+    def chat_completion_stream(self, messages, *, max_tokens, temperature,
+                               extra_params, on_delta, wall_clock_s, timeout=None):
+        text = messages[1]["content"]
+        with self.lock:
+            self.n += 1
+            k = self.n
+            self.inputs.append(text)
+        is_root_like = text.count("\n") < 10 and "Block" in text   # the root sees a few block summaries
+        summ = (None if (self.fail_every and k % self.fail_every == 0) or
+                (self.fail_root and is_root_like) else
+                f"Block {k} summary: " + " ".join(f"topic{k}x{i}" for i in range(45)) + ".")
+        answer = _contract_answer(summ)
+        acc, reason = "", None
+        for i in range(0, len(answer), 40):
+            acc += answer[i:i + 40]
+            reason = on_delta(answer[i:i + 40], acc)
+            if reason:
+                break
+        with self.lock:
+            self.generated.append((len(acc), len(answer)))
+        return {"choices": [{"message": {"role": "assistant", "content": acc},
+                             "finish_reason": reason or "stop"}]}
+
+
+def _pages_3000():
+    return "\n".join(
+        f"Page {n} summary: " + " ".join(f"w{n}x{i}" for i in range(32)) + "."   # ~315 chars, the measured ratio
+        for n in range(1, 3001))
+
+
+def test_contract_sos_tree_on_3000_page_summaries():
+    text = _pages_3000()
+    client = _TreeClient()
+    s, report = ds.summarize_via_contract(text, client, doc_id="book")
+    shape = [(l["level"], l["inputs"], l["calls"], l["root"]) for l in report["levels"]]
+    from app.structured_page import TEXT_PAGE_MAX_CHARS
+    assert all(len(i) <= TEXT_PAGE_MAX_CHARS for i in client.inputs)   # every call in distribution
+    assert shape[0][1] == 3000 and 80 <= shape[0][2] <= 95         # ~86 level-0 block calls
+    assert shape[-1][2] == 1 and shape[-1][3] is True               # exactly one root call
+    assert 2 <= len(shape) <= 3
+    assert report["calls"] == sum(l["calls"] for l in report["levels"]) == client.n
+    assert report["status"] == "ok" and s.startswith("Block ") and len(s) <= ds.DOC_SUMMARY_MAX_CHARS
+    # every call stopped right after the summary key
+    assert all(g < total / 10 for g, total in client.generated)
+
+
+def test_contract_sos_drops_a_failed_block_and_logs(caplog):
+    client = _TreeClient(fail_every=10)
+    with caplog.at_level(logging.WARNING, logger="app.doc_summary"):
+        s, report = ds.summarize_via_contract(_pages_3000(), client, doc_id="book")
+    assert report["status"] == "ok" and s
+    assert report["levels"][0]["dropped"] >= 8
+    assert any("block dropped" in r.getMessage() for r in caplog.records)
+
+
+def test_contract_sos_root_failure_is_null(caplog):
+    client = _TreeClient(fail_root=True)
+    with caplog.at_level(logging.ERROR, logger="app.doc_summary"):
+        s, report = ds.summarize_via_contract(_pages_3000(), client, doc_id="book")
+    assert s is None and report["status"] == "failed" and "root call failed" in report["error"]
+    assert any("summary: null" in r.getMessage() for r in caplog.records)
+
+
+def test_contract_sos_single_block_is_one_call():
+    client = _TreeClient()
+    text = "\n".join(f"Page {n} summary about item {n}." for n in range(1, 19))
+    s, report = ds.summarize_via_contract(text, client)
+    assert client.n == 1 and report["levels"] == [
+        {**report["levels"][0], "level": 0, "inputs": 18, "calls": 1, "root": True}]
+
+
+# ── modes as env flags + per-request override on /v1/convert ────────────────
+
+def test_validators_share_the_enum_and_limits():
+    assert ds.validate_mode(" Contract_SOS ") == "contract_sos"
+    assert ds.validate_max_chars("1500") == 1500
+    for bad in ("bogus", "", "join"):
+        with pytest.raises(ValueError):
+            ds.validate_mode(bad)
+    for bad in ("abc", 5, 199, 20001, None):
+        with pytest.raises(ValueError):
+            ds.validate_max_chars(bad)
+
+
+def test_invalid_env_value_falls_back_to_default_and_logs(monkeypatch, caplog):
+    monkeypatch.setenv("SHREW_DOC_SUMMARY_MODE", "concat")
+    with caplog.at_level(logging.ERROR, logger="app.doc_summary"):
+        assert ds._env("SHREW_DOC_SUMMARY_MODE", "deterministic", ds.validate_mode) == "deterministic"
+    assert any("ignored" in r.getMessage() for r in caplog.records)
+
+
+def test_block_chars_env(monkeypatch):
+    from app.structured_page import TEXT_PAGE_MAX_CHARS, context_limit_chars
+    monkeypatch.delenv("SHREW_DOC_SUMMARY_BLOCK_CHARS", raising=False)
+    assert ds._block_chars() == TEXT_PAGE_MAX_CHARS == 11000
+    monkeypatch.setenv("SHREW_DOC_SUMMARY_BLOCK_CHARS", "6000")
+    assert ds._block_chars() == 6000
+    monkeypatch.setenv("SHREW_DOC_SUMMARY_BLOCK_CHARS", "99")
+    assert ds._block_chars() == 11000                         # invalid -> default
+    monkeypatch.setenv("SHREW_DOC_SUMMARY_BLOCK_CHARS", "10000000")
+    assert ds._block_chars() == context_limit_chars()          # clamped to capacity
+    # and the tree actually uses it: 6,000-char blocks -> roughly twice the level-0 calls
+    monkeypatch.setenv("SHREW_DOC_SUMMARY_BLOCK_CHARS", "6000")
+    s, report = ds.summarize_via_contract(_pages_3000(), _TreeClient())
+    assert report["block_chars"] == 6000 and report["levels"][0]["calls"] >= 140
+
+
+def test_per_call_mode_overrides_env(monkeypatch):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "deterministic")
+    doc = _big_doc(n_pages=10)
+    report = ds.apply_document_summary(doc, "", _NoCallClient(), mode="off", max_chars=1000)
+    assert report["status"] == "disabled" and doc["doc_summary"] is None
+
+
+@pytest.fixture
+def convert_client(tmp_path, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi.testclient import TestClient
+    import app.server as server
+    from app.models import PipelineResult
+    monkeypatch.setenv("SHREW_CONCURRENCY_DIR", str(tmp_path / "leases"))
+    monkeypatch.setenv("SHREW_TELEMETRY_DIR", str(tmp_path / "tel"))
+    monkeypatch.setattr(server, "_config", server.ServerConfig(
+        vlm_url="http://fake", vlm_model="shrew-ocr-preview", workers=1,
+        pipeline_concurrency=1, vlm_concurrency=4))
+    monkeypatch.setattr(server, "_vlm_pool", ThreadPoolExecutor(max_workers=1))
+    monkeypatch.setattr(server, "_pipeline_gate", threading.Semaphore(1))
+    seen = {}
+
+    def fake_pipeline(path, out, cfg, **kw):
+        seen.update(kw)
+        return PipelineResult("# doc", {"metadata": {}, "summary": "s", "semantic_chunks": [],
+                                        "tables": [], "images": []}, {"gates": {}})
+    monkeypatch.setattr(server, "run_structured_pipeline", fake_pipeline)
+    # the public build gates /v1/convert on inference readiness; stub the probe
+    from tests.test_server_structured import FakeVLMClient
+    monkeypatch.setattr("app.server.VLMClient", FakeVLMClient)
+    return TestClient(server.app), seen
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/convert", "/v1/convert/stream"])
+@pytest.mark.parametrize("field, value", [
+    ("summary_mode", "concatenate"),
+    ("summary_max_chars", "abc"),
+    ("summary_max_chars", "50"),
+    ("summary_max_chars", "1000000"),
+])
+def test_invalid_summary_override_is_400(convert_client, endpoint, field, value):
+    client, seen = convert_client
+    r = client.post(endpoint, files={"file": ("a.txt", b"hello world\n", "text/plain")},
+                    data={field: value})
+    assert r.status_code == 400, r.text
+    assert "summary" in r.json()["detail"]
+    assert not seen                                   # rejected before any pipeline work
+
+
+def test_summary_override_reaches_the_pipeline(convert_client):
+    client, seen = convert_client
+    r = client.post("/v1/convert", files={"file": ("a.txt", b"hello world\n", "text/plain")},
+                    data={"summary_mode": "contract_sos", "summary_max_chars": "1500"})
+    assert r.status_code == 200, r.text
+    assert seen["summary_mode"] == "contract_sos" and seen["summary_max_chars"] == 1500
+
+
+def test_no_override_passes_none_so_env_default_applies(convert_client):
+    client, seen = convert_client
+    r = client.post("/v1/convert", files={"file": ("a.txt", b"hello world\n", "text/plain")})
+    assert r.status_code == 200, r.text
+    assert seen["summary_mode"] is None and seen["summary_max_chars"] is None

@@ -111,7 +111,7 @@ class _BlockingPipeline:
         self.entered = threading.Event()
 
     def __call__(self, tmp_path, output_dir, config, progress=None, raw=False,
-                 client=None, trace=None):
+                 client=None, trace=None, **kwargs):   # **kwargs: summary_mode/summary_max_chars
         self.entered.set()
         while not self.release.wait(timeout=0.05):
             if progress is not None and progress.is_cancelled():

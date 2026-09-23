@@ -905,7 +905,8 @@ def _trace_page(trace, page_no, pr, ms):
 
 
 def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
-                             client=None, raw=False, trace=None) -> PipelineResult:
+                             client=None, raw=False, trace=None,
+                             summary_mode=None, summary_max_chars=None) -> PipelineResult:
     """Turn an uploaded file into a shrew-ocr-preview PipelineResult.
 
     Image modality (pdf/image/office):
@@ -1076,7 +1077,8 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     # the first ~8k-token section; any failure yields summary: null, never a
     # concatenation. Single-page documents are untouched.
     trace.phase("doc_summary")
-    doc_summary_report = apply_document_summary(doc, synthesize_markdown(doc), client)
+    doc_summary_report = apply_document_summary(doc, synthesize_markdown(doc), client,
+                                                mode=summary_mode, max_chars=summary_max_chars)
 
     trace.phase("json_build")
     if raw:

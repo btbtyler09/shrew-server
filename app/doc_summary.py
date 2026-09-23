@@ -35,12 +35,14 @@ SHREW_DOC_SUMMARY_MODE:
   model over the page summaries in page order (the whole document's coverage,
   cut at ~8,000 tokens), the legacy prompt plus a sentence saying the input
   is per-page summaries of one document.
-* ``contract_sos`` — ONE call through the model's NORMAL text-page contract
-  (sentinel system prompt, the joined page summaries as the user turn, capped
-  at the text arm's trained 11,000-char bound, structured_page decode params);
-  the returned ``summary`` key is the abstract, the stream is stopped as soon
-  as that key closes and the rest is discarded. Stays inside what the served
-  OCR model was trained to do. NOT yet measured on a live serve.
+* ``contract_sos`` — HIERARCHICAL, through the model's NORMAL text-page
+  contract (sentinel system prompt, raw text user turn, structured_page decode
+  params), taking each call's ``summary`` key and stopping the stream as soon
+  as that key closes. Page summaries are packed in page order into blocks of
+  <= 11,000 chars (the text arm's trained bound, ~35 pages) -> one call each;
+  the block summaries are packed and summarized again until one root call
+  remains. ~90 short calls for a 3,000-page book; one call when everything
+  fits one block. Stays inside what the served OCR model was trained to do.
 * ``off`` — summary is None for multi-page documents.
 
 MEASURED 2026-09-23 (E6 on an MI100): with the served Granite OCR model
@@ -76,6 +78,10 @@ Knobs:
         CJK) — well inside a 10,240-token rerank pair with room for the query.
     SHREW_DOC_SUMMARY_MODE       "deterministic" (default) | "contract_sos"
                                  | "summary_of_summaries" | "model" | "off".
+    SHREW_DOC_SUMMARY_BLOCK_CHARS  contract_sos block size (default 11,000).
+    Per request, /v1/convert and /v1/convert/stream accept ``summary_mode`` and
+    ``summary_max_chars`` (same enum, 200-20,000 chars; invalid -> HTTP 400).
+    An invalid env value is logged and the default is used.
 """
 from __future__ import annotations
 
@@ -84,16 +90,84 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from .generation import get_generation_params
 from .structured import _load_pipeline, _section_document
 from .structured_page import (MAX_TOKENS, STREAM_WALL_CLOCK_S, TEXT_PAGE_MAX_CHARS, RepetitionGuard,
+                              context_limit_chars,
                               build_text_messages, is_degenerate, parse_json_lenient)
 
 logger = logging.getLogger(__name__)
 
-DOC_SUMMARY_MAX_CHARS = int(os.environ.get("SHREW_DOC_SUMMARY_MAX_CHARS", "4000"))
-DOC_SUMMARY_MODE = os.environ.get("SHREW_DOC_SUMMARY_MODE", "deterministic").strip().lower()
+MODES = ("deterministic", "contract_sos", "summary_of_summaries", "model", "off")
+# Bounds for SHREW_DOC_SUMMARY_MAX_CHARS and the per-request summary_max_chars.
+# The floor keeps at least a real sentence or two; the ceiling keeps the field
+# a bounded abstract (20,000 chars is ~5k English tokens, still inside a
+# 10,240-token rerank pair) — larger than that is the bug this module fixes.
+MIN_MAX_CHARS, MAX_MAX_CHARS = 200, 20000
+
+
+def validate_mode(value) -> str:
+    v = str(value).strip().lower()
+    if v not in MODES:
+        raise ValueError(f"summary mode must be one of {', '.join(MODES)}; got {value!r}")
+    return v
+
+
+def validate_max_chars(value) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"summary max chars must be an integer; got {value!r}") from None
+    if not MIN_MAX_CHARS <= v <= MAX_MAX_CHARS:
+        raise ValueError(f"summary max chars must be between {MIN_MAX_CHARS} and "
+                         f"{MAX_MAX_CHARS}; got {v}")
+    return v
+
+
+def _env(name: str, default, validate):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return validate(raw)
+    except ValueError as e:
+        logger.error("%s ignored (%s) — using %r", name, e, default)
+        return default
+
+
+DOC_SUMMARY_MAX_CHARS = _env("SHREW_DOC_SUMMARY_MAX_CHARS", 4000, validate_max_chars)
+DOC_SUMMARY_MODE = _env("SHREW_DOC_SUMMARY_MODE", "deterministic", validate_mode)
+# contract_sos: block calls in flight per level (the VLM gate still bounds totals).
+DOC_SUMMARY_CONCURRENCY = int(os.environ.get("SHREW_DOC_SUMMARY_CONCURRENCY", "4"))
+
+
+def _block_chars() -> int:
+    """contract_sos block size (SHREW_DOC_SUMMARY_BLOCK_CHARS, default the text
+    arm's trained 11,000-char bound). Clamped to the hard context capacity; a
+    value above the trained bound is allowed but logged, since it leaves the
+    distribution the model was trained on."""
+    raw = os.environ.get("SHREW_DOC_SUMMARY_BLOCK_CHARS")
+    if raw is None:
+        return TEXT_PAGE_MAX_CHARS
+    try:
+        v = int(raw)
+        if v < 1000:
+            raise ValueError("below 1000")
+    except ValueError as e:
+        logger.error("SHREW_DOC_SUMMARY_BLOCK_CHARS=%r ignored (%s) — using %d",
+                     raw, e, TEXT_PAGE_MAX_CHARS)
+        return TEXT_PAGE_MAX_CHARS
+    cap = context_limit_chars()
+    if v > cap:
+        logger.error("SHREW_DOC_SUMMARY_BLOCK_CHARS=%d exceeds the context capacity; "
+                     "clamped to %d", v, cap)
+        return cap
+    if v > TEXT_PAGE_MAX_CHARS:
+        logger.warning("SHREW_DOC_SUMMARY_BLOCK_CHARS=%d is above the text arm's trained "
+                       "%d-char bound", v, TEXT_PAGE_MAX_CHARS)
+    return v
 # Overview section types, in selection priority after the first page.
 OVERVIEW_SECTION_TYPES = ("abstract", "introduction", "conclusion")
 # The legacy step's input window: the first ~8,000 approx-tokens of markdown.
@@ -381,39 +455,9 @@ class _SummaryCapture:
         return self.repetition(chunk, accumulated)
 
 
-def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None = None,
-                           doc_id: str | None = None) -> tuple[str | None, dict]:
-    """Mode ``contract_sos``: the joined page summaries go through the model's
-    NORMAL text-page contract (sentinel system prompt, the raw text as the user
-    turn, the structured_page decode params) and the returned ``summary`` key
-    is the document abstract; the rest of the output is discarded.
-
-    Input bound: TEXT_PAGE_MAX_CHARS (11,000 chars, cut at a line boundary) —
-    the text arm's trained DISTRIBUTION bound, deliberately smaller than the
-    ~8k-token window of the other model modes: this mode exists to stay inside
-    what the model was trained on.
-    """
-    budget = DOC_SUMMARY_MAX_CHARS if max_chars is None else max_chars
-    report = {"status": None, "mode": "contract_sos", "chars": 0, "max_chars": budget,
-              "input_chars": 0, "output_chars": 0, "calls": 1, "seconds": 0.0, "error": None}
-
-    def fail(reason: str):
-        report["status"] = "failed"
-        report["error"] = reason
-        logger.error("doc summary FAILED for %s: %s — returning summary: null "
-                     "(the per-page summaries are NOT concatenated in its place)",
-                     doc_id or "document", reason)
-        return None, report
-
-    text = page_summaries
-    if len(text) > TEXT_PAGE_MAX_CHARS:
-        cut = text.rfind("\n", 0, TEXT_PAGE_MAX_CHARS)
-        text = text[:cut if cut > 0 else TEXT_PAGE_MAX_CHARS]
-    report["input_chars"] = len(text)
-    if not text.strip():
-        report["calls"] = 0
-        return fail("no page summaries to summarize")
-
+def _contract_call(text: str, client) -> tuple[str | None, dict]:
+    """ONE text-page-contract call over ``text``; returns (summary_or_None, info)."""
+    info = {"input_chars": len(text), "output_chars": 0, "seconds": 0.0, "error": None}
     messages = build_text_messages(text)
     params = get_generation_params(client.model, "structured_page")
     t0 = time.time()
@@ -426,16 +470,16 @@ def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None
                 wall_clock_s=STREAM_WALL_CLOCK_S)
             choice = result["choices"][0]
             out = choice["message"].get("content") or ""
-            finish = choice.get("finish_reason")
             if capture.found:
                 value = capture.value
             else:
                 parsed, _ = parse_json_lenient(out)
-                value = parsed.get("summary") if isinstance(parsed, dict) else None
-                if parsed is None:
-                    report["seconds"] = round(time.time() - t0, 2)
-                    report["output_chars"] = len(out)
-                    return fail(f"no summary key in the contract output (finish={finish})")
+                if not isinstance(parsed, dict):
+                    info["error"] = (f"no summary key in the contract output "
+                                     f"(finish={choice.get('finish_reason')})")
+                    value = None
+                else:
+                    value = parsed.get("summary")
         else:
             result = client.chat_completion(
                 messages, max_tokens=MAX_TOKENS, temperature=params["temperature"],
@@ -443,30 +487,133 @@ def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None
             out = result["choices"][0]["message"].get("content") or ""
             parsed, _ = parse_json_lenient(out)
             if not isinstance(parsed, dict):
-                report["seconds"] = round(time.time() - t0, 2)
-                report["output_chars"] = len(out)
-                return fail("contract output did not parse")
-            value = parsed.get("summary")
+                info["error"] = "contract output did not parse"
+                value = None
+            else:
+                value = parsed.get("summary")
     except Exception as e:  # transport, HTTP, malformed response
-        report["seconds"] = round(time.time() - t0, 2)
-        return fail(f"{type(e).__name__}: {e}")
-    report["seconds"] = round(time.time() - t0, 2)
-    report["output_chars"] = len(out)
-
+        info["seconds"] = round(time.time() - t0, 2)
+        info["error"] = f"{type(e).__name__}: {e}"
+        return None, info
+    info["seconds"] = round(time.time() - t0, 2)
+    info["output_chars"] = len(out)
+    if info["error"]:
+        return None, info
     if not isinstance(value, str) or not value.strip():
-        return fail("the contract's summary key was empty or null")
+        info["error"] = "the contract's summary key was empty or null"
+        return None, info
     value = value.strip()
     if is_degenerate(value):
-        return fail("degenerate (repetitive) summary")
+        info["error"] = "degenerate (repetitive) summary"
+        return None, info
+    return value, info
+
+
+def _pack_blocks(items: list[str], cap: int) -> list[str]:
+    """Pack ``items`` in order into newline-joined blocks of at most ``cap``
+    chars. An item longer than ``cap`` on its own is cut at a line/char bound
+    (page summaries are ~300 chars; this only guards a pathological one)."""
+    blocks, cur, size = [], [], 0
+    for it in items:
+        it = it[:cap]
+        add = len(it) + (1 if cur else 0)
+        if cur and size + add > cap:
+            blocks.append("\n".join(cur))
+            cur, size = [], 0
+            add = len(it)
+        cur.append(it)
+        size += add
+    if cur:
+        blocks.append("\n".join(cur))
+    return blocks
+
+
+def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None = None,
+                           doc_id: str | None = None) -> tuple[str | None, dict]:
+    """Mode ``contract_sos``: HIERARCHICAL summary through the model's NORMAL
+    text-page contract (sentinel system prompt, raw text user turn,
+    structured_page decode params); each call's ``summary`` key is taken and
+    the stream stops as soon as that key closes.
+
+    Level 0: page summaries, in page order, packed into blocks of at most
+    TEXT_PAGE_MAX_CHARS (11,000 chars — the text arm's trained distribution
+    bound; ~35 page summaries) -> one call per block. Each further level packs
+    the previous level's summaries the same way, until one block remains; the
+    call over that block is the ROOT, cut to the char budget on a sentence
+    boundary. A document whose page summaries fit one block is a single call.
+    A failed non-root call drops that block (logged at WARNING and counted); a
+    level where every call fails, or a failed root call, returns None.
+    """
+    budget = DOC_SUMMARY_MAX_CHARS if max_chars is None else max_chars
+    report = {"status": None, "mode": "contract_sos", "chars": 0, "max_chars": budget,
+              "calls": 0, "seconds": 0.0, "levels": [], "error": None}
+    t0 = time.time()
+
+    def fail(reason: str):
+        report["status"] = "failed"
+        report["error"] = reason
+        report["seconds"] = round(time.time() - t0, 2)
+        logger.error("doc summary FAILED for %s: %s — returning summary: null "
+                     "(the per-page summaries are NOT concatenated in its place)",
+                     doc_id or "document", reason)
+        return None, report
+
+    items = [ln.strip() for ln in page_summaries.split("\n") if ln.strip()]
+    if not items:
+        return fail("no page summaries to summarize")
+    tree = [] if os.environ.get("SHREW_DOC_SUMMARY_DEBUG") == "1" else None
+    block_chars = _block_chars()
+    report["block_chars"] = block_chars
+    level = 0
+    while True:
+        blocks = _pack_blocks(items, block_chars)
+        is_root = len(blocks) == 1
+        workers = max(1, min(DOC_SUMMARY_CONCURRENCY, len(blocks)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(lambda b: _contract_call(b, client), blocks))
+        report["calls"] += len(blocks)
+        ok = [v for v, _ in results if v is not None]
+        errors = [info["error"] for v, info in results if v is None]
+        lvl = {"level": level, "inputs": len(items), "calls": len(blocks), "ok": len(ok),
+               "dropped": len(errors), "root": is_root,
+               "seconds": round(sum(i["seconds"] for _, i in results), 2)}
+        report["levels"].append(lvl)
+        if tree is not None:
+            tree.append([{"input_chars": i["input_chars"], "summary": v, "error": i["error"]}
+                         for v, i in results])
+        for e in errors:
+            if not is_root:
+                logger.warning("doc summary for %s: level-%d block dropped: %s",
+                               doc_id or "document", level, e)
+        if is_root:
+            if not ok:
+                if tree is not None:
+                    report["tree"] = tree
+                return fail(f"root call failed: {errors[0]}")
+            value = ok[0]
+            break
+        if not ok:
+            if tree is not None:
+                report["tree"] = tree
+            return fail(f"every level-{level} call failed (first: {errors[0]})")
+        items = ok
+        level += 1
+        if level > 6:  # each level shrinks ~30x; 6 levels cover any real document
+            return fail("summary tree did not converge")
+
+    if tree is not None:
+        report["tree"] = tree
+    report["seconds"] = round(time.time() - t0, 2)
     cut = _cut_to_budget(value, budget)
     if cut is None:
-        return fail(f"no sentence of the {len(value)}-char summary fits the "
+        return fail(f"no sentence of the {len(value)}-char root summary fits the "
                     f"{budget}-char budget (SHREW_DOC_SUMMARY_MAX_CHARS)")
     report["status"] = "ok"
     report["chars"] = len(cut)
-    logger.info("doc summary (contract_sos) for %s: %d chars from %d chars of page "
-                "summaries; stopped after %d output chars in %.1fs",
-                doc_id or "document", len(cut), len(text), len(out), report["seconds"])
+    logger.info("doc summary (contract_sos) for %s: %d chars; tree %s; %d calls in %.1fs",
+                doc_id or "document", len(cut),
+                "/".join(str(l["calls"]) for l in report["levels"]), report["calls"],
+                report["seconds"])
     return cut, report
 
 
@@ -478,7 +625,7 @@ def _joined_page_summaries(doc: dict) -> str:
 
 
 def apply_document_summary(doc: dict, markdown: str, client, *,
-                           max_chars: int | None = None) -> dict:
+                           max_chars: int | None = None, mode: str | None = None) -> dict:
     """Replace the joined per-page summary on a multi-page ``doc`` in place.
 
     Single-page documents (exactly one extracted page) keep their page summary
@@ -487,7 +634,10 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
     ok_pages = [p for p in doc.get("pages") or [] if p.get("ok")]
     if len(ok_pages) <= 1:
         return {"status": "single_page", "chars": len(doc.get("doc_summary") or "")}
-    mode = DOC_SUMMARY_MODE
+    # Per-request override (validated by the server) wins over the env default.
+    mode = DOC_SUMMARY_MODE if mode is None else validate_mode(mode)
+    if max_chars is not None:
+        max_chars = validate_max_chars(max_chars)
     if mode == "off":
         doc["doc_summary"] = None
         return {"status": "disabled", "mode": "off", "chars": 0}
@@ -504,8 +654,6 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
                                              max_chars=max_chars, doc_id=doc.get("doc_id"))
         report["mode"] = "summary_of_summaries"
     else:
-        if mode != "deterministic":
-            logger.error("unknown SHREW_DOC_SUMMARY_MODE=%r — using deterministic", mode)
         summary, report = compose_document_summary(doc, max_chars=max_chars)
     doc["doc_summary"] = summary
     return report

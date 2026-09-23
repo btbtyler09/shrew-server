@@ -51,6 +51,8 @@ from .structured_page import (
     empty_200_streak,
     warn_if_budget_unreachable,
 )
+from .doc_summary import validate_max_chars as validate_summary_max_chars
+from .doc_summary import validate_mode as validate_summary_mode
 from .structured_pipeline import (
     IMAGE_TRANSFORM,
     ModelBackendDownError,
@@ -602,6 +604,20 @@ def _tel_sample_s() -> float:
         return 10.0
 
 
+def _validate_summary_params(summary_mode, summary_max_chars):
+    """Per-request doc-summary overrides: same enum / limits as the env knobs
+    (SHREW_DOC_SUMMARY_MODE / SHREW_DOC_SUMMARY_MAX_CHARS); None = env default.
+    An invalid value is a client error (400), never a silent fallback."""
+    try:
+        if summary_mode is not None:
+            summary_mode = validate_summary_mode(summary_mode)
+        if summary_max_chars is not None:
+            summary_max_chars = validate_summary_max_chars(summary_max_chars)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    return summary_mode, summary_max_chars
+
+
 @app.post("/v1/convert")
 async def convert(
     request: Request,
@@ -613,6 +629,8 @@ async def convert(
     skip_extraction: bool = Form(False),
     skip_stage3: bool = Form(False),     # deprecated alias of skip_extraction
     high_dpi: int = Form(200),
+    summary_mode: Optional[str] = Form(None),        # per-request SHREW_DOC_SUMMARY_MODE
+    summary_max_chars: Optional[str] = Form(None),   # per-request SHREW_DOC_SUMMARY_MAX_CHARS (400 if invalid)
 ):
     if format not in ("json", "markdown"):
         raise HTTPException(422, "format must be 'json' or 'markdown'")
@@ -620,6 +638,7 @@ async def convert(
     """Convert a document to markdown + structured JSON."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+    summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -754,6 +773,8 @@ async def convert(
                     raw=(pipeline_mode == "raw"),
                     progress=progress,
                     trace=trace,
+                    summary_mode=summary_mode,
+                    summary_max_chars=summary_max_chars,
                 )
             return run_pipeline(
                 tmp_path, output_dir, config,
@@ -816,11 +837,14 @@ async def convert_stream(
     skip_extraction: bool = Form(False),
     skip_stage3: bool = Form(False),     # deprecated alias of skip_extraction
     high_dpi: int = Form(200),
+    summary_mode: Optional[str] = Form(None),        # per-request SHREW_DOC_SUMMARY_MODE
+    summary_max_chars: Optional[str] = Form(None),   # per-request SHREW_DOC_SUMMARY_MAX_CHARS (400 if invalid)
 ):
     skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document with SSE streaming progress."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
+    summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -892,6 +916,8 @@ async def convert_stream(
                     tmp_path, output_dir, config, progress=progress,
                     raw=(pipeline_mode == "raw"),
                     trace=trace,
+                    summary_mode=summary_mode,
+                    summary_max_chars=summary_max_chars,
                 )
             else:
                 result = run_pipeline(
