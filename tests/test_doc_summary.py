@@ -91,9 +91,11 @@ def test_3000_chunk_document_deterministic_is_bounded(monkeypatch):
     assert report["status"] == "ok" and s and len(s) <= ds.DOC_SUMMARY_MAX_CHARS
     assert s.startswith("Machinery's Handbook is a comprehensive reference")
     # Selection rule: page 1, then abstract (500), then introduction (2, 3),
-    # then conclusion (999) — never a walk over the whole document.
-    assert report["pages_used"][:3] == [1, 500, 2]
-    assert set(report["pages_used"]) <= {1, 2, 3, 500, 999}
+    # then conclusion (999) — never a walk over the whole document. The
+    # introduction/conclusion summaries here repeat page 500's template with a
+    # different number, so they are dropped as near-duplicates.
+    assert report["pages_used"] == [1, 500]
+    assert report["sentences_dropped_as_duplicate"] > 0
     assert "Page 4 " not in s
 
 
@@ -169,7 +171,7 @@ def test_off_mode_is_null_without_a_call(monkeypatch):
 
 # ── single-page documents: byte-identical to the previous code ──────────────
 
-@pytest.mark.parametrize("mode", ["deterministic", "summary_of_summaries", "model", "off"])
+@pytest.mark.parametrize("mode", ["deterministic", "contract_sos", "summary_of_summaries", "model", "off"])
 def test_single_page_output_is_byte_identical(monkeypatch, mode):
     monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", mode)
     doc = _doc([_page(1, "A one-page memo about bearing preload limits.")])
@@ -226,3 +228,115 @@ def test_cjk_input_window_does_not_overflow_context():
     capped = ds._cap_tokens(zh, 8000)
     # chars/4 would have admitted ~32k CJK chars (~32k tokens); the safe cap keeps ~8k.
     assert len(capped) <= 8100 and ds._approx_tokens_safe(capped) <= 8000
+
+
+# ── near-duplicate dedupe, on the real paper18 page summaries (card 3, 09-23) ──
+
+PAPER18 = {1: "This research paper presents a massive 172-billion-token study using the RIKER methodology to quantify hallucination rates in large language models across various context lengths, temperatures, and hardware platforms. The findings reveal that even top-performing models fabricate information at significant rates, with hallucination increasing sharply as context length grows, while model selection and temperature settings are identified as primary drivers of fabrication resistance.",
+           2: "This research paper evaluates the hallucination rates of large language models in enterprise document Q&A scenarios, analyzing the impact of temperature settings, hardware platforms, and context length. The study finds that fabrication rates increase with context length and that setting temperature to zero does not universally improve factuality, challenging conventional wisdom on model selection.",
+           16: "This research paper evaluates the hallucination rates of 35 open-weight LLMs when answering questions about documents, finding that fabrication is substantial and increases significantly with context length. The study concludes that model selection and context length are the primary drivers of accuracy, while temperature settings require nuanced optimization to balance fabrication resistance with coherence."}
+
+
+def test_paper18_restatements_are_deduplicated():
+    prs = [_page(1, PAPER18[1], ("abstract",)), _page(2, PAPER18[2], ("introduction",))]
+    prs += [_page(n, "", ("technical_content",)) for n in range(3, 16)]
+    prs += [_page(16, PAPER18[16], ("conclusion",))] + [_page(n, "", ("technical_content",)) for n in (17, 18)]
+    doc = _doc(prs)
+    s, report = ds.compose_document_summary(doc)
+    assert report["status"] == "ok" and 450 <= len(s) <= 900, len(s)
+    assert s.count("This research paper") < 3
+    assert s.startswith("This research paper presents a massive 172-billion-token study")
+    # coverage kept: something from the introduction page AND the conclusion page
+    assert report["pages_used"] == [1, 2, 16]
+    assert report["sentences_dropped_as_duplicate"] == 2
+
+
+def test_dedupe_works_on_cjk_text():
+    a = "本手册介绍了机械加工中的公差与配合标准。"
+    b = "本手册介绍了机械加工中的公差与配合的标准。"          # near-duplicate
+    c = "第二部分讨论齿轮设计与材料热处理工艺。"              # new content
+    doc = _doc([_page(1, a, ("title",)), _page(2, b, ("introduction",)),
+                _page(3, c, ("conclusion",))])
+    s, report = ds.compose_document_summary(doc)
+    assert b not in s and a in s and c in s
+    assert report["sentences_dropped_as_duplicate"] == 1
+
+
+# ── contract_sos: page summaries through the TEXT-PAGE contract ─────────────
+
+class _StreamContractClient:
+    """Streams a 5-key contract answer through on_delta like VLMClient and
+    records how much of it was actually generated before the abort."""
+    model = "shrew-ocr-preview"
+
+    def __init__(self, answer, chunk=17, exc=None):
+        self.answer, self.chunk, self.exc, self.calls = answer, chunk, exc, []
+
+    def chat_completion_stream(self, messages, *, max_tokens, temperature,
+                               extra_params, on_delta, wall_clock_s, timeout=None):
+        self.calls.append({"messages": messages, "max_tokens": max_tokens,
+                           "temperature": temperature, "extra_params": extra_params})
+        if self.exc:
+            raise self.exc
+        acc, reason = "", None
+        for i in range(0, len(self.answer), self.chunk):
+            acc += self.answer[i:i + self.chunk]
+            reason = on_delta(self.answer[i:i + self.chunk], acc)
+            if reason:
+                break
+        self.generated = len(acc)
+        return {"choices": [{"message": {"role": "assistant", "content": acc},
+                             "finish_reason": reason or "stop"}]}
+
+
+def _contract_answer(summary):
+    chunks = [{"chunk_id": f"c{i}", "title": "t", "section_type": "body",
+               "content": "transcribed input " * 40} for i in range(200)]
+    return json.dumps({"metadata": {"title": "Machinery's Handbook", "authors": [],
+                                    "organization": None, "year": None, "doc_type": "manual"},
+                       "summary": summary, "semantic_chunks": chunks,
+                       "tables": [], "figures": []})
+
+
+def test_contract_sos_request_shape_and_early_stop(monkeypatch):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
+    doc = _big_doc()
+    answer = _contract_answer('Machinery\'s Handbook is the "standard" shop reference.')
+    client = _StreamContractClient(answer)
+    report = ds.apply_document_summary(doc, "", client)
+    assert report["status"] == "ok" and report["mode"] == "contract_sos"
+    assert doc["doc_summary"] == 'Machinery\'s Handbook is the "standard" shop reference.'
+    call = client.calls[0]
+    # the text-page contract, exactly: sentinel system prompt, raw string user turn
+    from app.structured_page import SENTINEL, TEXT_PAGE_MAX_CHARS, get_generation_params
+    assert call["messages"][0] == {"role": "system", "content": SENTINEL}
+    assert isinstance(call["messages"][1]["content"], str)
+    assert call["messages"][1]["content"].startswith("Machinery's Handbook is a comprehensive")
+    assert len(call["messages"][1]["content"]) <= TEXT_PAGE_MAX_CHARS
+    p = get_generation_params("shrew-ocr-preview", "structured_page")
+    assert call["temperature"] == p["temperature"] and call["extra_params"] == p["extra_params"]
+    # stopped right after the summary key: the chunk transcription is never paid for
+    assert client.generated < len(answer) / 20
+
+
+@pytest.mark.parametrize("client, why", [
+    (_StreamContractClient(_contract_answer(None)), "empty or null"),
+    (_StreamContractClient(_contract_answer("")), "empty or null"),
+    (_StreamContractClient('{"metadata": {"title": "x"}, "semantic_chunks": [' + '{"c": 1},' * 50),
+     "no summary key"),
+    (_StreamContractClient("", exc=ConnectionError("backend down")), "ConnectionError"),
+])
+def test_contract_sos_failure_is_null(monkeypatch, caplog, client, why):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
+    doc = _big_doc(n_pages=10)
+    with caplog.at_level(logging.ERROR, logger="app.doc_summary"):
+        report = ds.apply_document_summary(doc, "", client)
+    assert doc["doc_summary"] is None and report["status"] == "failed" and why in report["error"]
+    assert any("summary: null" in r.getMessage() for r in caplog.records)
+
+
+def test_contract_sos_blocking_client_parses_the_summary_key(monkeypatch):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
+    doc = _big_doc(n_pages=10)
+    report = ds.apply_document_summary(doc, "", _ReplyClient(_contract_answer("A bounded abstract.")))
+    assert report["status"] == "ok" and doc["doc_summary"] == "A bounded abstract."

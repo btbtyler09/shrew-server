@@ -20,9 +20,11 @@ SHREW_DOC_SUMMARY_MODE:
     2. then the summaries of pages carrying a chunk whose section_type is
        ``abstract``, then ``introduction``, then ``conclusion`` — each group
        in page order, a page taken once, identical summaries taken once;
-    3. joined with a single space and cut at the budget on a SENTENCE
-       boundary (a partially fitting page summary contributes its leading
-       whole sentences; a page summary that fits nowhere ends the selection).
+    3. split into sentences; a sentence is dropped as a near-duplicate unless
+       >= 50% of its content tokens are new relative to the sentences already
+       kept (DEDUPE_MIN_NOVELTY; the first sentence is always kept);
+    4. joined with a single space and cut at the budget on a SENTENCE
+       boundary (the first sentence that does not fit ends the selection).
   Every other page summary is left out: the result is page 1's abstract plus
   the document's own overview pages, never a walk over the whole document.
 * ``model`` — the pre-cutover legacy step: ONE text call with the same prompt
@@ -33,7 +35,21 @@ SHREW_DOC_SUMMARY_MODE:
   model over the page summaries in page order (the whole document's coverage,
   cut at ~8,000 tokens), the legacy prompt plus a sentence saying the input
   is per-page summaries of one document.
+* ``contract_sos`` — ONE call through the model's NORMAL text-page contract
+  (sentinel system prompt, the joined page summaries as the user turn, capped
+  at the text arm's trained 11,000-char bound, structured_page decode params);
+  the returned ``summary`` key is the abstract, the stream is stopped as soon
+  as that key closes and the rest is discarded. Stays inside what the served
+  OCR model was trained to do. NOT yet measured on a live serve.
 * ``off`` — summary is None for multi-page documents.
+
+MEASURED 2026-09-23 (E6 on an MI100): with the served Granite OCR model
+(shrew-ocr-preview) BOTH ``model`` and ``summary_of_summaries`` return null —
+the model answers a free-form summary prompt in its trained 5-key JSON, which
+this module rejects. They only become meaningful behind a general-purpose
+summary model reached through a separate URL knob, which is NOT built and
+would be a new dependency. Use ``deterministic`` (or, once measured,
+``contract_sos``) with this model.
 
 Model modes: max_tokens 4096 (the legacy value); a completion that hits it is
 a runaway and fails; otherwise the answer is cut to the budget on a sentence
@@ -58,11 +74,12 @@ Knobs:
         of the same string differs across the model, the reranker and the
         embedder. 4000 chars is ~1,000-1,300 tokens of English (~2.5-4k of
         CJK) — well inside a 10,240-token rerank pair with room for the query.
-    SHREW_DOC_SUMMARY_MODE       "deterministic" (default) | "summary_of_summaries"
-                                 | "model" | "off".
+    SHREW_DOC_SUMMARY_MODE       "deterministic" (default) | "contract_sos"
+                                 | "summary_of_summaries" | "model" | "off".
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -70,7 +87,8 @@ import time
 
 from .generation import get_generation_params
 from .structured import _load_pipeline, _section_document
-from .structured_page import is_degenerate
+from .structured_page import (MAX_TOKENS, STREAM_WALL_CLOCK_S, TEXT_PAGE_MAX_CHARS, RepetitionGuard,
+                              build_text_messages, is_degenerate, parse_json_lenient)
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +237,41 @@ def summarize_document(source_text: str, client, *, source: str = "markdown",
     return cut, report
 
 
+# Near-duplicate filter for the deterministic mode. Page summaries of the
+# pages it selects (title page, abstract, introduction, conclusion) often
+# restate the whole document in different words — measured on an 18-page
+# paper: three "This research paper evaluates…" openers. Pairwise sentence
+# similarity cannot separate those paraphrases (content-word overlap <= 0.56)
+# from genuinely different sentences of one page (0.17-0.22), so the rule is
+# CUMULATIVE NOVELTY instead: a sentence is kept only if at least
+# DEDUPE_MIN_NOVELTY of its content tokens are not already in the kept
+# sentences. Content tokens: lowercase Latin/digit words of 3+ chars minus
+# stopwords, plus character bigrams of CJK runs (CJK has no spaces). The
+# document's first sentence is always kept. On the paper this keeps 890 of
+# 1,296 chars with one sentence each from the introduction and conclusion.
+DEDUPE_MIN_NOVELTY = 0.5
+_STOPWORDS = frozenset(
+    "a an the of in on and or to for with by at from as is are was were be been "
+    "this that these those it its their which while even into across over under "
+    "than more most such not no do does also has have had".split())
+_WORD = re.compile(r"[a-z0-9]+")
+_CJK_RUN = re.compile(r"[\u3400-\u9fff\uac00-\ud7af\u3040-\u30ff]+")
+
+
+def _content_tokens(sentence: str) -> set:
+    low = sentence.lower()
+    toks = {w for w in _WORD.findall(low) if len(w) > 2 and w not in _STOPWORDS}
+    for run in _CJK_RUN.findall(sentence):
+        toks |= {run[i:i + 2] for i in range(max(1, len(run) - 1))}
+    return toks
+
+
+def _novelty(tokens: set, kept: set) -> float:
+    if not tokens:
+        return 0.0          # nothing checkable (e.g. a bare number): not new
+    return len(tokens - kept) / len(tokens)
+
+
 _SENTENCE_END = re.compile(r"(?<=[.!?。！？])\s*")
 
 
@@ -254,34 +307,40 @@ def compose_document_summary(doc: dict, *, max_chars: int | None = None) -> tupl
     for st in OVERVIEW_SECTION_TYPES:
         candidates += [pg for pg in ordered if st in types_by_page.get(pg, ())]
 
+    # Sentence stream over the selected pages, near-duplicates dropped, cut at
+    # the budget on a sentence boundary (the first sentence that does not fit
+    # ends the selection).
     parts: list[str] = []
+    kept_tokens: set = set()
     seen_pages: set = set()
     seen_text: set = set()
     used = 0
+    report["sentences_dropped_as_duplicate"] = 0
+    full = False
     for pg in candidates:
         text = summaries[pg]
         if pg in seen_pages or text in seen_text:
             continue
         seen_pages.add(pg)
         seen_text.add(text)
-        sep = 1 if parts else 0
-        if used + sep + len(text) <= budget:
-            parts.append(text)
-            used += sep + len(text)
-            report["pages_used"].append(pg)
-            continue
-        # Partial fit: the leading whole sentences that fit, then stop.
-        fitted = []
+        took = False
         for sent in _sentences(text):
-            add = (1 if (parts or fitted) else 0) + len(sent)
+            toks = _content_tokens(sent)
+            if parts and _novelty(toks, kept_tokens) < DEDUPE_MIN_NOVELTY:
+                report["sentences_dropped_as_duplicate"] += 1
+                continue
+            add = (1 if parts else 0) + len(sent)
             if used + add > budget:
+                full = True
                 break
-            fitted.append(sent)
+            parts.append(sent)
+            kept_tokens |= toks
             used += add
-        if fitted:
-            parts.append(" ".join(fitted))
+            took = True
+        if took:
             report["pages_used"].append(pg)
-        break
+        if full:
+            break
 
     if not parts:
         report["status"] = "failed"
@@ -294,6 +353,128 @@ def compose_document_summary(doc: dict, *, max_chars: int | None = None) -> tupl
     report["status"] = "ok"
     report["chars"] = len(summary)
     return summary, report
+
+
+_SUMMARY_VALUE = re.compile(r'"summary"\s*:\s*("(?:[^"\\]|\\.)*"|null)')
+SUMMARY_CAPTURED = "summary_captured"
+
+
+class _SummaryCapture:
+    """``on_delta`` that stops the stream as soon as the top-level ``summary``
+    value has been emitted. The trained contract emits ``metadata`` first and
+    ``summary`` second; everything after it (chunks transcribing the input)
+    is discarded, so waiting for it would only cost tokens."""
+
+    def __init__(self, repetition: RepetitionGuard):
+        self.repetition = repetition
+        self.value = None
+        self.found = False
+
+    def __call__(self, chunk: str, accumulated: str):
+        if not self.found:
+            m = _SUMMARY_VALUE.search(accumulated)
+            if m:
+                self.found = True
+                raw = m.group(1)
+                self.value = None if raw == "null" else json.loads(raw)
+                return SUMMARY_CAPTURED
+        return self.repetition(chunk, accumulated)
+
+
+def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None = None,
+                           doc_id: str | None = None) -> tuple[str | None, dict]:
+    """Mode ``contract_sos``: the joined page summaries go through the model's
+    NORMAL text-page contract (sentinel system prompt, the raw text as the user
+    turn, the structured_page decode params) and the returned ``summary`` key
+    is the document abstract; the rest of the output is discarded.
+
+    Input bound: TEXT_PAGE_MAX_CHARS (11,000 chars, cut at a line boundary) —
+    the text arm's trained DISTRIBUTION bound, deliberately smaller than the
+    ~8k-token window of the other model modes: this mode exists to stay inside
+    what the model was trained on.
+    """
+    budget = DOC_SUMMARY_MAX_CHARS if max_chars is None else max_chars
+    report = {"status": None, "mode": "contract_sos", "chars": 0, "max_chars": budget,
+              "input_chars": 0, "output_chars": 0, "calls": 1, "seconds": 0.0, "error": None}
+
+    def fail(reason: str):
+        report["status"] = "failed"
+        report["error"] = reason
+        logger.error("doc summary FAILED for %s: %s — returning summary: null "
+                     "(the per-page summaries are NOT concatenated in its place)",
+                     doc_id or "document", reason)
+        return None, report
+
+    text = page_summaries
+    if len(text) > TEXT_PAGE_MAX_CHARS:
+        cut = text.rfind("\n", 0, TEXT_PAGE_MAX_CHARS)
+        text = text[:cut if cut > 0 else TEXT_PAGE_MAX_CHARS]
+    report["input_chars"] = len(text)
+    if not text.strip():
+        report["calls"] = 0
+        return fail("no page summaries to summarize")
+
+    messages = build_text_messages(text)
+    params = get_generation_params(client.model, "structured_page")
+    t0 = time.time()
+    try:
+        if hasattr(client, "chat_completion_stream"):
+            capture = _SummaryCapture(RepetitionGuard(attempt="doc summary"))
+            result = client.chat_completion_stream(
+                messages, max_tokens=MAX_TOKENS, temperature=params["temperature"],
+                extra_params=params["extra_params"], on_delta=capture,
+                wall_clock_s=STREAM_WALL_CLOCK_S)
+            choice = result["choices"][0]
+            out = choice["message"].get("content") or ""
+            finish = choice.get("finish_reason")
+            if capture.found:
+                value = capture.value
+            else:
+                parsed, _ = parse_json_lenient(out)
+                value = parsed.get("summary") if isinstance(parsed, dict) else None
+                if parsed is None:
+                    report["seconds"] = round(time.time() - t0, 2)
+                    report["output_chars"] = len(out)
+                    return fail(f"no summary key in the contract output (finish={finish})")
+        else:
+            result = client.chat_completion(
+                messages, max_tokens=MAX_TOKENS, temperature=params["temperature"],
+                extra_params=params["extra_params"])
+            out = result["choices"][0]["message"].get("content") or ""
+            parsed, _ = parse_json_lenient(out)
+            if not isinstance(parsed, dict):
+                report["seconds"] = round(time.time() - t0, 2)
+                report["output_chars"] = len(out)
+                return fail("contract output did not parse")
+            value = parsed.get("summary")
+    except Exception as e:  # transport, HTTP, malformed response
+        report["seconds"] = round(time.time() - t0, 2)
+        return fail(f"{type(e).__name__}: {e}")
+    report["seconds"] = round(time.time() - t0, 2)
+    report["output_chars"] = len(out)
+
+    if not isinstance(value, str) or not value.strip():
+        return fail("the contract's summary key was empty or null")
+    value = value.strip()
+    if is_degenerate(value):
+        return fail("degenerate (repetitive) summary")
+    cut = _cut_to_budget(value, budget)
+    if cut is None:
+        return fail(f"no sentence of the {len(value)}-char summary fits the "
+                    f"{budget}-char budget (SHREW_DOC_SUMMARY_MAX_CHARS)")
+    report["status"] = "ok"
+    report["chars"] = len(cut)
+    logger.info("doc summary (contract_sos) for %s: %d chars from %d chars of page "
+                "summaries; stopped after %d output chars in %.1fs",
+                doc_id or "document", len(cut), len(text), len(out), report["seconds"])
+    return cut, report
+
+
+def _joined_page_summaries(doc: dict) -> str:
+    return "\n".join(
+        (p.get("page_summary") or "").strip()
+        for p in sorted(doc.get("pages") or [], key=lambda p: p["page"])
+        if p.get("ok") and (p.get("page_summary") or "").strip())
 
 
 def apply_document_summary(doc: dict, markdown: str, client, *,
@@ -314,12 +495,12 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
         summary, report = summarize_document(markdown, client, source="markdown",
                                              max_chars=max_chars, doc_id=doc.get("doc_id"))
         report["mode"] = "model"
+    elif mode == "contract_sos":
+        summary, report = summarize_via_contract(_joined_page_summaries(doc), client,
+                                                 max_chars=max_chars, doc_id=doc.get("doc_id"))
     elif mode == "summary_of_summaries":
-        page_summaries = "\n".join(
-            (p.get("page_summary") or "").strip()
-            for p in sorted(doc.get("pages") or [], key=lambda p: p["page"])
-            if p.get("ok") and (p.get("page_summary") or "").strip())
-        summary, report = summarize_document(page_summaries, client, source="page_summaries",
+        summary, report = summarize_document(_joined_page_summaries(doc), client,
+                                             source="page_summaries",
                                              max_chars=max_chars, doc_id=doc.get("doc_id"))
         report["mode"] = "summary_of_summaries"
     else:

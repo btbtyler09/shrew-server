@@ -203,6 +203,28 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_PORT` | Server bind port | `8080` |
 | `SHREW_WORKERS` | Uvicorn worker count | `1` |
 | `LOG_LEVEL` | Logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
+| `SHREW_DOC_SUMMARY_MAX_CHARS` | Hard budget for the document `summary`, in **characters** (structured mode) | `4000` |
+| `SHREW_DOC_SUMMARY_MODE` | How a multi-page document's `summary` is built (structured mode) — see below | `deterministic` |
+
+**Document summary (structured mode).** Each page's model call returns a page
+summary; the document `summary` is built from them and is always bounded by
+`SHREW_DOC_SUMMARY_MAX_CHARS`, cut on a sentence boundary. Single-page
+documents return the page summary unchanged. If the document summary cannot be
+produced it is returned as `null` (and logged at ERROR) — never as a
+concatenation of page summaries; treat `null` as "no summary".
+
+| `SHREW_DOC_SUMMARY_MODE` | What it does | Model calls |
+|---|---|---|
+| `deterministic` (default) | First page's summary, then the pages the model labelled abstract / introduction / conclusion; near-duplicate sentences dropped | 0 |
+| `contract_sos` | The page summaries go through the model's normal text-page contract; its `summary` key is used | 1 |
+| `summary_of_summaries` | A free-form summary prompt over the page summaries | 1 |
+| `model` | The legacy pipeline's free-form summary prompt over the first ~8k tokens of the document | 1 |
+| `off` | `summary` is `null` for multi-page documents | 0 |
+
+With shrew-ocr-preview, `summary_of_summaries` and `model` return `null`: the
+model answers free-form prompts in its structured JSON contract. They are
+useful only with a general-purpose model; a separate summary-model URL is not
+supported yet.
 
 **Using OpenRouter** instead of a local VLM:
 ```bash
