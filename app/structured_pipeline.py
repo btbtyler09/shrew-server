@@ -38,6 +38,7 @@ logger = logging.getLogger("shrew.structured_pipeline")
 from . import rasterizer
 from . import telemetry
 from .assembly import assemble_document, build_table_composite
+from .doc_summary import apply_document_summary
 from .models import PipelineResult
 from .pipeline import CancelledException
 from .preprocess import glyph_height, prepare_image, prepare_image_bucketed
@@ -1069,6 +1070,14 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     # descriptive error rather than a bare KeyError inside the projection.
     _validate_document(doc)
 
+    # Bounded document-level summary (platform ops 2026-09-23): the joined
+    # per-page summaries grew linearly with page count (1.1 MB on a 3,501-page
+    # handbook). Multi-page documents get ONE legacy-style summary call over
+    # the first ~8k-token section; any failure yields summary: null, never a
+    # concatenation. Single-page documents are untouched.
+    trace.phase("doc_summary")
+    doc_summary_report = apply_document_summary(doc, synthesize_markdown(doc), client)
+
     trace.phase("json_build")
     if raw:
         # Flat text rendering: no structured.json, so the server omits the
@@ -1096,6 +1105,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         },
     }
 
+    processing_log["doc_summary"] = doc_summary_report
     if fidelity_report is not None:
         processing_log["fidelity"] = fidelity_report
 

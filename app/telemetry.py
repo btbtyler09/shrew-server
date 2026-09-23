@@ -53,7 +53,7 @@ PAGE_STATUSES = frozenset({
 # from ever becoming a channel for content.
 PHASES = frozenset({
     "upload", "rasterize_start", "rasterize_done", "transcribe_start",
-    "transcribe_done", "assemble_start", "stitch", "fidelity", "json_build",
+    "transcribe_done", "assemble_start", "stitch", "fidelity", "doc_summary", "json_build",
     "serialize_start", "serialize_done", "render_raw",
 })
 
