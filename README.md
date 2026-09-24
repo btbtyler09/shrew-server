@@ -207,18 +207,21 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_DOC_SUMMARY_MODE` | How a multi-page document's `summary` is built (structured mode) — see below | `deterministic` |
 | `SHREW_DOC_SUMMARY_BLOCK_CHARS` | `contract_sos` block size in characters (the model's trained text-page bound; larger values are clamped to the context capacity and logged) | `11000` |
 | `SHREW_DOC_SUMMARY_CONCURRENCY` | `contract_sos` block calls in flight per level | `4` |
+| `SHREW_DOC_SUMMARY_LONG_DOC_PAGES` | Above this many pages, `deterministic` uses abstract-labelled pages only (reference manuals label body pages "introduction") | `30` |
 
 **Document summary (structured mode).** Each page's model call returns a page
 summary; the document `summary` is built from them and is always bounded by
 `SHREW_DOC_SUMMARY_MAX_CHARS`, cut on a sentence boundary. Single-page
 documents return the page summary unchanged. If the document summary cannot be
 produced it is returned as `null` (and logged at ERROR) — never as a
-concatenation of page summaries; treat `null` as "no summary".
+concatenation of page summaries; treat `null` as "no summary". The
+response's `processing_log.doc_summary.mode_used` says which mode actually
+produced it (e.g. `deterministic_fallback`).
 
 | `SHREW_DOC_SUMMARY_MODE` | What it does | Model calls |
 |---|---|---|
-| `deterministic` (default) | First page's summary, then the pages the model labelled abstract / introduction / conclusion; near-duplicate sentences dropped | 0 |
-| `contract_sos` | Hierarchical: page summaries in blocks of ≤ 11,000 chars through the model's normal text-page contract, then the block summaries the same way, up to one root summary | 1 per ~35 pages, + a few (≈ 85 for 3,000 pages) |
+| `deterministic` (default) | First page's summary, then the pages the model labelled abstract / introduction / conclusion (abstract only for documents over `SHREW_DOC_SUMMARY_LONG_DOC_PAGES` pages); near-duplicate sentences dropped | 0 |
+| `contract_sos` | Hierarchical: page summaries in blocks of ≤ 11,000 chars through the model's normal text-page contract, then the block summaries the same way, up to one root summary; falls back to `deterministic` if the tree fails | 1 per ~35 pages, + a few (≈ 85 for 3,000 pages) |
 | `summary_of_summaries` | A free-form summary prompt over the page summaries | 1 |
 | `model` | The legacy pipeline's free-form summary prompt over the first ~8k tokens of the document | 1 |
 | `off` | `summary` is `null` for multi-page documents | 0 |

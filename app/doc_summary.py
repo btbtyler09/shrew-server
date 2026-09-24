@@ -20,6 +20,8 @@ SHREW_DOC_SUMMARY_MODE:
     2. then the summaries of pages carrying a chunk whose section_type is
        ``abstract``, then ``introduction``, then ``conclusion`` — each group
        in page order, a page taken once, identical summaries taken once;
+       — for documents longer than SHREW_DOC_SUMMARY_LONG_DOC_PAGES (30) pages,
+       ``abstract`` pages only: manuals label body pages ``introduction``;
     3. split into sentences; a sentence is dropped as a near-duplicate unless
        >= 50% of its content tokens are new relative to the sentences already
        kept (DEDUPE_MIN_NOVELTY; the first sentence is always kept);
@@ -43,6 +45,8 @@ SHREW_DOC_SUMMARY_MODE:
   the block summaries are packed and summarized again until one root call
   remains. ~90 short calls for a 3,000-page book; one call when everything
   fits one block. Stays inside what the served OCR model was trained to do.
+  If the tree returns null it FALLS BACK to ``deterministic`` (logged;
+  processing_log ``mode_used`` = "deterministic_fallback").
 * ``off`` — summary is None for multi-page documents.
 
 MEASURED 2026-09-23 (E6 on an MI100): with the served Granite OCR model
@@ -170,6 +174,15 @@ def _block_chars() -> int:
     return v
 # Overview section types, in selection priority after the first page.
 OVERVIEW_SECTION_TYPES = ("abstract", "introduction", "conclusion")
+# Long documents use `abstract` pages only (plus page 1). Measured 2026-09-23/24:
+# on an 18-page paper the introduction/conclusion pages were the paper's own
+# overview; on pages 1-50 of a reference manual the model labels many BODY
+# pages `introduction` (logarithms, complex numbers, quadratic equations...),
+# and the summary degraded into a page list. The two measurements bracket the
+# threshold to (18, 50] pages — they do not pin it — so the default is their
+# geometric mean, ~30. SHREW_DOC_SUMMARY_LONG_DOC_PAGES overrides it.
+LONG_DOC_PAGES = int(os.environ.get("SHREW_DOC_SUMMARY_LONG_DOC_PAGES", "30"))
+LONG_DOC_SECTION_TYPES = ("abstract",)
 # The legacy step's input window: the first ~8,000 approx-tokens of markdown.
 DOC_SUMMARY_INPUT_TOKENS = 8000
 
@@ -377,8 +390,11 @@ def compose_document_summary(doc: dict, *, max_chars: int | None = None) -> tupl
         for pg in c.get("pages") or [c.get("page")]:
             if pg is not None:
                 types_by_page.setdefault(pg, set()).add(c.get("section_type"))
+    long_doc = len(doc.get("pages") or []) > LONG_DOC_PAGES
+    overview = LONG_DOC_SECTION_TYPES if long_doc else OVERVIEW_SECTION_TYPES
+    report["overview_types"] = list(overview)
     candidates = [ordered[0]]
-    for st in OVERVIEW_SECTION_TYPES:
+    for st in overview:
         candidates += [pg for pg in ordered if st in types_by_page.get(pg, ())]
 
     # Sentence stream over the selected pages, near-duplicates dropped, cut at
@@ -528,8 +544,17 @@ def _pack_blocks(items: list[str], cap: int) -> list[str]:
     return blocks
 
 
+# EXPERIMENT (off by default): one line prepended to the ROOT call's input when
+# the root summarizes block summaries (level > 0), e.g. "Section summaries of one
+# document, in order:". It is input text, so the call stays inside the trained
+# contract. Measured on 50 pages the root echoed block 1 instead of integrating
+# the blocks; this tests whether framing the input changes that.
+ROOT_PREFIX = os.environ.get("SHREW_DOC_SUMMARY_ROOT_PREFIX", "")
+
+
 def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None = None,
-                           doc_id: str | None = None) -> tuple[str | None, dict]:
+                           doc_id: str | None = None,
+                           root_prefix: str | None = None) -> tuple[str | None, dict]:
     """Mode ``contract_sos``: HIERARCHICAL summary through the model's NORMAL
     text-page contract (sentinel system prompt, raw text user turn,
     structured_page decode params); each call's ``summary`` key is taken and
@@ -568,6 +593,10 @@ def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None
     while True:
         blocks = _pack_blocks(items, block_chars)
         is_root = len(blocks) == 1
+        prefix = ROOT_PREFIX if root_prefix is None else root_prefix
+        if is_root and level > 0 and prefix:
+            blocks = [prefix.strip() + "\n" + blocks[0]]
+            report["root_prefix"] = prefix.strip()
         workers = max(1, min(DOC_SUMMARY_CONCURRENCY, len(blocks)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             results = list(pool.map(lambda b: _contract_call(b, client), blocks))
@@ -648,6 +677,17 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
     elif mode == "contract_sos":
         summary, report = summarize_via_contract(_joined_page_summaries(doc), client,
                                                  max_chars=max_chars, doc_id=doc.get("doc_id"))
+        report["mode_used"] = "contract_sos"
+        if summary is None:
+            # The tree failed (logged at ERROR above). Fall back to the zero-call
+            # composer rather than returning null: a bounded deterministic
+            # abstract beats none. If that fails too, the summary is null.
+            logger.warning("doc summary for %s: contract_sos returned null (%s) — "
+                           "falling back to deterministic", doc.get("doc_id") or "document",
+                           report.get("error"))
+            summary, det = compose_document_summary(doc, max_chars=max_chars)
+            report = {**det, "mode": "contract_sos", "contract_sos": report,
+                      "mode_used": "deterministic_fallback" if summary is not None else "none"}
     elif mode == "summary_of_summaries":
         summary, report = summarize_document(_joined_page_summaries(doc), client,
                                              source="page_summaries",
@@ -655,5 +695,8 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
         report["mode"] = "summary_of_summaries"
     else:
         summary, report = compose_document_summary(doc, max_chars=max_chars)
+    report.setdefault("mode_used", report.get("mode") or mode)
+    if summary is None:
+        report["mode_used"] = "none"
     doc["doc_summary"] = summary
     return report

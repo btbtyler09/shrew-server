@@ -90,12 +90,10 @@ def test_3000_chunk_document_deterministic_is_bounded(monkeypatch):
     s = doc["doc_summary"]
     assert report["status"] == "ok" and s and len(s) <= ds.DOC_SUMMARY_MAX_CHARS
     assert s.startswith("Machinery's Handbook is a comprehensive reference")
-    # Selection rule: page 1, then abstract (500), then introduction (2, 3),
-    # then conclusion (999) — never a walk over the whole document. The
-    # introduction/conclusion summaries here repeat page 500's template with a
-    # different number, so they are dropped as near-duplicates.
+    # A 1,000-page document is LONG: page 1, then `abstract` pages only
+    # (introduction/conclusion labels are unreliable on long manuals).
+    assert report["overview_types"] == ["abstract"]
     assert report["pages_used"] == [1, 500]
-    assert report["sentences_dropped_as_duplicate"] > 0
     assert "Page 4 " not in s
 
 
@@ -326,13 +324,48 @@ def test_contract_sos_request_shape_and_early_stop(monkeypatch):
      "no summary key"),
     (_StreamContractClient("", exc=ConnectionError("backend down")), "ConnectionError"),
 ])
-def test_contract_sos_failure_is_null(monkeypatch, caplog, client, why):
+def test_contract_sos_failure_falls_back_to_deterministic(monkeypatch, caplog, client, why):
     monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
     doc = _big_doc(n_pages=10)
-    with caplog.at_level(logging.ERROR, logger="app.doc_summary"):
+    with caplog.at_level(logging.WARNING, logger="app.doc_summary"):
         report = ds.apply_document_summary(doc, "", client)
-    assert doc["doc_summary"] is None and report["status"] == "failed" and why in report["error"]
+    # the tree failed loudly ...
+    assert report["contract_sos"]["status"] == "failed" and why in report["contract_sos"]["error"]
     assert any("summary: null" in r.getMessage() for r in caplog.records)
+    assert any("falling back to deterministic" in r.getMessage() for r in caplog.records)
+    # ... and the document still gets a bounded deterministic abstract
+    assert report["mode_used"] == "deterministic_fallback" and report["status"] == "ok"
+    assert doc["doc_summary"].startswith("Machinery's Handbook is a comprehensive reference")
+
+
+def test_contract_sos_and_fallback_both_failing_is_null(monkeypatch):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
+    doc = _big_doc(n_pages=10)
+    for p in doc["pages"]:
+        p["page_summary"] = ""
+    report = ds.apply_document_summary(doc, "", _StreamContractClient("", exc=ConnectionError("x")))
+    assert doc["doc_summary"] is None and report["mode_used"] == "none"
+
+
+def test_mode_used_is_reported(monkeypatch):
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "contract_sos")
+    doc = _big_doc(n_pages=10)
+    report = ds.apply_document_summary(doc, "", _StreamContractClient(_contract_answer("An abstract.")))
+    assert report["mode_used"] == "contract_sos"
+    monkeypatch.setattr(ds, "DOC_SUMMARY_MODE", "deterministic")
+    doc = _big_doc(n_pages=10)
+    assert ds.apply_document_summary(doc, "", _NoCallClient())["mode_used"] == "deterministic"
+
+
+@pytest.mark.parametrize("n_pages, expect_intro", [(18, True), (30, True), (31, False), (50, False)])
+def test_long_documents_use_abstract_pages_only(n_pages, expect_intro):
+    prs = [_page(1, "A reference manual for machinists.", ("title",)),
+           _page(2, "Page two introduces the conventions used for tolerances.", ("introduction",))]
+    prs += [_page(n, f"Body page {n} lists gear data {n}.", ("technical_content",)) for n in range(3, n_pages + 1)]
+    s, report = ds.compose_document_summary(_doc(prs))
+    assert ("conventions used for tolerances" in s) is expect_intro
+    assert report["overview_types"] == (["abstract", "introduction", "conclusion"] if expect_intro
+                                        else ["abstract"])
 
 
 def test_contract_sos_blocking_client_parses_the_summary_key(monkeypatch):
@@ -528,3 +561,17 @@ def test_no_override_passes_none_so_env_default_applies(convert_client):
     r = client.post("/v1/convert", files={"file": ("a.txt", b"hello world\n", "text/plain")})
     assert r.status_code == 200, r.text
     assert seen["summary_mode"] is None and seen["summary_max_chars"] is None
+
+
+def test_root_prefix_is_off_by_default_and_only_on_a_level_above_zero():
+    c = _TreeClient()
+    ds.summarize_via_contract(_pages_3000(), c)
+    assert not any(i.startswith("Section summaries") for i in c.inputs)
+    c = _TreeClient()
+    s, report = ds.summarize_via_contract(_pages_3000(), c,
+                                          root_prefix="Section summaries of one document, in order:")
+    starts = [i for i in c.inputs if i.startswith("Section summaries of one document, in order:")]
+    assert len(starts) == 1 and report["root_prefix"]          # the root call only
+    c = _TreeClient()                                           # single block: no level > 0, no prefix
+    ds.summarize_via_contract("Page 1 about gears.\nPage 2 about cams.", c, root_prefix="X:")
+    assert c.inputs == ["Page 1 about gears.\nPage 2 about cams."]
