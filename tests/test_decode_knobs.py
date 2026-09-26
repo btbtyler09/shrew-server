@@ -171,3 +171,60 @@ def test_pipeline_threads_the_request_policy_to_every_page(monkeypatch, tmp_path
     spl._process_one_page(1, str(img), type("C", (), {"low_dpi": 100, "high_dpi": 200})(),
                           str(tmp_path), client=None, decode=pol)
     assert seen == [pol]
+
+
+# ── SHREW_TRY2_ENFORCE / retry_enforce (hub 2026-09-26 follow-up) ────────────
+
+@pytest.mark.parametrize("val", ["1", "on", "true", "YES"])
+def test_explicit_enforce_on_is_still_byte_identical(monkeypatch, tmp_path, val):
+    monkeypatch.setenv("SHREW_TRY2_ENFORCE", val)
+    golden = json.loads((HERE / "fixtures" / "decode_payloads_v0315.json").read_text())
+    assert _capture(tmp_path) == golden
+
+
+def test_enforce_off_retry_uses_the_first_pass_contract(monkeypatch, tmp_path):
+    monkeypatch.setenv("SHREW_TRY2_ENFORCE", "off")
+    b = _bodies(tmp_path)
+    first, retry = b["parse_then_retry"]
+    assert "structured_outputs" not in retry and "json_schema" not in retry
+    assert retry["presence_penalty"] == 0.6                     # SHREW_RETRY_PP
+    assert retry["temperature"] == 0 and "seed" not in retry     # SHREW_TRY2_TEMP default
+    # apart from the penalty, the retry request is the first pass's
+    strip = lambda d: {k: v for k, v in d.items() if k != "presence_penalty"}
+    assert strip(retry) == strip(first)
+    assert b["clean"][0] == json.loads(json.loads(
+        (HERE / "fixtures" / "decode_payloads_v0315.json").read_text())["clean"][0])  # first pass untouched
+
+
+def test_enforce_off_with_sampled_retry(monkeypatch, tmp_path):
+    monkeypatch.setenv("SHREW_TRY2_ENFORCE", "0")
+    monkeypatch.setenv("SHREW_TRY2_TEMP", "0.4")
+    retry = _bodies(tmp_path)["loop_reroll_retry"][2]
+    assert retry["temperature"] == 0.4 and isinstance(retry["seed"], int)
+    assert retry["presence_penalty"] == 0.6 and "structured_outputs" not in retry
+
+
+def test_bad_enforce_value_fails_fast(monkeypatch):
+    monkeypatch.setenv("SHREW_TRY2_ENFORCE", "maybe")
+    with pytest.raises(ValueError, match="SHREW_TRY2_ENFORCE"):
+        DecodePolicy.from_env()
+
+
+def test_retry_enforce_override():
+    from fastapi import HTTPException
+    from app.server import _validate_decode_params
+    assert DecodePolicy.from_env().with_overrides(retry_enforce="off").try2_enforce is False
+    d = _validate_decode_params(None, None, None, "false")
+    assert d is not None and d.try2_enforce is False
+    with pytest.raises(HTTPException) as e:
+        _validate_decode_params(None, None, None, "sometimes")
+    assert e.value.status_code == 400
+
+
+def test_describe_records_the_whole_recipe(monkeypatch):
+    d = DecodePolicy.from_env().describe()
+    assert d == {"try1_temperature": 0.0, "try2_temperature": 0.0, "seed_policy": "fixed",
+                 "try1_pp": 0.3, "retry_pp": 0.6, "try2_enforce": True}
+    d2 = DecodePolicy(0.4, 0.4, 7, False).describe()
+    assert (d2["try1_temperature"], d2["try2_temperature"], d2["seed_policy"], d2["try2_enforce"]) == (0.4, 0.4, 7, False)
+    json.dumps(d2)                                              # log-serialisable

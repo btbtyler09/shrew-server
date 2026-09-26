@@ -153,7 +153,8 @@ async def lifespan(app: FastAPI):
 
     start = time.time()
     _config = ServerConfig.from_env()
-    # Fail fast on a malformed SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY
+    # Fail fast on a malformed SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY /
+    # SHREW_TRY2_ENFORCE
     # rather than on the first page of the first request.
     logger.info("decode policy: %s", DecodePolicy.from_env().describe())
     _sweep_stale_tmp()
@@ -608,17 +609,20 @@ def _tel_sample_s() -> float:
         return 10.0
 
 
-def _validate_decode_params(temperature, retry_temperature, seed_policy):
+def _validate_decode_params(temperature, retry_temperature, seed_policy,
+                            retry_enforce=None):
     """Per-request decode overrides: first-pass ``temperature``,
-    ``retry_temperature`` (enforced retry) and ``seed_policy`` — same rules as
-    SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY; all None = env
-    defaults. An invalid value is a client error (400), never a silent fallback."""
-    if temperature is None and retry_temperature is None and seed_policy is None:
+    ``retry_temperature``, ``seed_policy`` and ``retry_enforce`` — same rules as
+    SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY / SHREW_TRY2_ENFORCE;
+    all None = env defaults. An invalid value is a client error (400), never a
+    silent fallback."""
+    if (temperature is None and retry_temperature is None and seed_policy is None
+            and retry_enforce is None):
         return None
     try:
         return DecodePolicy.from_env().with_overrides(
             temperature=temperature, retry_temperature=retry_temperature,
-            seed_policy=seed_policy)
+            seed_policy=seed_policy, retry_enforce=retry_enforce)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
@@ -653,6 +657,7 @@ async def convert(
     temperature: Optional[str] = Form(None),         # per-request SHREW_TRY1_TEMP (400 if invalid)
     retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
     seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
+    retry_enforce: Optional[str] = Form(None),       # per-request SHREW_TRY2_ENFORCE (400 if invalid)
 ):
     if format not in ("json", "markdown"):
         raise HTTPException(422, "format must be 'json' or 'markdown'")
@@ -661,7 +666,7 @@ async def convert(
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
-    decode = _validate_decode_params(temperature, retry_temperature, seed_policy)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -866,13 +871,14 @@ async def convert_stream(
     temperature: Optional[str] = Form(None),         # per-request SHREW_TRY1_TEMP (400 if invalid)
     retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
     seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
+    retry_enforce: Optional[str] = Form(None),       # per-request SHREW_TRY2_ENFORCE (400 if invalid)
 ):
     skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document with SSE streaming progress."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
-    decode = _validate_decode_params(temperature, retry_temperature, seed_policy)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 

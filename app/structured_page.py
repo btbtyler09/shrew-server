@@ -395,6 +395,10 @@ def enforcement_params() -> dict:
 #   SHREW_TRY1_TEMP    first pass AND its same-config re-rolls   (default 0)
 #   SHREW_TRY2_TEMP    the enforced retry                        (default 0)
 #   SHREW_SEED_POLICY  fixed (default) | random | <integer>
+#   SHREW_TRY2_ENFORCE retry keeps schema enforcement (default on). Off: the
+#                      retry uses the first-pass contract (no grammar) at
+#                      SHREW_TRY2_TEMP with the retry presence penalty
+#                      (SHREW_RETRY_PP) — the un-enforced retry arm.
 #
 # fixed   -> seed derived from the page input (the model-input image, or the
 #            text page) plus the attempt index: a rerun of the same page
@@ -407,6 +411,8 @@ def enforcement_params() -> dict:
 # overrides (/v1/convert `temperature`, `retry_temperature`, `seed_policy`) are
 # validated against the same rules; an invalid value is a 400, never a fallback.
 SEED_POLICIES = ("fixed", "random")
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
 MAX_TEMPERATURE = 2.0
 _SEED_MOD = 2 ** 31
 
@@ -419,6 +425,15 @@ def parse_temperature(value, name: str = "temperature") -> float:
     if not (0.0 <= t <= MAX_TEMPERATURE):
         raise ValueError(f"{name} must be in [0, {MAX_TEMPERATURE}], got {t}")
     return t
+
+
+def parse_bool(value, name: str) -> bool:
+    v = str(value).strip().lower()
+    if v in _TRUE:
+        return True
+    if v in _FALSE:
+        return False
+    raise ValueError(f"{name} must be one of 1/0, true/false, yes/no, on/off, got {value!r}")
 
 
 def parse_seed_policy(value, name: str = "seed_policy"):
@@ -440,6 +455,7 @@ class DecodePolicy:
     try1_temp: float = 0.0
     try2_temp: float = 0.0
     seed_policy: object = "fixed"          # "fixed" | "random" | int
+    try2_enforce: bool = True
 
     @classmethod
     def from_env(cls) -> "DecodePolicy":
@@ -447,10 +463,11 @@ class DecodePolicy:
             try1_temp=parse_temperature(os.environ.get("SHREW_TRY1_TEMP", "0"), "SHREW_TRY1_TEMP"),
             try2_temp=parse_temperature(os.environ.get("SHREW_TRY2_TEMP", "0"), "SHREW_TRY2_TEMP"),
             seed_policy=parse_seed_policy(os.environ.get("SHREW_SEED_POLICY", "fixed"), "SHREW_SEED_POLICY"),
+            try2_enforce=parse_bool(os.environ.get("SHREW_TRY2_ENFORCE", "1"), "SHREW_TRY2_ENFORCE"),
         )
 
     def with_overrides(self, *, temperature=None, retry_temperature=None,
-                       seed_policy=None) -> "DecodePolicy":
+                       seed_policy=None, retry_enforce=None) -> "DecodePolicy":
         """Per-request overrides; None keeps the value already in force."""
         return replace(
             self,
@@ -458,6 +475,8 @@ class DecodePolicy:
             try2_temp=(self.try2_temp if retry_temperature is None
                        else parse_temperature(retry_temperature, "retry_temperature")),
             seed_policy=self.seed_policy if seed_policy is None else parse_seed_policy(seed_policy),
+            try2_enforce=(self.try2_enforce if retry_enforce is None
+                          else parse_bool(retry_enforce, "retry_enforce")),
         )
 
     def seed_for(self, input_key: str, attempt_index: int, temperature: float):
@@ -469,9 +488,26 @@ class DecodePolicy:
         digest = hashlib.sha256(f"{input_key}:{attempt_index}".encode()).digest()
         return int.from_bytes(digest[:4], "big") % _SEED_MOD
 
+    def retry_extra(self, first_pass_extra) -> dict:
+        """extra_params for the retry rung, before any seed. Enforced (default):
+        the first-pass extras overlaid with enforcement_params() — the shipped
+        merge. Un-enforced: the same overlay minus the schema-enforcement keys,
+        i.e. the first-pass contract at the retry presence penalty."""
+        merged = {**(first_pass_extra or {}), **enforcement_params()}
+        if not self.try2_enforce:
+            merged.pop("structured_outputs", None)
+            merged.pop("json_schema", None)
+        return merged
+
     def describe(self) -> dict:
+        """The whole per-document recipe, so a log check can verify it."""
+        from .generation import get_generation_params
+        fp = get_generation_params("", "structured_page")["extra_params"] or {}
         return {"try1_temperature": self.try1_temp, "try2_temperature": self.try2_temp,
-                "seed_policy": self.seed_policy}
+                "seed_policy": self.seed_policy,
+                "try1_pp": fp.get("presence_penalty", 0.0),
+                "retry_pp": RETRY_PP,
+                "try2_enforce": self.try2_enforce}
 
 
 def page_input_key(messages: list[dict]) -> str:
@@ -1109,8 +1145,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
     first_verdict = verdict
     first_error = error
 
-    t2, x2 = _sampling(params["temperature"],
-                       {**(params["extra_params"] or {}), **enforcement_params()},
+    t2, x2 = _sampling(params["temperature"], decode.retry_extra(params["extra_params"]),
                        decode.try2_temp, decode, input_key, attempt)
     rtext, rfinish, rguard = _call(
         messages, client,
@@ -1118,7 +1153,8 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         temperature=t2,
         extra_params=x2,
         timeout=timeout,
-        page_no=page_no, attempt="attempt 2/2, enforced retry",
+        page_no=page_no, attempt=("attempt 2/2, enforced retry" if decode.try2_enforce
+                                  else "attempt 2/2, un-enforced retry"),
     )
     rparsed, rverdict, rerror = _gate(rtext, rfinish, rguard)
     _note_completion(rverdict == "empty")

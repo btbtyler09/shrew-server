@@ -211,6 +211,7 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0` |
 | `SHREW_TRY2_TEMP` | Sampling temperature of the enforced retry (0 = greedy) | `0` |
 | `SHREW_SEED_POLICY` | Seed for sampled attempts: `fixed`, `random`, or an integer — see below | `fixed` |
+| `SHREW_TRY2_ENFORCE` | Enforced retry keeps schema enforcement; `0` = the retry uses the first-pass contract (no grammar) at `SHREW_TRY2_TEMP` and the retry presence penalty | `1` |
 
 **Document summary (structured mode).** Each page's model call returns a page
 summary; the document `summary` is built from them and is always bounded by
@@ -254,9 +255,10 @@ A seed is sent only on an attempt whose temperature is above 0:
 `fixed` derives it from the page's model input plus the attempt number, so a
 rerun of the same page reproduces and each later attempt is a different sample;
 `random` sends none; an integer pins every attempt to that seed. Per request,
-`/v1/convert` and `/v1/convert/stream` accept `temperature`, `retry_temperature`
-and `seed_policy` (same rules; invalid → HTTP 400). The policy used is reported
-in `processing_log.decode`.
+`/v1/convert` and `/v1/convert/stream` accept `temperature`, `retry_temperature`,
+`seed_policy` and `retry_enforce` (same rules; invalid → HTTP 400). The full
+recipe used — both temperatures, the seed policy, both presence penalties and
+whether the retry was enforced — is reported in `processing_log.decode`.
 
 **Using OpenRouter** instead of a local VLM:
 ```bash
