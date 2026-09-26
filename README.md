@@ -208,6 +208,9 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_DOC_SUMMARY_BLOCK_CHARS` | `contract_sos` block size in characters (the model's trained text-page bound; larger values are clamped to the context capacity and logged) | `11000` |
 | `SHREW_DOC_SUMMARY_CONCURRENCY` | `contract_sos` block calls in flight per level | `4` |
 | `SHREW_DOC_SUMMARY_LONG_DOC_PAGES` | Above this many pages, `deterministic` uses abstract-labelled pages only (reference manuals label body pages "introduction") | `30` |
+| `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0` |
+| `SHREW_TRY2_TEMP` | Sampling temperature of the enforced retry (0 = greedy) | `0` |
+| `SHREW_SEED_POLICY` | Seed for sampled attempts: `fixed`, `random`, or an integer — see below | `fixed` |
 
 **Document summary (structured mode).** Each page's model call returns a page
 summary; the document `summary` is built from them and is always bounded by
@@ -242,6 +245,18 @@ With shrew-ocr-preview, `summary_of_summaries` and `model` return `null`: the
 model answers free-form prompts in its structured JSON contract. They are
 useful only with a general-purpose model; a separate summary-model URL is not
 supported yet.
+
+**Decode temperature and seed (structured mode).** By default every structured
+page call is greedy (temperature 0) and carries no seed, exactly as before these
+knobs existed. `SHREW_TRY1_TEMP` sets the first pass (and the re-roll that
+repeats it after a repetition abort); `SHREW_TRY2_TEMP` sets the enforced retry.
+A seed is sent only on an attempt whose temperature is above 0:
+`fixed` derives it from the page's model input plus the attempt number, so a
+rerun of the same page reproduces and each later attempt is a different sample;
+`random` sends none; an integer pins every attempt to that seed. Per request,
+`/v1/convert` and `/v1/convert/stream` accept `temperature`, `retry_temperature`
+and `seed_policy` (same rules; invalid → HTTP 400). The policy used is reported
+in `processing_log.decode`.
 
 **Using OpenRouter** instead of a local VLM:
 ```bash

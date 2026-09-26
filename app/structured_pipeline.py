@@ -43,7 +43,7 @@ from .models import PipelineResult
 from .pipeline import CancelledException
 from .preprocess import glyph_height, prepare_image, prepare_image_bucketed
 from .rasterizer import classify_file, prepare_pages
-from .structured_page import extract_page, extract_text_page, paginate_text
+from .structured_page import DecodePolicy, extract_page, extract_text_page, paginate_text
 from .text_extract import extract_text
 from .vlm_client import VLMClient
 
@@ -178,7 +178,7 @@ def _model_input_src_dpi(size, config, input_class: str) -> int:
 
 
 def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
-                       input_class: str = "pdf", fallback_client=None) -> dict:
+                       input_class: str = "pdf", fallback_client=None, decode=None) -> dict:
     """Prepare the model input image for one page and run extraction on it."""
     pages_dir = os.path.join(output_dir, "pages")
     os.makedirs(pages_dir, exist_ok=True)
@@ -201,7 +201,7 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     # document (§5.2 discipline — same as parse/schema failures).
     try:
         result = _page_result(page_no, extract_page(model_png, client,
-                                                    page_no=page_no), bucket)
+                                                    page_no=page_no, decode=decode), bucket)
         _note_transport(client, ok=True)
     except Exception as e:
         _note_transport(client, ok=False)
@@ -234,10 +234,11 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     return result
 
 
-def _process_one_text_page(page_no: int, text: str, client) -> dict:
+def _process_one_text_page(page_no: int, text: str, client, decode=None) -> dict:
     """Run extraction on one paginated block of extracted text."""
     try:
-        r = _page_result(page_no, extract_text_page(text, client, page_no=page_no))
+        r = _page_result(page_no, extract_text_page(text, client, page_no=page_no,
+                                                    decode=decode))
         _note_transport(client, ok=True)
         return r
     except Exception as e:
@@ -272,7 +273,8 @@ def _count_rows(html: str) -> int:
 _REFINE_TIMEOUT_S = 120
 
 
-def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict):
+def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict,
+                       decode=None):
     """Build the stitch_tables refine hook: re-extract a detected cross-page
     table from a composite of its two fragment crops.
 
@@ -335,7 +337,7 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict)
             # page_no identifies the FIRST page represented by the stitched
             # cross-page composite.
             res = extract_page(model_png, client, timeout=_REFINE_TIMEOUT_S,
-                               page_no=prev.get("page"))
+                               page_no=prev.get("page"), decode=decode)
         except Exception:
             return None
         if not res["ok"] or not res["data"]:
@@ -791,7 +793,7 @@ def _raw_deterministic(file_path, output_dir, config, input_class,
     })
 
 
-def _extract_and_caption_media(file_path, output_dir, client) -> list[dict]:
+def _extract_and_caption_media(file_path, output_dir, client, decode=None) -> list[dict]:
     """Embedded workbook pictures -> image-modality captions.
 
     The picture goes through the normal bucket prep + extract_page, and we
@@ -815,7 +817,7 @@ def _extract_and_caption_media(file_path, output_dir, client) -> list[dict]:
                 enh, _bucket = prepare_image_bucketed(img.convert("RGB"))
             prepped = m["path"] + ".prepped.png"
             enh.save(prepped)
-            res = extract_page(prepped, client)
+            res = extract_page(prepped, client, decode=decode)
             if res.get("ok") and res.get("data"):
                 sj = res["data"]
                 figs = [f for f in (sj.get("figures") or [])
@@ -846,7 +848,8 @@ def _select_text_blocks(blocks, page_range):
     return [pair for pair in numbered if start <= pair[0] <= end]
 
 
-def _extract_text_pages(file_path, output_dir, config, input_class, client, progress):
+def _extract_text_pages(file_path, output_dir, config, input_class, client, progress,
+                        decode=None):
     """Text modality: deterministic extractor -> paginate -> per-page model call.
 
     Honors config.page_range (1-indexed inclusive) exactly like the image
@@ -873,7 +876,7 @@ def _extract_text_pages(file_path, output_dir, config, input_class, client, prog
     results: dict[int, dict] = {}
     with ThreadPoolExecutor(max_workers=max(1, config.vlm_concurrency)) as pool:
         futures = {
-            pool.submit(_process_one_text_page, i, block, client): i
+            pool.submit(_process_one_text_page, i, block, client, decode): i
             for i, block in selected
         }
         done = 0
@@ -906,7 +909,8 @@ def _trace_page(trace, page_no, pr, ms):
 
 def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
                              client=None, raw=False, trace=None,
-                             summary_mode=None, summary_max_chars=None) -> PipelineResult:
+                             summary_mode=None, summary_max_chars=None,
+                             decode=None) -> PipelineResult:
     """Turn an uploaded file into a shrew-ocr-preview PipelineResult.
 
     Image modality (pdf/image/office):
@@ -928,6 +932,8 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     os.makedirs(output_dir, exist_ok=True)
     input_class = classify_file(file_path)
     trace = trace or telemetry.NullTrace()
+    # One decode policy per document (env defaults unless the request overrode it).
+    decode = decode or DecodePolicy.from_env()
 
     if raw and os.path.splitext(file_path)[1].lower() in RAW_DETERMINISTIC_EXTENSIONS:
         return _raw_deterministic(file_path, output_dir, config, input_class,
@@ -948,12 +954,12 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     if input_class in TEXT_CLASSES:
         trace.phase("transcribe_start")
         page_results, total_pages, _ = _extract_text_pages(
-            file_path, output_dir, config, input_class, client, progress,
+            file_path, output_dir, config, input_class, client, progress, decode,
         )
         trace.mark_pages_done(len(page_results))
         trace.phase("transcribe_done")
         spreadsheet_media = (
-            _extract_and_caption_media(file_path, output_dir, client)
+            _extract_and_caption_media(file_path, output_dir, client, decode)
             if input_class == "spreadsheet" else []
         )
     else:
@@ -982,7 +988,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
             futures = {
                 pool.submit(
                     _process_one_page, pno, page_images[pno][1], config, output_dir,
-                    client, input_class, fallback_client,
+                    client, input_class, fallback_client, decode,
                 ): pno
                 for pno in page_numbers
             }
@@ -1034,7 +1040,8 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     # only (text-modality tables have null bboxes and never stitch anyway).
     trace.phase("assemble_start")
     stitch_stats: dict = {}
-    table_refiner = (make_table_refiner(hires_images, output_dir, client, stitch_stats)
+    table_refiner = (make_table_refiner(hires_images, output_dir, client, stitch_stats,
+                                        decode=decode)
                      if hires_images else None)
 
     doc = assemble_document(
@@ -1101,6 +1108,9 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         "failed_pages": sum(1 for pr in page_results if not pr["ok"]),
         "modality": "text" if input_class in TEXT_CLASSES else "image",
         "gates": gate_metrics(page_results),
+        # How the pages were decoded (temperature per rung, seed policy), so a
+        # sampled run's output is attributable and reproducible from the log.
+        "decode": decode.describe(),
         "table_stitch": {
             "attempted": stitch_stats.get("attempted", 0),
             "model_refined": stitch_stats.get("model_refined", 0),

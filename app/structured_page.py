@@ -22,6 +22,8 @@ is flagged ``schema_coerced`` so downstream can filter or de-rank it.
 """
 
 import json
+import hashlib
+from dataclasses import dataclass, replace
 import logging
 import os
 import re
@@ -382,6 +384,115 @@ def enforcement_params() -> dict:
     if RETRY_PP:
         out["presence_penalty"] = RETRY_PP
     return out
+
+
+# --------------------------------------------------------------------------- decode policy (temperature / seed)
+
+# Operator knobs for the first-pass and retry sampling temperature and the
+# sampling seed (2026-09-26). The DEFAULTS reproduce the shipped ladder byte for
+# byte: temperature 0 on every rung and no `seed` field in any request.
+#
+#   SHREW_TRY1_TEMP    first pass AND its same-config re-rolls   (default 0)
+#   SHREW_TRY2_TEMP    the enforced retry                        (default 0)
+#   SHREW_SEED_POLICY  fixed (default) | random | <integer>
+#
+# fixed   -> seed derived from the page input (the model-input image, or the
+#            text page) plus the attempt index: a rerun of the same page
+#            reproduces, and each later attempt is a genuinely different sample.
+# random  -> no seed sent; the backend samples freshly every time.
+# <int>   -> that seed on every attempt (a re-roll then repeats its sample).
+#
+# A seed only exists for a SAMPLED attempt (temperature > 0); a greedy attempt
+# never carries one, so the policy is inert at the defaults. Per-request
+# overrides (/v1/convert `temperature`, `retry_temperature`, `seed_policy`) are
+# validated against the same rules; an invalid value is a 400, never a fallback.
+SEED_POLICIES = ("fixed", "random")
+MAX_TEMPERATURE = 2.0
+_SEED_MOD = 2 ** 31
+
+
+def parse_temperature(value, name: str = "temperature") -> float:
+    try:
+        t = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number in [0, {MAX_TEMPERATURE}], got {value!r}") from None
+    if not (0.0 <= t <= MAX_TEMPERATURE):
+        raise ValueError(f"{name} must be in [0, {MAX_TEMPERATURE}], got {t}")
+    return t
+
+
+def parse_seed_policy(value, name: str = "seed_policy"):
+    """'fixed' | 'random' | a non-negative integer below 2**31."""
+    v = str(value).strip().lower()
+    if v in SEED_POLICIES:
+        return v
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError(f"{name} must be 'fixed', 'random' or an integer, got {value!r}") from None
+    if not (0 <= n < _SEED_MOD):
+        raise ValueError(f"{name} integer must be in [0, {_SEED_MOD}), got {n}")
+    return n
+
+
+@dataclass(frozen=True)
+class DecodePolicy:
+    try1_temp: float = 0.0
+    try2_temp: float = 0.0
+    seed_policy: object = "fixed"          # "fixed" | "random" | int
+
+    @classmethod
+    def from_env(cls) -> "DecodePolicy":
+        return cls(
+            try1_temp=parse_temperature(os.environ.get("SHREW_TRY1_TEMP", "0"), "SHREW_TRY1_TEMP"),
+            try2_temp=parse_temperature(os.environ.get("SHREW_TRY2_TEMP", "0"), "SHREW_TRY2_TEMP"),
+            seed_policy=parse_seed_policy(os.environ.get("SHREW_SEED_POLICY", "fixed"), "SHREW_SEED_POLICY"),
+        )
+
+    def with_overrides(self, *, temperature=None, retry_temperature=None,
+                       seed_policy=None) -> "DecodePolicy":
+        """Per-request overrides; None keeps the value already in force."""
+        return replace(
+            self,
+            try1_temp=self.try1_temp if temperature is None else parse_temperature(temperature),
+            try2_temp=(self.try2_temp if retry_temperature is None
+                       else parse_temperature(retry_temperature, "retry_temperature")),
+            seed_policy=self.seed_policy if seed_policy is None else parse_seed_policy(seed_policy),
+        )
+
+    def seed_for(self, input_key: str, attempt_index: int, temperature: float):
+        """The seed to send for one attempt, or None to send no seed field."""
+        if not temperature or self.seed_policy == "random":
+            return None
+        if isinstance(self.seed_policy, int):
+            return self.seed_policy
+        digest = hashlib.sha256(f"{input_key}:{attempt_index}".encode()).digest()
+        return int.from_bytes(digest[:4], "big") % _SEED_MOD
+
+    def describe(self) -> dict:
+        return {"try1_temperature": self.try1_temp, "try2_temperature": self.try2_temp,
+                "seed_policy": self.seed_policy}
+
+
+def page_input_key(messages: list[dict]) -> str:
+    """Stable hash of a page request's input — for image pages this covers the
+    base64 model-input PNG, i.e. it is the image hash."""
+    return hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()
+
+
+def _sampling(base_temp, base_extra, decode_temp, decode: "DecodePolicy",
+              input_key: str, attempt_index: int):
+    """(temperature, extra_params) for one attempt. At temperature 0 this
+    returns the stage's own values UNCHANGED (same objects, same JSON: the
+    table's int 0 stays `0`, not `0.0`), so the default payload is byte-identical
+    to the pre-knob ladder."""
+    if not decode_temp:
+        return base_temp, base_extra
+    extra = dict(base_extra or {})
+    seed = decode.seed_for(input_key, attempt_index, decode_temp)
+    if seed is not None:
+        extra["seed"] = seed
+    return decode_temp, (extra or None)
 
 
 # --------------------------------------------------------------------------- §5.1 degeneration gate
@@ -920,16 +1031,24 @@ COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
 
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
-             min_content_chars: int = 0, page_no: int | None = None) -> dict:
-    """Run the §3 first pass + at most one flagged enforcement retry."""
+             min_content_chars: int = 0, page_no: int | None = None,
+             decode: "DecodePolicy | None" = None) -> dict:
+    """Run the §3 first pass + at most one flagged enforcement retry.
+
+    ``decode`` carries the temperature/seed knobs (env defaults when None);
+    at the defaults every request is identical to the pre-knob ladder."""
     params = get_generation_params(client.model, "structured_page")
+    decode = decode or DecodePolicy.from_env()
+    input_key = page_input_key(messages)
+    t1, x1 = _sampling(params["temperature"], params["extra_params"],
+                       decode.try1_temp, decode, input_key, 0)
 
     # ── First pass: minimal params, no enforcement ──────────────────────────
     text, finish_reason, guard = _call(
         messages, client,
         max_tokens=max_tokens,
-        temperature=params["temperature"],
-        extra_params=params["extra_params"],
+        temperature=t1,
+        extra_params=x1,
         timeout=timeout,
         page_no=page_no, attempt="attempt 1/2, first pass",
     )
@@ -965,11 +1084,15 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
     while aborted and rerolls > 0:
         rerolls -= 1
         attempt += 1
+        # Same config as the first pass; under a sampled first pass with the
+        # fixed seed policy the attempt index makes it a different sample.
+        rt, rx = _sampling(params["temperature"], params["extra_params"],
+                           decode.try1_temp, decode, input_key, attempt - 1)
         text, finish_reason, guard = _call(
             messages, client,
             max_tokens=max_tokens,
-            temperature=params["temperature"],
-            extra_params=params["extra_params"],
+            temperature=rt,
+            extra_params=rx,
             timeout=timeout,
             page_no=page_no, attempt=f"attempt {attempt}, re-roll (same config)",
         )
@@ -986,11 +1109,14 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
     first_verdict = verdict
     first_error = error
 
+    t2, x2 = _sampling(params["temperature"],
+                       {**(params["extra_params"] or {}), **enforcement_params()},
+                       decode.try2_temp, decode, input_key, attempt)
     rtext, rfinish, rguard = _call(
         messages, client,
         max_tokens=max_tokens,
-        temperature=params["temperature"],
-        extra_params={**(params["extra_params"] or {}), **enforcement_params()},
+        temperature=t2,
+        extra_params=x2,
         timeout=timeout,
         page_no=page_no, attempt="attempt 2/2, enforced retry",
     )
@@ -1045,7 +1171,8 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 
 
 def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS,
-                  timeout=None, page_no: int | None = None) -> dict:
+                  timeout=None, page_no: int | None = None,
+                  decode: "DecodePolicy | None" = None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
     ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
@@ -1062,13 +1189,14 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
     # legitimately coerces to a tiny result.
     return _extract(build_image_messages(image_path), client,
                     max_tokens=max_tokens, timeout=timeout,
-                    min_content_chars=COERCED_MIN_CHARS, page_no=page_no)
+                    min_content_chars=COERCED_MIN_CHARS, page_no=page_no, decode=decode)
 
 
 def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        max_model_len: int = MAX_MODEL_LEN,
                        max_chars: int = TEXT_PAGE_MAX_CHARS, timeout=None,
-                       page_no: int | None = None) -> dict:
+                       page_no: int | None = None,
+                       decode: "DecodePolicy | None" = None) -> dict:
     """Run structured extraction on one text page (§2 text modality).
 
     §5.4 — never truncate: a page over the size bound is filtered and reported,
@@ -1084,7 +1212,7 @@ def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        f"text-page bound; filtered rather than truncated",
                        0, len(text))
     return _extract(build_text_messages(text), client,
-                    max_tokens=max_tokens, timeout=timeout, page_no=page_no)
+                    max_tokens=max_tokens, timeout=timeout, page_no=page_no, decode=decode)
 
 
 # --------------------------------------------------------------------------- text pagination

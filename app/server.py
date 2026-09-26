@@ -40,6 +40,7 @@ from .rasterizer import (
 )
 from .progress import ProgressReporter
 from .structured_page import (
+    DecodePolicy,
     EMPTY_200_ALERT_THRESHOLD,
     MAX_MODEL_LEN,
     MAX_TOKENS,
@@ -152,6 +153,9 @@ async def lifespan(app: FastAPI):
 
     start = time.time()
     _config = ServerConfig.from_env()
+    # Fail fast on a malformed SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY
+    # rather than on the first page of the first request.
+    logger.info("decode policy: %s", DecodePolicy.from_env().describe())
     _sweep_stale_tmp()
 
     # Every throttle in this process (VLM gate, rasterize lock, pipeline
@@ -604,6 +608,21 @@ def _tel_sample_s() -> float:
         return 10.0
 
 
+def _validate_decode_params(temperature, retry_temperature, seed_policy):
+    """Per-request decode overrides: first-pass ``temperature``,
+    ``retry_temperature`` (enforced retry) and ``seed_policy`` — same rules as
+    SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY; all None = env
+    defaults. An invalid value is a client error (400), never a silent fallback."""
+    if temperature is None and retry_temperature is None and seed_policy is None:
+        return None
+    try:
+        return DecodePolicy.from_env().with_overrides(
+            temperature=temperature, retry_temperature=retry_temperature,
+            seed_policy=seed_policy)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+
 def _validate_summary_params(summary_mode, summary_max_chars):
     """Per-request doc-summary overrides: same enum / limits as the env knobs
     (SHREW_DOC_SUMMARY_MODE / SHREW_DOC_SUMMARY_MAX_CHARS); None = env default.
@@ -631,6 +650,9 @@ async def convert(
     high_dpi: int = Form(200),
     summary_mode: Optional[str] = Form(None),        # per-request SHREW_DOC_SUMMARY_MODE
     summary_max_chars: Optional[str] = Form(None),   # per-request SHREW_DOC_SUMMARY_MAX_CHARS (400 if invalid)
+    temperature: Optional[str] = Form(None),         # per-request SHREW_TRY1_TEMP (400 if invalid)
+    retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
+    seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
 ):
     if format not in ("json", "markdown"):
         raise HTTPException(422, "format must be 'json' or 'markdown'")
@@ -639,6 +661,7 @@ async def convert(
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -775,6 +798,7 @@ async def convert(
                     trace=trace,
                     summary_mode=summary_mode,
                     summary_max_chars=summary_max_chars,
+                    decode=decode,
                 )
             return run_pipeline(
                 tmp_path, output_dir, config,
@@ -839,12 +863,16 @@ async def convert_stream(
     high_dpi: int = Form(200),
     summary_mode: Optional[str] = Form(None),        # per-request SHREW_DOC_SUMMARY_MODE
     summary_max_chars: Optional[str] = Form(None),   # per-request SHREW_DOC_SUMMARY_MAX_CHARS (400 if invalid)
+    temperature: Optional[str] = Form(None),         # per-request SHREW_TRY1_TEMP (400 if invalid)
+    retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
+    seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
 ):
     skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document with SSE streaming progress."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -918,6 +946,7 @@ async def convert_stream(
                     trace=trace,
                     summary_mode=summary_mode,
                     summary_max_chars=summary_max_chars,
+                    decode=decode,
                 )
             else:
                 result = run_pipeline(
