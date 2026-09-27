@@ -259,6 +259,11 @@ rerun of the same page reproduces and each later attempt is a different sample;
 `seed_policy` and `retry_enforce` (same rules; invalid → HTTP 400). The full
 recipe used — both temperatures, the seed policy, both presence penalties and
 whether the retry was enforced — is reported in `processing_log.decode`.
+Each page records `rescued_by` — `none`, `reroll`, `retry_enforced`,
+`retry_unenforced` or `fallback` — and `model_calls`. `schema_coerced` means
+"rescued by the retry tier" for historical reasons, enforced or not, and
+`attempts` keeps its historical value; `processing_log.decode` tallies
+`rescued_by`, `attempts` and `model_calls` per document.
 
 **Using OpenRouter** instead of a local VLM:
 ```bash

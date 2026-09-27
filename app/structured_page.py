@@ -612,7 +612,8 @@ class RepetitionGuard:
                  threshold: float = STREAM_GUARD_RATIO,
                  consecutive: int = STREAM_GUARD_CONSECUTIVE,
                  page_no: int | None = None,
-                 attempt: str | None = None):
+                 attempt: str | None = None,
+                 doc_id: str | None = None):
         self.window = window
         self.check_every = check_every
         self.threshold = threshold
@@ -623,6 +624,8 @@ class RepetitionGuard:
         # the page); attempt distinguishes first pass from the enforced retry.
         self.page_no = page_no
         self.attempt = attempt
+        # Joins guard lines to their document when many documents stream at once.
+        self.doc_id = doc_id
         self.violations = 0
         self.ratio = 0.0
         self.max_ratio = 0.0
@@ -645,18 +648,24 @@ class RepetitionGuard:
             return None
         self.fired = True
         self.position = n
-        context = ""
-        if self.page_no is not None:
-            context = f"Page {self.page_no}"
-            if self.attempt:
-                context += f" ({self.attempt})"
-            context += ": "
+        context = self.log_context()
         logger.warning(
             "%srepetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
             "for %d consecutive windows",
             context, n, self.ratio, self.threshold, self.violations,
         )
         return REPETITION_ABORT
+
+    def log_context(self) -> str:
+        """'Doc <id> Page N (attempt): ' — each part only when known."""
+        context = ""
+        if self.page_no is not None:
+            context = f"Page {self.page_no}"
+            if self.attempt:
+                context += f" ({self.attempt})"
+        if self.doc_id:
+            context = f"Doc {self.doc_id} {context}".rstrip()
+        return context + ": " if context else ""
 
     def stats(self) -> dict:
         return {
@@ -778,12 +787,7 @@ class StreamGuards:
         if self.json_close is not None:
             reason = self.json_close(chunk, accumulated)
             if reason:
-                context = ""
-                if self.repetition.page_no is not None:
-                    context = f"Page {self.repetition.page_no}"
-                    if self.repetition.attempt:
-                        context += f" ({self.repetition.attempt})"
-                    context += ": "
+                context = self.repetition.log_context()
                 logger.warning("%sjson_close at %d chars (%d trailing chars dropped)",
                                context, self.json_close.close_index, self.json_close.trailing)
                 return reason
@@ -874,10 +878,20 @@ def reset_empty_200_streak() -> None:
         _empty_streak = 0
 
 
+# Which rung produced a page's result. schema_coerced predates the un-enforced
+# retry and means "rescued by the retry tier" (kept for the density floor and the
+# gate counts); rescued_by is the unambiguous name for the rung.
+RESCUED_BY = ("none", "reroll", "retry_enforced", "retry_unenforced", "fallback")
+
+
 def _result(ok, data, status, error, attempts, raw_len, *,
             schema_coerced=False, degenerate=False, repetition_abort=False,
-            loop_guard=None) -> dict:
+            loop_guard=None, rescued_by="none", model_calls=None) -> dict:
     return {
+        "rescued_by": rescued_by,
+        # `attempts` keeps its historical value (2 for every retry-tier result,
+        # even after a re-roll); model_calls is the exact number of VLM calls.
+        "model_calls": attempts if model_calls is None else model_calls,
         "ok": ok,
         "data": data,
         "status": status,
@@ -1003,7 +1017,7 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
 
 
 def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
-          page_no=None, attempt=None):
+          page_no=None, attempt=None, doc_id=None):
     """One model call, streamed when the §5.2 guard is on.
 
     Streaming changes nothing about sampling — greedy is greedy — so the eval
@@ -1020,7 +1034,7 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
         choice = result["choices"][0]
         return choice["message"].get("content") or "", choice.get("finish_reason"), None
 
-    rep = RepetitionGuard(page_no=page_no, attempt=attempt)
+    rep = RepetitionGuard(page_no=page_no, attempt=attempt, doc_id=doc_id)
     guard = StreamGuards(rep, JsonCloseGuard()) if JSON_CLOSE_GUARD_ENABLED else rep
     result = client.chat_completion_stream(
         messages, max_tokens=max_tokens, temperature=temperature,
@@ -1068,7 +1082,7 @@ COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
              min_content_chars: int = 0, page_no: int | None = None,
-             decode: "DecodePolicy | None" = None) -> dict:
+             decode: "DecodePolicy | None" = None, doc_id: str | None = None) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry.
 
     ``decode`` carries the temperature/seed knobs (env defaults when None);
@@ -1086,6 +1100,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         temperature=t1,
         extra_params=x1,
         timeout=timeout,
+        doc_id=doc_id,
         page_no=page_no, attempt="attempt 1/2, first pass",
     )
     parsed, verdict, error = _gate(text, finish_reason, guard)
@@ -1130,6 +1145,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
             temperature=rt,
             extra_params=rx,
             timeout=timeout,
+            doc_id=doc_id,
             page_no=page_no, attempt=f"attempt {attempt}, re-roll (same config)",
         )
         parsed, verdict, error = _gate(text, finish_reason, guard)
@@ -1137,7 +1153,8 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         aborted = finish_reason == REPETITION_ABORT
         if verdict == "ok":
             return _result(True, parsed, "ok", None, attempt, len(text),
-                           loop_guard=guard.stats() if guard else None)
+                           loop_guard=guard.stats() if guard else None,
+                           rescued_by="reroll")
 
     # ── Retry tier: ONE attempt, enforcement on, flagged ────────────────────
     # Enforcement is for FORM failures (parse/schema) a changed request can fix,
@@ -1153,6 +1170,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         temperature=t2,
         extra_params=x2,
         timeout=timeout,
+        doc_id=doc_id,
         page_no=page_no, attempt=("attempt 2/2, enforced retry" if decode.try2_enforce
                                   else "attempt 2/2, un-enforced retry"),
     )
@@ -1183,12 +1201,16 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
                            f"— hallucination-slop signature, counted failed",
                            2, len(rtext), schema_coerced=True,
                            degenerate=(first_verdict == "degenerate"),
-                           repetition_abort=aborted, loop_guard=stats)
+                           repetition_abort=aborted, loop_guard=stats,
+                           model_calls=attempt + 1)
         # Well-formed but outside the validated distribution — flag it so
         # downstream can filter or de-rank.
         return _result(True, rparsed, "ok_coerced", None, 2, len(rtext),
                        schema_coerced=True, degenerate=(first_verdict == "degenerate"),
-                       repetition_abort=aborted, loop_guard=stats)
+                       repetition_abort=aborted, loop_guard=stats,
+                       rescued_by=("retry_enforced" if decode.try2_enforce
+                                   else "retry_unenforced"),
+                       model_calls=attempt + 1)
 
     # Still failing → page-level failure record; the doc-level pipeline continues.
     status = {
@@ -1200,7 +1222,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
                    f"first={first_verdict}:{first_error}; retry={rverdict}:{rerror}",
                    2, len(rtext), degenerate=(first_verdict == "degenerate"
                                               or rverdict == "degenerate"),
-                   repetition_abort=aborted, loop_guard=stats)
+                   repetition_abort=aborted, loop_guard=stats, model_calls=attempt + 1)
 
 
 # --------------------------------------------------------------------------- public API
@@ -1208,7 +1230,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 
 def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS,
                   timeout=None, page_no: int | None = None,
-                  decode: "DecodePolicy | None" = None) -> dict:
+                  decode: "DecodePolicy | None" = None, doc_id: str | None = None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
     ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
@@ -1225,14 +1247,16 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
     # legitimately coerces to a tiny result.
     return _extract(build_image_messages(image_path), client,
                     max_tokens=max_tokens, timeout=timeout,
-                    min_content_chars=COERCED_MIN_CHARS, page_no=page_no, decode=decode)
+                    min_content_chars=COERCED_MIN_CHARS, page_no=page_no, decode=decode,
+                    doc_id=doc_id)
 
 
 def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        max_model_len: int = MAX_MODEL_LEN,
                        max_chars: int = TEXT_PAGE_MAX_CHARS, timeout=None,
                        page_no: int | None = None,
-                       decode: "DecodePolicy | None" = None) -> dict:
+                       decode: "DecodePolicy | None" = None,
+                       doc_id: str | None = None) -> dict:
     """Run structured extraction on one text page (§2 text modality).
 
     §5.4 — never truncate: a page over the size bound is filtered and reported,
@@ -1248,7 +1272,8 @@ def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
                        f"text-page bound; filtered rather than truncated",
                        0, len(text))
     return _extract(build_text_messages(text), client,
-                    max_tokens=max_tokens, timeout=timeout, page_no=page_no, decode=decode)
+                    max_tokens=max_tokens, timeout=timeout, page_no=page_no, decode=decode,
+                    doc_id=doc_id)
 
 
 # --------------------------------------------------------------------------- text pagination

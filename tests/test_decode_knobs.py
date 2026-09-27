@@ -228,3 +228,170 @@ def test_describe_records_the_whole_recipe(monkeypatch):
     d2 = DecodePolicy(0.4, 0.4, 7, False).describe()
     assert (d2["try1_temperature"], d2["try2_temperature"], d2["seed_policy"], d2["try2_enforce"]) == (0.4, 0.4, 7, False)
     json.dumps(d2)                                              # log-serialisable
+
+
+# ── rescued_by: which rung produced the page (hub 2026-09-27) ────────────────
+
+class _SeqClient:
+    """Streams scripted completions in call order through on_delta."""
+    model = "shrew-ocr-preview"
+
+    def __init__(self, completions):
+        self.q = list(completions)
+
+    def chat_completion_stream(self, messages, *, max_tokens, temperature, extra_params,
+                               timeout, on_delta, wall_clock_s):
+        text, acc, reason = self.q.pop(0), "", None
+        for i in range(0, len(text), 50):
+            acc += text[i:i + 50]
+            reason = on_delta(text[i:i + 50], acc)
+            if reason:
+                break
+        return {"choices": [{"message": {"role": "assistant", "content": acc},
+                             "finish_reason": reason or "stop"}]}
+
+
+def _run(completions, **policy):
+    import sys
+    sys.path.insert(0, str(HERE))
+    import decode_payload_capture as cap
+    seq = [{"GOOD": cap.GOOD, "LOOP": cap.LOOP}.get(c, c) for c in completions]
+    return sp.extract_text_page("A short text page.", _SeqClient(seq), page_no=1,
+                                decode=DecodePolicy(**policy))
+
+
+@pytest.mark.parametrize("script, policy, want_status, want_rescued, want_coerced", [
+    (["GOOD"], {}, "ok", "none", False),
+    (["LOOP", "GOOD"], {}, "ok", "reroll", False),
+    (["not json", "GOOD"], {}, "ok_coerced", "retry_enforced", True),
+    (["not json", "GOOD"], {"try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
+    (["LOOP", "LOOP", "GOOD"], {"try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
+    (["not json", "still not json"], {}, "failed", "none", False),
+])
+def test_rescued_by_names_the_rung(script, policy, want_status, want_rescued, want_coerced):
+    r = _run(script, **policy)
+    assert r["status"] == want_status
+    assert r["rescued_by"] == want_rescued
+    # schema_coerced keeps its historical meaning: "rescued by the retry tier",
+    # enforced or not — the density floor and gate counts depend on it.
+    assert r["schema_coerced"] is want_coerced
+
+
+def test_rescued_by_flows_to_page_results_and_the_decode_log():
+    from app.structured_pipeline import _page_result, rescued_by_counts
+    prs = [_page_result(i, {"ok": True, "data": {}, "status": "ok", "rescued_by": rb})
+           for i, rb in enumerate(["none", "none", "reroll", "retry_unenforced"], 1)]
+    prs.append(_page_result(5, {"ok": False, "data": None, "status": "failed"}))  # legacy / no field
+    assert [p["rescued_by"] for p in prs] == ["none", "none", "reroll", "retry_unenforced", "none"]
+    assert rescued_by_counts(prs) == {"none": 3, "reroll": 1, "retry_enforced": 0,
+                                      "retry_unenforced": 1, "fallback": 0}
+
+
+# ── attempts / model_calls / doc id on guard lines (hub addendum 2026-09-27) ─
+
+@pytest.mark.parametrize("script, policy, attempts, calls", [
+    (["GOOD"], {}, 1, 1),
+    (["LOOP", "GOOD"], {}, 2, 2),                                   # re-roll rescue
+    (["not json", "GOOD"], {}, 2, 2),                               # retry, no re-roll
+    (["LOOP", "LOOP", "GOOD"], {"try2_enforce": False}, 2, 3),      # re-roll then retry
+    (["LOOP", "LOOP", "LOOP"], {}, 2, 3),                           # all rungs fail
+])
+def test_attempts_keeps_its_value_and_model_calls_is_exact(script, policy, attempts, calls):
+    r = _run(script, **policy)
+    assert r["attempts"] == attempts                    # historical value unchanged
+    assert r["model_calls"] == calls
+
+
+def test_page_record_and_decode_log_carry_attempts():
+    from app.structured_pipeline import _page_result, attempt_counts
+    prs = [_page_result(1, {"ok": True, "data": {}, "status": "ok", "attempts": 1, "model_calls": 1,
+                            "rescued_by": "none"}),
+           _page_result(2, {"ok": True, "data": {}, "status": "ok", "attempts": 2, "model_calls": 2,
+                            "rescued_by": "reroll"}),
+           _page_result(3, {"ok": True, "data": {}, "status": "ok_coerced", "attempts": 2,
+                            "model_calls": 3, "rescued_by": "retry_unenforced",
+                            "schema_coerced": True})]
+    assert [(p["attempts"], p["model_calls"], p["rescued_by"]) for p in prs] == \
+        [(1, 1, "none"), (2, 2, "reroll"), (2, 3, "retry_unenforced")]
+    # a re-roll success is no longer indistinguishable from a first-pass success
+    assert prs[1]["status"] == prs[0]["status"] == "ok" and prs[1]["rescued_by"] != prs[0]["rescued_by"]
+    assert attempt_counts(prs) == {"attempts": {"1": 1, "2": 2}, "model_calls": 6}
+
+
+def test_guard_lines_carry_the_doc_id(caplog):
+    import logging
+    import sys
+    sys.path.insert(0, str(HERE))
+    import decode_payload_capture as cap
+    caplog.set_level(logging.WARNING, logger="shrew.structured_page")
+    sp.extract_text_page("x", _SeqClient([cap.LOOP, cap.GOOD]), page_no=4,
+                         decode=DecodePolicy(), doc_id="abc123def4567890")
+    lines = [r.getMessage() for r in caplog.records if "repetition_abort" in r.getMessage()]
+    assert lines and lines[0].startswith("Doc abc123def4567890 Page 4 (attempt 1/2, first pass): ")
+
+
+def test_guard_line_format_is_unchanged_without_a_doc_id():
+    g = sp.RepetitionGuard(page_no=3, attempt="attempt 1/2, first pass")
+    assert g.log_context() == "Page 3 (attempt 1/2, first pass): "
+    assert sp.RepetitionGuard().log_context() == ""
+    assert sp.RepetitionGuard(doc_id="d1").log_context() == "Doc d1: "
+
+
+# ── the policy under evaluation reaches the fallback (hub 2026-09-27) ────────
+
+def test_two_attempt_unenforced_policy_then_fallback(monkeypatch, tmp_path):
+    """First pass temp 0.4 / pp 0.3 / fixed seed, SHREW_ABORT_REROLL=0, one
+    un-enforced retry at the same setting with a fresh seed; both fail ->
+    the fallback client runs (the same `not result["ok"]` gate as today)."""
+    import app.fallback as fb
+    import app.structured_pipeline as spl
+    from PIL import Image
+    monkeypatch.setenv("SHREW_ABORT_REROLL", "0")
+    monkeypatch.setenv("SHREW_RETRY_PP", "0.3")
+    import importlib
+    importlib.reload(sp)                                        # RETRY_PP is read at import
+    try:
+        calls = []
+
+        class Rec(_SeqClient):
+            def chat_completion_stream(self, messages, **kw):
+                calls.append(kw)
+                return super().chat_completion_stream(messages, **kw)
+
+        client = Rec(["not json", "still not json"])
+        monkeypatch.setattr(spl, "extract_page", sp.extract_page)
+        fb_calls = []
+        monkeypatch.setattr(fb, "extract_page_fallback",
+                            lambda *a, **k: fb_calls.append(a) or {"summary": "rescued"})
+        img = tmp_path / "p.png"
+        Image.new("RGB", (400, 600), "white").save(img)
+        cfg = type("C", (), {"low_dpi": 100, "high_dpi": 200})()
+        pol = sp.DecodePolicy(0.4, 0.4, "fixed", False)
+        r = spl._process_one_page(1, str(img), cfg, str(tmp_path), client,
+                                  fallback_client=object(), decode=pol, doc_id="d")
+        assert len(calls) == 2                                  # two shrew attempts, no re-roll
+        first, retry = calls
+        assert first["temperature"] == retry["temperature"] == 0.4
+        assert first["extra_params"]["presence_penalty"] == retry["extra_params"]["presence_penalty"] == 0.3
+        assert "structured_outputs" not in retry["extra_params"] and "json_schema" not in retry["extra_params"]
+        assert first["extra_params"]["seed"] != retry["extra_params"]["seed"]   # fresh seed
+        assert len(fb_calls) == 1                               # fallback ran after try-2
+        assert r["status"] == "fallback_ok" and r["rescued_by"] == "fallback"
+        assert r["model_calls"] == 3
+    finally:
+        monkeypatch.delenv("SHREW_RETRY_PP")
+        importlib.reload(sp)
+
+
+def test_no_fallback_client_means_the_page_fails_after_try2(monkeypatch, tmp_path):
+    import app.structured_pipeline as spl
+    from PIL import Image
+    monkeypatch.setenv("SHREW_ABORT_REROLL", "0")
+    monkeypatch.setattr(spl, "extract_page", sp.extract_page)
+    img = tmp_path / "p.png"
+    Image.new("RGB", (400, 600), "white").save(img)
+    r = spl._process_one_page(1, str(img), type("C", (), {"low_dpi": 100, "high_dpi": 200})(),
+                              str(tmp_path), _SeqClient(["bad", "bad"]),
+                              decode=sp.DecodePolicy(0.4, 0.4, "fixed", False))
+    assert r["ok"] is False and r["status"] == "failed" and r["rescued_by"] == "none"
+    assert r["model_calls"] == 2
