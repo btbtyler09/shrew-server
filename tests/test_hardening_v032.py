@@ -249,4 +249,4 @@ def test_retry_extra_params_carry_both_dialects():
     first = get_generation_params("shrew-ocr-preview", "structured_page")["extra_params"] or {}
     retry = {**first, **enforcement_params()}
     assert "structured_outputs" in retry and "json_schema" in retry
-    assert retry["presence_penalty"] == 0.6   # retry pp overrides first-pass 0.3
+    assert retry["presence_penalty"] == enforcement_params()["presence_penalty"]   # retry pp overrides first-pass

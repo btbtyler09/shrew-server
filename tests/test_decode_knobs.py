@@ -1,10 +1,15 @@
 """Decode knobs: SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY and the
 per-request overrides (temperature, retry_temperature, seed_policy).
 
-The load-bearing test is the first one: at the defaults every request the
-ladder sends is byte-identical to the payloads recorded from the pre-knob
-source (tests/fixtures/decode_payloads_v0315.json, captured with
-tests/decode_payload_capture.py against the v0.3.15-era tree).
+The load-bearing tests are the first two:
+  * at the v0.4.0 DEFAULTS every request the ladder sends is byte-identical to
+    tests/fixtures/decode_payloads_v040.json (the recipe shipped with
+    shrew-ocr-preview v0.4: two sampled attempts at 0.4 / pp 0.3, fixed seeds,
+    un-enforced retry, no re-roll);
+  * with the v0.3.x recipe set by ENV, every request is byte-identical to
+    tests/fixtures/decode_payloads_v0315.json (recorded from the pre-knob
+    v0.3.15-era tree) — the old ladder stays one env block away.
+Both fixtures are produced by tests/decode_payload_capture.py.
 """
 import json
 import os
@@ -16,13 +21,29 @@ from app import structured_page as sp
 from app.structured_page import DecodePolicy, parse_seed_policy, parse_temperature
 
 HERE = Path(__file__).parent
-KNOBS = ("SHREW_TRY1_TEMP", "SHREW_TRY2_TEMP", "SHREW_SEED_POLICY")
+KNOBS = ("SHREW_TRY1_TEMP", "SHREW_TRY2_TEMP", "SHREW_SEED_POLICY", "SHREW_TRY2_ENFORCE",
+         "SHREW_ABORT_REROLL", "SHREW_RETRY_PP")
+
+# The v0.3.x greedy ladder, as DecodePolicy fields and as the env block an
+# operator sets to restore it (README "Decode recipe").
+V0315 = dict(try1_temp=0.0, try2_temp=0.0, seed_policy="fixed", try2_enforce=True)
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for k in KNOBS:
         monkeypatch.delenv(k, raising=False)
+
+
+@pytest.fixture
+def v0315_env(monkeypatch):
+    """Restore the v0.3.x recipe the way an operator would (SHREW_RETRY_PP is
+    read at import, so the module value is patched alongside the env)."""
+    for k, v in (("SHREW_TRY1_TEMP", "0"), ("SHREW_TRY2_TEMP", "0"),
+                 ("SHREW_TRY2_ENFORCE", "1"), ("SHREW_ABORT_REROLL", "1"),
+                 ("SHREW_RETRY_PP", "0.6")):
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(sp, "RETRY_PP", 0.6)
 
 
 def _capture(tmp_path):
@@ -36,19 +57,39 @@ def _bodies(tmp_path):
     return {k: [json.loads(b) for b in v] for k, v in _capture(tmp_path).items()}
 
 
-# ── defaults: the exact payload shipped today ───────────────────────────────
+# ── defaults: the exact payload shipped with v0.4.0 ─────────────────────────
 
-def test_default_payloads_are_byte_identical_to_the_pre_knob_ladder(tmp_path):
-    golden = json.loads((HERE / "fixtures" / "decode_payloads_v0315.json").read_text())
+def test_default_payloads_are_byte_identical_to_the_v040_recipe(tmp_path):
+    golden = json.loads((HERE / "fixtures" / "decode_payloads_v040.json").read_text())
     now = _capture(tmp_path)
     assert now.keys() == golden.keys()
     for scenario in golden:
         assert now[scenario] == golden[scenario], scenario   # string compare = byte compare
 
 
-def test_defaults_parse_to_greedy_fixed():
+def test_v0315_recipe_by_env_is_byte_identical_to_the_pre_knob_ladder(v0315_env, tmp_path):
+    golden = json.loads((HERE / "fixtures" / "decode_payloads_v0315.json").read_text())
+    now = _capture(tmp_path)
+    assert now.keys() == golden.keys()
+    for scenario in golden:
+        assert now[scenario] == golden[scenario], scenario
+
+
+def test_v040_defaults_are_two_sampled_unenforced_attempts(tmp_path):
+    b = _bodies(tmp_path)
+    first, retry = b["parse_then_retry"]
+    for body in (first, retry):
+        assert body["temperature"] == 0.4 and body["presence_penalty"] == 0.3
+        assert isinstance(body["seed"], int)
+        assert "structured_outputs" not in body and "json_schema" not in body
+    assert first["seed"] != retry["seed"]                       # the retry is a fresh sample
+    assert len(b["loop_reroll_retry"]) == 2                     # no re-roll: loop -> retry, done
+
+
+def test_defaults_parse_to_the_v040_recipe():
     d = DecodePolicy.from_env()
-    assert (d.try1_temp, d.try2_temp, d.seed_policy) == (0.0, 0.0, "fixed")
+    assert (d.try1_temp, d.try2_temp, d.seed_policy, d.try2_enforce) == (0.4, 0.4, "fixed", False)
+    assert d == DecodePolicy()                                  # env defaults == dataclass defaults
     assert d.seed_for("k", 0, 0) is None                       # greedy never carries a seed
 
 
@@ -79,7 +120,7 @@ def test_bad_seed_policy_is_rejected(bad):
 
 # ── request payloads carry temperature / seed as configured ─────────────────
 
-def test_sampled_first_pass_payload(monkeypatch, tmp_path):
+def test_sampled_first_pass_payload(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY1_TEMP", "0.4")
     b = _bodies(tmp_path)
     first = b["clean"][0]
@@ -90,7 +131,7 @@ def test_sampled_first_pass_payload(monkeypatch, tmp_path):
     assert retry["temperature"] == 0 and "seed" not in retry and "structured_outputs" in retry
 
 
-def test_sampled_retry_payload(monkeypatch, tmp_path):
+def test_sampled_retry_payload(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY2_TEMP", "0.4")
     b = _bodies(tmp_path)
     first, retry = b["parse_then_retry"]
@@ -108,7 +149,7 @@ def test_random_policy_sends_no_seed(monkeypatch, tmp_path):
             assert body["temperature"] == 0.4 and "seed" not in body
 
 
-def test_integer_policy_pins_every_attempt(monkeypatch, tmp_path):
+def test_integer_policy_pins_every_attempt(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY1_TEMP", "0.4")
     monkeypatch.setenv("SHREW_TRY2_TEMP", "0.4")
     monkeypatch.setenv("SHREW_SEED_POLICY", "77")
@@ -117,7 +158,7 @@ def test_integer_policy_pins_every_attempt(monkeypatch, tmp_path):
 
 # ── fixed-by-hash: reproducible per page, distinct per attempt ──────────────
 
-def test_fixed_seed_is_stable_across_calls_and_distinct_across_attempts(monkeypatch, tmp_path):
+def test_fixed_seed_is_stable_across_calls_and_distinct_across_attempts(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY1_TEMP", "0.4")
     monkeypatch.setenv("SHREW_TRY2_TEMP", "0.4")
     a = _bodies(tmp_path)["loop_reroll_retry"]
@@ -173,16 +214,16 @@ def test_pipeline_threads_the_request_policy_to_every_page(monkeypatch, tmp_path
     assert seen == [pol]
 
 
-# ── SHREW_TRY2_ENFORCE / retry_enforce (hub 2026-09-26 follow-up) ────────────
+# ── SHREW_TRY2_ENFORCE / retry_enforce ──────────────────────────
 
 @pytest.mark.parametrize("val", ["1", "on", "true", "YES"])
-def test_explicit_enforce_on_is_still_byte_identical(monkeypatch, tmp_path, val):
+def test_explicit_enforce_on_is_still_byte_identical(v0315_env, monkeypatch, tmp_path, val):
     monkeypatch.setenv("SHREW_TRY2_ENFORCE", val)
     golden = json.loads((HERE / "fixtures" / "decode_payloads_v0315.json").read_text())
     assert _capture(tmp_path) == golden
 
 
-def test_enforce_off_retry_uses_the_first_pass_contract(monkeypatch, tmp_path):
+def test_enforce_off_retry_uses_the_first_pass_contract(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY2_ENFORCE", "off")
     b = _bodies(tmp_path)
     first, retry = b["parse_then_retry"]
@@ -196,7 +237,7 @@ def test_enforce_off_retry_uses_the_first_pass_contract(monkeypatch, tmp_path):
         (HERE / "fixtures" / "decode_payloads_v0315.json").read_text())["clean"][0])  # first pass untouched
 
 
-def test_enforce_off_with_sampled_retry(monkeypatch, tmp_path):
+def test_enforce_off_with_sampled_retry(v0315_env, monkeypatch, tmp_path):
     monkeypatch.setenv("SHREW_TRY2_ENFORCE", "0")
     monkeypatch.setenv("SHREW_TRY2_TEMP", "0.4")
     retry = _bodies(tmp_path)["loop_reroll_retry"][2]
@@ -223,14 +264,14 @@ def test_retry_enforce_override():
 
 def test_describe_records_the_whole_recipe(monkeypatch):
     d = DecodePolicy.from_env().describe()
-    assert d == {"try1_temperature": 0.0, "try2_temperature": 0.0, "seed_policy": "fixed",
-                 "try1_pp": 0.3, "retry_pp": 0.6, "try2_enforce": True}
+    assert d == {"try1_temperature": 0.4, "try2_temperature": 0.4, "seed_policy": "fixed",
+                 "try1_pp": 0.3, "retry_pp": 0.3, "try2_enforce": False}
     d2 = DecodePolicy(0.4, 0.4, 7, False).describe()
     assert (d2["try1_temperature"], d2["try2_temperature"], d2["seed_policy"], d2["try2_enforce"]) == (0.4, 0.4, 7, False)
     json.dumps(d2)                                              # log-serialisable
 
 
-# ── rescued_by: which rung produced the page (hub 2026-09-27) ────────────────
+# ── rescued_by: which rung produced the page ──────────────────────────────
 
 class _SeqClient:
     """Streams scripted completions in call order through on_delta."""
@@ -261,14 +302,14 @@ def _run(completions, **policy):
 
 
 @pytest.mark.parametrize("script, policy, want_status, want_rescued, want_coerced", [
-    (["GOOD"], {}, "ok", "none", False),
-    (["LOOP", "GOOD"], {}, "ok", "reroll", False),
-    (["not json", "GOOD"], {}, "ok_coerced", "retry_enforced", True),
-    (["not json", "GOOD"], {"try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
-    (["LOOP", "LOOP", "GOOD"], {"try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
-    (["not json", "still not json"], {}, "failed", "none", False),
+    (["GOOD"], V0315, "ok", "none", False),
+    (["LOOP", "GOOD"], V0315, "ok", "reroll", False),
+    (["not json", "GOOD"], V0315, "ok_coerced", "retry_enforced", True),
+    (["not json", "GOOD"], {**V0315, "try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
+    (["LOOP", "LOOP", "GOOD"], {**V0315, "try2_enforce": False}, "ok_coerced", "retry_unenforced", True),
+    (["not json", "still not json"], V0315, "failed", "none", False),
 ])
-def test_rescued_by_names_the_rung(script, policy, want_status, want_rescued, want_coerced):
+def test_rescued_by_names_the_rung(v0315_env, script, policy, want_status, want_rescued, want_coerced):
     r = _run(script, **policy)
     assert r["status"] == want_status
     assert r["rescued_by"] == want_rescued
@@ -287,16 +328,16 @@ def test_rescued_by_flows_to_page_results_and_the_decode_log():
                                       "retry_unenforced": 1, "fallback": 0}
 
 
-# ── attempts / model_calls / doc id on guard lines (hub addendum 2026-09-27) ─
+# ── attempts / model_calls / doc id on guard lines ───────────────
 
 @pytest.mark.parametrize("script, policy, attempts, calls", [
-    (["GOOD"], {}, 1, 1),
-    (["LOOP", "GOOD"], {}, 2, 2),                                   # re-roll rescue
-    (["not json", "GOOD"], {}, 2, 2),                               # retry, no re-roll
-    (["LOOP", "LOOP", "GOOD"], {"try2_enforce": False}, 2, 3),      # re-roll then retry
-    (["LOOP", "LOOP", "LOOP"], {}, 2, 3),                           # all rungs fail
+    (["GOOD"], V0315, 1, 1),
+    (["LOOP", "GOOD"], V0315, 2, 2),                                   # re-roll rescue
+    (["not json", "GOOD"], V0315, 2, 2),                               # retry, no re-roll
+    (["LOOP", "LOOP", "GOOD"], {**V0315, "try2_enforce": False}, 2, 3),  # re-roll then retry
+    (["LOOP", "LOOP", "LOOP"], V0315, 2, 3),                           # all rungs fail
 ])
-def test_attempts_keeps_its_value_and_model_calls_is_exact(script, policy, attempts, calls):
+def test_attempts_keeps_its_value_and_model_calls_is_exact(v0315_env, script, policy, attempts, calls):
     r = _run(script, **policy)
     assert r["attempts"] == attempts                    # historical value unchanged
     assert r["model_calls"] == calls
@@ -337,7 +378,7 @@ def test_guard_line_format_is_unchanged_without_a_doc_id():
     assert sp.RepetitionGuard(doc_id="d1").log_context() == "Doc d1: "
 
 
-# ── the policy under evaluation reaches the fallback (hub 2026-09-27) ────────
+# ── the two-attempt recipe reaches the fallback ──────────────────────────
 
 def test_two_attempt_unenforced_policy_then_fallback(monkeypatch, tmp_path):
     """First pass temp 0.4 / pp 0.3 / fixed seed, SHREW_ABORT_REROLL=0, one
@@ -397,7 +438,7 @@ def test_no_fallback_client_means_the_page_fails_after_try2(monkeypatch, tmp_pat
     assert r["model_calls"] == 2
 
 
-# ── the /v1/convert response carries processing_log.decode (hub 2026-09-27) ──
+# ── the /v1/convert response carries processing_log.decode ────────────────
 
 def test_convert_response_carries_the_decode_block():
     from app.models import PipelineResult
@@ -418,3 +459,17 @@ def test_convert_response_carries_the_decode_block():
     assert out["table_stitch"] == log["table_stitch"] and out["doc_summary"] == log["doc_summary"]
     assert "fidelity" not in out                                 # unbounded list, left out
     json.dumps(out)
+
+
+# ── the v0.4.0 ladder: two attempts, then the fallback ───────────────────────
+
+@pytest.mark.parametrize("script, want_status, want_rescued, calls", [
+    (["GOOD"], "ok", "none", 1),
+    (["LOOP", "GOOD"], "ok_coerced", "retry_unenforced", 2),      # no re-roll rung: straight to try 2
+    (["not json", "GOOD"], "ok_coerced", "retry_unenforced", 2),
+    (["LOOP", "LOOP"], "degenerate", "none", 2),                  # -> fallback client when configured
+])
+def test_v040_default_ladder(script, want_status, want_rescued, calls):
+    r = _run(script)
+    assert (r["status"], r["rescued_by"], r["model_calls"]) == (want_status, want_rescued, calls)
+    assert r["attempts"] == min(calls, 2)

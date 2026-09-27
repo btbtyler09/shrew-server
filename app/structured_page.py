@@ -351,11 +351,12 @@ ENFORCEMENT_SCHEMA = {
 }
 
 
-# Retry-tier presence penalty (0 disables). The retry must differ from the
-# deterministic first pass; a stronger penalty is the measured lever that
-# breaks repetition ruts (12/12 loop-failed pages rescued at 0.6, VHR
-# 2026-08-16) and it composes with enforcement below.
-RETRY_PP = float(os.environ.get("SHREW_RETRY_PP", "0.6"))
+# Retry-tier presence penalty (0 disables). v0.4.0 default 0.3 — the retry runs
+# the first-pass contract at the same penalty, and the sampled retry's fresh
+# seed is what makes it differ from try 1. (The v0.3.x greedy ladder used 0.6
+# with enforcement: 12/12 loop-failed pages rescued, VHR 2026-08-16; set
+# SHREW_RETRY_PP=0.6 to restore it.)
+RETRY_PP = float(os.environ.get("SHREW_RETRY_PP", "0.3"))
 
 
 def enforcement_params() -> dict:
@@ -389,16 +390,20 @@ def enforcement_params() -> dict:
 # --------------------------------------------------------------------------- decode policy (temperature / seed)
 
 # Operator knobs for the first-pass and retry sampling temperature and the
-# sampling seed (2026-09-26). The DEFAULTS reproduce the shipped ladder byte for
-# byte: temperature 0 on every rung and no `seed` field in any request.
+# sampling seed (2026-09-26). v0.4.0 DEFAULTS are the recipe shipped with
+# shrew-ocr-preview v0.4 (two sampled attempts, then the fallback client when
+# one is configured): try 1 at temperature 0.4 / presence penalty 0.3, no
+# same-config re-roll, try 2 un-enforced at 0.4 / 0.3, fixed seeds. The v0.3.x
+# greedy ladder is one env block away (README "Decode recipe"); its payloads are
+# pinned byte for byte by tests/fixtures/decode_payloads_v0315.json.
 #
-#   SHREW_TRY1_TEMP    first pass AND its same-config re-rolls   (default 0)
-#   SHREW_TRY2_TEMP    the enforced retry                        (default 0)
+#   SHREW_TRY1_TEMP    first pass AND its same-config re-rolls   (default 0.4)
+#   SHREW_TRY2_TEMP    the retry                                 (default 0.4)
 #   SHREW_SEED_POLICY  fixed (default) | random | <integer>
-#   SHREW_TRY2_ENFORCE retry keeps schema enforcement (default on). Off: the
+#   SHREW_TRY2_ENFORCE retry keeps schema enforcement (default OFF). Off: the
 #                      retry uses the first-pass contract (no grammar) at
 #                      SHREW_TRY2_TEMP with the retry presence penalty
-#                      (SHREW_RETRY_PP) — the un-enforced retry arm.
+#                      (SHREW_RETRY_PP). On: the v0.3.x enforced retry.
 #
 # fixed   -> seed derived from the page input (the model-input image, or the
 #            text page) plus the attempt index: a rerun of the same page
@@ -452,18 +457,18 @@ def parse_seed_policy(value, name: str = "seed_policy"):
 
 @dataclass(frozen=True)
 class DecodePolicy:
-    try1_temp: float = 0.0
-    try2_temp: float = 0.0
+    try1_temp: float = 0.4
+    try2_temp: float = 0.4
     seed_policy: object = "fixed"          # "fixed" | "random" | int
-    try2_enforce: bool = True
+    try2_enforce: bool = False
 
     @classmethod
     def from_env(cls) -> "DecodePolicy":
         return cls(
-            try1_temp=parse_temperature(os.environ.get("SHREW_TRY1_TEMP", "0"), "SHREW_TRY1_TEMP"),
-            try2_temp=parse_temperature(os.environ.get("SHREW_TRY2_TEMP", "0"), "SHREW_TRY2_TEMP"),
+            try1_temp=parse_temperature(os.environ.get("SHREW_TRY1_TEMP", "0.4"), "SHREW_TRY1_TEMP"),
+            try2_temp=parse_temperature(os.environ.get("SHREW_TRY2_TEMP", "0.4"), "SHREW_TRY2_TEMP"),
             seed_policy=parse_seed_policy(os.environ.get("SHREW_SEED_POLICY", "fixed"), "SHREW_SEED_POLICY"),
-            try2_enforce=parse_bool(os.environ.get("SHREW_TRY2_ENFORCE", "1"), "SHREW_TRY2_ENFORCE"),
+            try2_enforce=parse_bool(os.environ.get("SHREW_TRY2_ENFORCE", "0"), "SHREW_TRY2_ENFORCE"),
         )
 
     def with_overrides(self, *, temperature=None, retry_temperature=None,
@@ -678,7 +683,7 @@ class RepetitionGuard:
         }
 
 
-# Stop-at-JSON-close (Tyler, 2026-09-20). Belt and braces against "close the
+# Stop-at-JSON-close (2026-09-20). Belt and braces against "close the
 # top-level object, then keep generating until the cap" — a case that is
 # THEORETICAL (unobserved in the paired eval, no reward gradient toward it), so
 # this is cheap insurance, not a fix. It cannot touch the loop failure, which
@@ -1130,7 +1135,10 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
     # loops (2/74 → 0/72), so on a repetition_abort we re-run the SAME
     # first-pass config first — the only thing that recovers this class. N is
     # tunable (SHREW_ABORT_REROLL); the enforced retry stays as the last rung.
-    rerolls = int(os.environ.get("SHREW_ABORT_REROLL", "1")) if aborted else 0
+    # v0.4.0 default 0: under the sampled recipe try 2 is already a fresh
+    # sample of the same contract, so the re-roll rung is folded into it
+    # (two attempts, then the fallback). SHREW_ABORT_REROLL=1 restores v0.3.x.
+    rerolls = int(os.environ.get("SHREW_ABORT_REROLL", "0")) if aborted else 0
     attempt = 1
     while aborted and rerolls > 0:
         rerolls -= 1

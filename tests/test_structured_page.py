@@ -95,18 +95,29 @@ def test_text_modality_sends_raw_string_not_content_parts():
 # ── §3 sampling contract ────────────────────────────────────────────────────
 
 
-def test_first_pass_sampling_is_greedy_and_bare():
-    """§3.1 (rev 2026-08-16): temperature 0, max_tokens 20000, presence_penalty
-    0.3 — nothing else (see test_generation for the measurement). Any
-    decode knob here voids Gate F and smoke_test_preview reports DRIFT. (12000
-    was the pre-bucket budget; a B3 page carries ~7k image tokens and the
-    median correct newspaper label runs past it — see the e4 spec update.)"""
+def test_first_pass_sampling_is_the_v040_recipe():
+    """v0.4.0 default first pass: temperature 0.4, max_tokens 20000, presence
+    penalty 0.3 and a fixed per-page seed — nothing else. (12000 was the
+    pre-bucket budget; a B3 page carries ~7k image tokens and the median correct
+    newspaper label runs past it.)"""
+    c = FakeClient([(GOOD, "stop")])
+    extract_page("/tmp/fake.png", c)
+    call = c.calls[0]
+    assert call["temperature"] == 0.4
+    assert call["max_tokens"] == MAX_TOKENS == 20000
+    assert set(call["extra_params"]) == {"presence_penalty", "seed"}
+    assert call["extra_params"]["presence_penalty"] == 0.3
+    assert isinstance(call["extra_params"]["seed"], int)
+
+
+def test_first_pass_under_the_v0315_ladder_is_greedy_and_bare(v0315_env):
+    """The v0.3.x contract, one env block away: temperature 0, presence penalty
+    0.3, no seed."""
     c = FakeClient([(GOOD, "stop")])
     extract_page("/tmp/fake.png", c)
     call = c.calls[0]
     assert call["temperature"] == 0
-    assert call["max_tokens"] == MAX_TOKENS == 20000
-    assert call["extra_params"] == {"presence_penalty": 0.3}   # §3 rev 2026-08-16
+    assert call["extra_params"] == {"presence_penalty": 0.3}
 
 
 def test_no_sampling_knobs_leak_in_for_qwen_named_models():
@@ -115,7 +126,8 @@ def test_no_sampling_knobs_leak_in_for_qwen_named_models():
     c = FakeClient([(GOOD, "stop")])
     c.model = "qwen3.5-35b"
     extract_page("/tmp/fake.png", c)
-    assert c.calls[0]["extra_params"] == {"presence_penalty": 0.3}
+    assert set(c.calls[0]["extra_params"]) == {"presence_penalty", "seed"}
+    assert c.calls[0]["extra_params"]["presence_penalty"] == 0.3
 
 
 # ── §3 retry tier ───────────────────────────────────────────────────────────
@@ -129,7 +141,7 @@ def test_happy_path_is_a_single_call():
     assert r["data"]["summary"] == "s"
 
 
-def test_parse_failure_retries_once_with_enforcement():
+def test_parse_failure_retries_once_with_enforcement(v0315_env):
     """§3.2: the retry is the ONLY place enforcement belongs, and it must use
     structured_outputs — guided_json is silently ignored by the fork."""
     c = FakeClient([("not json", "stop"), (GOOD, "stop")])
@@ -145,7 +157,7 @@ def test_parse_failure_retries_once_with_enforcement():
     assert retry["temperature"] == 0
 
 
-def test_schema_failure_takes_the_same_enforcement_retry():
+def test_schema_failure_takes_the_same_enforcement_retry(v0315_env):
     c = FakeClient([(BAD_SCHEMA, "stop"), (GOOD, "stop")])
     r = extract_page("/tmp/fake.png", c)
     assert r["ok"] and r["status"] == "ok_coerced" and r["schema_coerced"] is True
@@ -211,7 +223,7 @@ def test_loop_output_trips_the_gate():
     assert is_degenerate(loop)
 
 
-def test_degenerate_page_is_never_blind_retried():
+def test_degenerate_page_is_never_blind_retried(v0315_env):
     """§3.3: greedy reproduces the loop, so the retry must carry enforcement —
     and if it still fails the page is flagged degenerate, not merely failed."""
     loop = '{"summary":"' + "repeat forever. " * 1200 + '"}'

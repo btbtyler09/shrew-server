@@ -14,7 +14,7 @@ abstracts even for 594-page PDFs.
 Two ways to build the document summary for a multi-page document, chosen by
 SHREW_DOC_SUMMARY_MODE:
 
-* ``deterministic`` (DEFAULT, Tyler 2026-09-23: no extra model calls) —
+* ``deterministic`` (DEFAULT: no extra model calls) —
   composed from what the page calls already produced. Selection rule, exact:
     1. the first extracted page's summary (the title page / opening page);
     2. then the summaries of pages carrying a chunk whose section_type is
@@ -33,7 +33,7 @@ SHREW_DOC_SUMMARY_MODE:
   (``pipelines/summarize_document.json``), the same section rule
   (``_section_document(markdown, max_tokens=8000)[0]``) and the same
   generation params, plus the hard output budget.
-* ``summary_of_summaries`` (Tyler 2026-09-23) — ONE call to the same served
+* ``summary_of_summaries`` — ONE call to the same served
   model over the page summaries in page order (the whole document's coverage,
   cut at ~8,000 tokens), the legacy prompt plus a sentence saying the input
   is per-page summaries of one document.
@@ -49,7 +49,7 @@ SHREW_DOC_SUMMARY_MODE:
   processing_log ``mode_used`` = "deterministic_fallback").
 * ``off`` — summary is None for multi-page documents.
 
-MEASURED 2026-09-23 (E6 on an MI100): with the served Granite OCR model
+MEASURED 2026-09-23 (shrew-ocr-preview v0.3): with the served Granite OCR model
 (shrew-ocr-preview) BOTH ``model`` and ``summary_of_summaries`` return null —
 the model answers a free-form summary prompt in its trained 5-key JSON, which
 this module rejects. They only become meaningful behind a general-purpose

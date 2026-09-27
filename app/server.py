@@ -308,7 +308,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.3.15",
+    version="0.4.0",
     lifespan=lifespan,
 )
 

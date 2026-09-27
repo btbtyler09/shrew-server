@@ -14,10 +14,22 @@ def test_first_pass_is_greedy_plus_mild_presence_penalty():
     assert p["extra_params"] == {"presence_penalty": 0.3}   # and NOTHING else
 
 
-def test_retry_composes_enforcement_with_stronger_penalty():
+def test_retry_composes_enforcement_with_the_retry_penalty():
     e = enforcement_params()
     assert "structured_outputs" in e          # schema enforcement retry-only
-    assert e["presence_penalty"] == 0.6
+    assert e["presence_penalty"] == 0.3       # v0.4.0 default (v0.3.x: 0.6, via SHREW_RETRY_PP)
+
+
+def test_retry_pp_env_restores_the_v03_penalty(monkeypatch):
+    monkeypatch.setenv("SHREW_RETRY_PP", "0.6")
+    import app.structured_page as sp
+    importlib.reload(sp)
+    try:
+        assert sp.enforcement_params()["presence_penalty"] == 0.6
+        assert sp.DecodePolicy().describe()["retry_pp"] == 0.6
+    finally:
+        monkeypatch.delenv("SHREW_RETRY_PP")
+        importlib.reload(sp)
 
 
 def test_retry_emits_both_backend_dialects():
@@ -43,7 +55,7 @@ def test_enforce_dialect_pin(monkeypatch):
 def test_retry_penalty_overrides_first_pass_value():
     p = get_generation_params("shrew-ocr-preview", "structured_page")
     merged = {**(p["extra_params"] or {}), **enforcement_params()}
-    assert merged["presence_penalty"] == 0.6
+    assert merged["presence_penalty"] == enforcement_params()["presence_penalty"]   # retry value wins
 
 
 def test_env_zero_disables_penalties(monkeypatch):

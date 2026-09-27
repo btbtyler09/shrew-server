@@ -26,8 +26,8 @@ The default structured pipeline is built for
 [**shrew-ocr-preview**](https://huggingface.co/btbtyler09/shrew-ocr-preview) —
 our per-page document-understanding model — and implements its **entire input
 contract server-side**: glyph-routed bucket preprocessing, the
-`structured_extraction` sentinel request shape, greedy-plus-presence-penalty
-decoding, the streaming repetition guard, schema gates with coercion checks,
+`structured_extraction` sentinel request shape, the model's tested decode
+recipe (two sampled attempts with a presence penalty — see "Decode recipe"), the streaming repetition guard, schema gates with coercion checks,
 and multi-page assembly. You do not hand-build any of the model card's
 preprocessing — point the server at a vLLM endpoint serving the model and POST
 documents:
@@ -208,10 +208,13 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_DOC_SUMMARY_BLOCK_CHARS` | `contract_sos` block size in characters (the model's trained text-page bound; larger values are clamped to the context capacity and logged) | `11000` |
 | `SHREW_DOC_SUMMARY_CONCURRENCY` | `contract_sos` block calls in flight per level | `4` |
 | `SHREW_DOC_SUMMARY_LONG_DOC_PAGES` | Above this many pages, `deterministic` uses abstract-labelled pages only (reference manuals label body pages "introduction") | `30` |
-| `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0` |
-| `SHREW_TRY2_TEMP` | Sampling temperature of the enforced retry (0 = greedy) | `0` |
+| `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0.4` |
+| `SHREW_TRY1_PP` | Presence penalty of the first pass | `0.3` |
+| `SHREW_TRY2_TEMP` | Sampling temperature of the retry (0 = greedy) | `0.4` |
+| `SHREW_RETRY_PP` | Presence penalty of the retry | `0.3` |
 | `SHREW_SEED_POLICY` | Seed for sampled attempts: `fixed`, `random`, or an integer — see below | `fixed` |
-| `SHREW_TRY2_ENFORCE` | Enforced retry keeps schema enforcement; `0` = the retry uses the first-pass contract (no grammar) at `SHREW_TRY2_TEMP` and the retry presence penalty | `1` |
+| `SHREW_TRY2_ENFORCE` | Retry keeps schema enforcement; `0` = the retry uses the first-pass contract (no grammar) at `SHREW_TRY2_TEMP` and the retry presence penalty | `0` |
+| `SHREW_ABORT_REROLL` | Same-config re-rolls after a repetition abort, before the retry | `0` |
 
 **Document summary (structured mode).** Each page's model call returns a page
 summary; the document `summary` is built from them and is always bounded by
@@ -247,10 +250,20 @@ model answers free-form prompts in its structured JSON contract. They are
 useful only with a general-purpose model; a separate summary-model URL is not
 supported yet.
 
-**Decode temperature and seed (structured mode).** By default every structured
-page call is greedy (temperature 0) and carries no seed, exactly as before these
-knobs existed. `SHREW_TRY1_TEMP` sets the first pass (and the re-roll that
-repeats it after a repetition abort); `SHREW_TRY2_TEMP` sets the enforced retry.
+**Decode recipe (structured mode, v0.4.0 defaults).** Each page gets two model
+attempts, then the fallback client when one is configured. Try 1 samples at
+temperature 0.4 with presence penalty 0.3; on any failure (parse, schema,
+repetition abort) try 2 runs the same un-enforced contract at 0.4 / 0.3 with a
+fresh seed. This is the recipe shrew-ocr-preview v0.4 was measured with. To
+restore the v0.3.x greedy ladder (greedy first pass, one re-roll on a loop,
+greedy enforced retry at penalty 0.6):
+
+```bash
+SHREW_TRY1_TEMP=0 SHREW_TRY2_TEMP=0 SHREW_TRY2_ENFORCE=1 SHREW_ABORT_REROLL=1 SHREW_RETRY_PP=0.6
+```
+
+`SHREW_TRY1_TEMP` sets the first pass (and the re-roll that repeats it after a
+repetition abort, when `SHREW_ABORT_REROLL` > 0); `SHREW_TRY2_TEMP` sets the retry.
 A seed is sent only on an attempt whose temperature is above 0:
 `fixed` derives it from the page's model input plus the attempt number, so a
 rerun of the same page reproduces and each later attempt is a different sample;
@@ -534,12 +547,12 @@ Two behaviors keep a long conversion honest when things go wrong mid-run:
   inline image reference in the markdown, captioned
   `[Page N: transcription unavailable (<status>)]`. A human can still read the
   page the model couldn't.
-- **Re-roll on a repetition loop.** On a batched backend greedy decode is not
-  deterministic across batch compositions: a dense page that loops on one
-  batch draw decodes clean on another, and the enforced-retry never recovers
-  these. So on a `repetition_abort` the page is re-run with the **same**
-  first-pass config first — `SHREW_ABORT_REROLL` re-rolls (default `1`, `0` to
-  disable) — before the enforced retry, which stays as the last rung.
+- **Second attempt on a repetition loop.** A `repetition_abort` sends the page
+  to try 2 — a fresh sample of the same contract (v0.4.0 default). Under the
+  v0.3.x greedy ladder, `SHREW_ABORT_REROLL=1` re-runs the **same** first-pass
+  config once before the enforced retry, because greedy decode on a batched
+  backend is not deterministic across batch compositions and a looped page
+  often decodes clean on a second draw.
 
 ## CLI
 

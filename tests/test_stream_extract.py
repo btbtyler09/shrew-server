@@ -223,7 +223,7 @@ def test_wall_clock_excludes_queue_wait(slow_sse_server):
     assert choice["message"]["content"] == _SSEHandler.BODY
 
 
-def test_page_context_labels_both_attempts(caplog):
+def test_page_context_labels_both_attempts(v0315_env, caplog):
     """Observability port: with page_no supplied, the first pass and the
     enforced retry produce distinguishable, page-correlated abort warnings.
     Behavior (early abort, degenerate verdict, repetition_abort flag) is
