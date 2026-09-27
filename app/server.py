@@ -1042,7 +1042,10 @@ def _build_response(result: PipelineResult, skip_stage3: bool) -> dict:
         },
     }
 
-    for key in ("modality", "gates", "failed_pages"):
+    # decode: the per-document decode recipe + rescued_by / attempts / model_calls
+    # tallies; table_stitch and doc_summary are small scalar reports. fidelity is
+    # left out: its "flagged" list grows with the document.
+    for key in ("modality", "gates", "failed_pages", "decode", "table_stitch", "doc_summary"):
         if key in result.processing_log:
             response["processing_log"][key] = result.processing_log[key]
 

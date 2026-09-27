@@ -395,3 +395,26 @@ def test_no_fallback_client_means_the_page_fails_after_try2(monkeypatch, tmp_pat
                               decode=sp.DecodePolicy(0.4, 0.4, "fixed", False))
     assert r["ok"] is False and r["status"] == "failed" and r["rescued_by"] == "none"
     assert r["model_calls"] == 2
+
+
+# ── the /v1/convert response carries processing_log.decode (hub 2026-09-27) ──
+
+def test_convert_response_carries_the_decode_block():
+    from app.models import PipelineResult
+    from app.server import _build_response
+    from app.structured_pipeline import attempt_counts, rescued_by_counts
+    decode = {**DecodePolicy.from_env().describe(), "rescued_by": rescued_by_counts([]),
+              **attempt_counts([])}
+    log = {"total_pages": 1, "total_figures": 0, "total_time_seconds": 1.0, "modality": "image",
+           "gates": {"pages": 1}, "failed_pages": 0, "decode": decode,
+           "table_stitch": {"attempted": 0, "model_refined": 0},
+           "doc_summary": {"status": "ok", "chars": 10},
+           "fidelity": {"flagged": [{"token": "x"}] * 3}}
+    r = PipelineResult(clean_markdown="m", structured_json={}, processing_log=log)
+    out = _build_response(r, False)["processing_log"]
+    assert set(out["decode"]) == {"try1_temperature", "try2_temperature", "seed_policy", "try1_pp",
+                                  "retry_pp", "try2_enforce", "rescued_by", "attempts", "model_calls"}
+    assert out["decode"] == decode
+    assert out["table_stitch"] == log["table_stitch"] and out["doc_summary"] == log["doc_summary"]
+    assert "fidelity" not in out                                 # unbounded list, left out
+    json.dumps(out)
