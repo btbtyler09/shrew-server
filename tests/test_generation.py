@@ -3,7 +3,7 @@ from app.generation import get_generation_params
 
 def test_structured_page_stage_is_greedy_plus_mild_presence_penalty():
     """§3 revised 2026-08-16 (900-run decode matrix on the production stack,
-    shrew-server-private#4): first pass is EXACTLY temperature 0 +
+    issue #4): first pass is EXACTLY temperature 0 +
     presence_penalty 0.3 and nothing else. The penalty measured one-shot
     0.887 vs 0.880 bare, table-page one-shot 1.000 vs 0.975, with content and
     table fidelity flat — and it breaks the deterministic loop rut greedy

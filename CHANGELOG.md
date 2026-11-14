@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.5.0 — 2026-11-14
+
+Server for the **shrew-ocr-preview v0.5** model. The server now speaks two
+model contracts, `v0.5` and `v0.4`, named after the model's release line.
+
+**Compatibility: v0.5.0 defaults to the v0.5 model contract; set
+`SHREW_CONTRACT=v0.4` for v0.4/v0.4.1 weights.**
+
+**Upgrade notes — read before upgrading.**
+- **The default contract is `v0.5`.** If you serve a v0.4 or v0.4.1 model,
+  set `SHREW_CONTRACT=v0.4` (or send the form field `contract=v0.4`). Under
+  `v0.4` the requests sent to the model, the response shape and `/health` are
+  byte-identical to 0.4.1.
+- **`bbox` is four corners under `v0.5`** (breaking for clients that read
+  boxes): `tables[].bbox` and `images[].bbox` are
+  `[[x,y],[x,y],[x,y],[x,y]]` (top-left, top-right, bottom-right, bottom-left
+  of the element's own reading frame, 0-1000 page coordinates) in place of
+  `[x0, y0, x1, y1]`. There is no second box field.
+- Serve the v0.5 model with `--max-model-len 32768`; `/health` is `degraded`
+  below 30,000.
+- Under `v0.5` the summary modes `model` and `summary_of_summaries` run as
+  `contract_sos`.
+- Docker Compose: `SHREW_CONTRACT`, `SHREW_FIGURE_CHECK`, `SHREW_HEADING_FIX`
+  and `SHREW_LATEX_WRAP` are now passed from `docker/.env` to the server.
+- The bundled llama.cpp stack (`docker-compose.ocr.yml`) now downloads the
+  v0.5 GGUF files (revision `v0.5`) and runs the `v0.5` contract. Rebuild it
+  (`--build`) to get the new model. llama.cpp reports no token usage while
+  streaming, so there the runaway cut is the 60,000-character cap.
+- A malformed `SHREW_CONTRACT`, `SHREW_LATEX_WRAP` or
+  `SHREW_LATEX_WRAP_MIXED` stops the server at startup.
+- New dependency: `tokenizers`.
+- The README has a minimal (no PyTorch) install and an Alpine / musl recipe;
+  the default pipeline does not need the `figures` extra.
+
+**v0.5 contract.**
+- Prompts are commands: the system turn is the bare command
+  (`structured_extraction` for pages and text, `classify_figure` for figure
+  crops, `fix_headings` for the heading outline). The user turn is the image
+  alone, or one text part. Image preprocessing is unchanged.
+- Decode is the 0.4.0 recipe from the same knobs (first pass 0.4 /
+  presence penalty 0.3, un-enforced retry, fixed seed policy).
+- New output: `tables[].description`; `images[].chart_data`
+  (`{header, rows, values?, precision?}`) when the model emits one;
+  `processing_log.pages[]` with one record per page (status, bucket, model
+  calls, loop flags, and a per-call `trail`).
+- Document passes, on by default: **figure check** (crops the model classifies
+  as page artifacts are dropped), **heading fix** (heading levels repaired
+  over the document outline, accepted only when no heading text changes) and
+  **LaTeX wrap** (bare LaTeX gets math delimiters; nothing else is edited).
+  Switches: `SHREW_FIGURE_CHECK`, `SHREW_HEADING_FIX`, `SHREW_LATEX_WRAP`, and
+  the form fields `figure_check` / `heading_fix`.
+- `app.compose.compose_markdown(page_json)` is the server's page markdown as a
+  pure function, for external scorers (spec: `app/compose.md`).
+
+**Token budget (v0.5).** Every request satisfies prompt + image + `max_tokens`
+<= 30,000, the budget the model was trained under.
+- Image tokens are computed exactly from the size of the image that is sent;
+  an unreadable size is charged the maximum (7,152).
+- Prompt tokens are counted with the tokenizer the serving stack uses
+  (vendored and hash-checked), including the chat template's handling of its
+  task tags and of plain-string text content. If the tokenizer cannot be
+  loaded the count falls back to UTF-8 bytes, an upper bound.
+- Text pages are bounded at 3,500 tokens as well as 11,000 characters, so
+  dense scripts (CJK) no longer overrun. A line over the bound is split at
+  sentence ends, then whitespace, then token boundaries; it is never refused
+  or truncated. Embedded base64 `data:` payloads are replaced by
+  `[payload removed]` (`SHREW_V05_STRIP_DATA_URIS=0` keeps them).
+  `processing_log.text_pagination` reports pages, split lines and removed
+  payloads.
+- `/health` adds `budget_v05`.
+
+**Loop guard (v0.5).** The 0.4 guard (2,000-character window) stays; v0.5 adds
+content-aware guards and takes the runaway cut in output tokens.
+- Guards: a repeating block (`periodic`; numbered rows that only count up
+  get a longer allowance), repeated lines (`repeated`), and short numeric
+  cycles (`numeric`). A dense table that is correct is no longer cut: the guards
+  were accepted by replaying 41,441 saved model outputs, with 0 of 152
+  hand-checked correct long pages aborted.
+- Runaway cut in output tokens per tile bucket, from the longest outputs the
+  model was trained on plus 10% (B0 6,500 / B1 25,500 / B2 29,500 / B3 26,500 /
+  text 7,000), read from the token usage the model server reports on the
+  stream. Without usage, a 60,000-character cap applies.
+- Every abort records what fired, the score, the threshold and the last 2,000
+  characters in `processing_log.pages[].trail[].abort_evidence`.
+- A page is judged degenerate only when both the raw output and the output
+  with markup stripped compress above the gate, so HTML tables do not trip it.
+- `/health` adds `loop_guard_v05`, including which cut the streams actually
+  got. `scripts/loopguard_replay.py` replays the guard over saved outputs.
+
+**Known limits.**
+- A model server that rejects `stream_options` with HTTP 400 fails pages until
+  `SHREW_V05_STREAM_USAGE=0` is set. vLLM accepts the option.
+- A text page that literally contains one of the model chat template's task
+  tags (for example `<tables_otsl>`) is replaced by that task's prompt inside
+  the template. The server counts it correctly and logs a warning.
+- A loop that changes a number on every repeat can run to the output cut.
+
 ## v0.4.1 — 2026-10-25
 
 Security release: dependency and base-image updates only. No code, API or

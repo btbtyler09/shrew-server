@@ -16,6 +16,8 @@ from collections import Counter
 from bs4 import BeautifulSoup
 from PIL import Image
 
+from .contract import envelope
+
 _TERMINAL_END = re.compile(r'[.!?:;]["\')\]]*$')
 _LIST_LINE = re.compile(r'^\s*(?:[-*•]|\d+[.)])\s+', re.M)
 _WS = re.compile(r'\s+')
@@ -29,6 +31,9 @@ def crop_bbox(hires_img, bbox, *, min_area_frac: float = 0.015):
     page area (measured in normalized space), otherwise scales the bbox to
     the hires image's pixel dimensions and returns the cropped image.
     """
+    bbox = envelope(bbox)          # v0.5 quads crop by their envelope
+    if bbox is None:
+        return None
     x0, y0, x1, y1 = (max(0, min(1000, c)) for c in bbox)
     if x1 <= x0 or y1 <= y0:
         return None
@@ -142,7 +147,7 @@ def _norm_row_text(row) -> str:
 def should_stitch_tables(prev: dict, nxt: dict) -> bool:
     """Is `nxt` (first table of page N+1) a continuation of `prev` (last table
     of page N)? Pure geometry + structure + caption; no model call."""
-    pb, nb = prev.get("bbox"), nxt.get("bbox")
+    pb, nb = envelope(prev.get("bbox")), envelope(nxt.get("bbox"))
     if not pb or not nb:
         return False  # text-modality/null bboxes carry no position evidence
     if pb[3] < _STITCH_Y1_MIN or nb[1] > _STITCH_Y0_MAX:
@@ -237,7 +242,7 @@ _FRAGMENT_BBOX_PAD = 40
 
 def pad_bbox(bbox, pad: int = _FRAGMENT_BBOX_PAD) -> list:
     """Expand a 0-1000 normalized bbox by `pad` units per side, clamped."""
-    x0, y0, x1, y1 = bbox
+    x0, y0, x1, y1 = envelope(bbox)
     return [max(0, x0 - pad), max(0, y0 - pad),
             min(1000, x1 + pad), min(1000, y1 + pad)]
 
@@ -425,6 +430,8 @@ def assemble_document(doc_id, file_path, source, page_results,
                 "caption": table.get("caption"),
                 "html": html,
                 "flat_text": table_flat_text(html, table.get("caption")),
+                # v0.5 carries both; the v0.4 response projection ignores them.
+                "description": table.get("description"),
                 "crop_path": None,
             })
 
@@ -444,6 +451,7 @@ def assemble_document(doc_id, file_path, source, page_results,
                 # was generated at full cost and dropped here until v0.3.13
                 # (GitLab #26). Additive: None when the model omits it.
                 "description": figure.get("description"),
+                "chart_data": figure.get("chart_data"),
                 "crop_path": None,
             })
 

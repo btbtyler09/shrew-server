@@ -55,6 +55,7 @@ PHASES = frozenset({
     "upload", "rasterize_start", "rasterize_done", "transcribe_start",
     "transcribe_done", "assemble_start", "stitch", "fidelity", "doc_summary", "json_build",
     "serialize_start", "serialize_done", "render_raw",
+    "figure_check", "heading_fix",            # v0.5 document passes
 })
 
 _LIVE_SUFFIX = ".live.json"

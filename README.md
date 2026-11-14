@@ -32,9 +32,16 @@ and multi-page assembly. You do not hand-build any of the model card's
 preprocessing — point the server at a vLLM endpoint serving the model and POST
 documents:
 
+> **Which model version?** shrew-server 0.5 defaults to the **v0.5** model
+> contract (`SHREW_CONTRACT=v0.5`). To serve a v0.4 or v0.4.1 model, set
+> `SHREW_CONTRACT=v0.4`. A model served under the wrong contract returns
+> failed or empty pages; the server names the active contract in a banner at
+> startup (and, under v0.5, in `/health` as `contract`). Benchmark scores for each model version are on the
+> [model card](https://huggingface.co/btbtyler09/shrew-ocr-preview).
+
 ```bash
 # 1. Serve the model (bf16 or the GPTQ-8bit variant) with vLLM per its model card
-vllm serve btbtyler09/shrew-ocr-preview --trust-remote-code \
+vllm serve btbtyler09/shrew-ocr-preview --revision v0.5 --trust-remote-code \
   --served-model-name shrew-ocr-preview \
   --max-model-len 32768 --limit-mm-per-prompt '{"image":1}' --no-enable-prefix-caching
 
@@ -48,9 +55,16 @@ curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F pipeline_mode=structu
 curl -X POST localhost:8080/v1/convert -F file=@doc.pdf -F format=markdown
 ```
 
+Serve the v0.5 model with `--max-model-len 32768`: the server plans every
+request inside the model's 30,000-token trained budget, and `/health` reports
+`degraded` when the served context is below 30,000.
+
 No vLLM? A fully self-contained stack (llama.cpp serving the
 [Q8_0 GGUF](https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF) +
-shrew-server) runs on a single ≥12 GB NVIDIA GPU:
+shrew-server) runs on a single ≥12 GB NVIDIA GPU. This bundled stack downloads
+the **v0.5** GGUF files (revision `v0.5`) and runs the `v0.5` contract. llama.cpp
+does not report token usage while streaming, so on this stack a runaway
+generation is cut by the 60,000-character cap instead of the output-token cut:
 
 ```bash
 cd docker
@@ -112,6 +126,47 @@ curl -X POST localhost:8080/v1/convert -F file=@doc.pdf
 | `figures` | Figure detection via heron-101 layout model (pulls PyTorch) — **legacy pipeline only**; the structured pipeline gets figure/table crops from the model's own bboxes and does not need this | No figure crops in legacy mode |
 
 `pip install .` gives you just the CLI with no figure detection. `pip install .[server,figures]` is the full install.
+
+**Minimal server install (no PyTorch).** The default structured pipeline needs
+only `pip install .[server]`: 48 packages, about 240 MB. The `figures` extra
+(PyTorch, transformers, the layout model) is used by the legacy
+`pipeline_mode=vlm` / `conventional` only. Nothing is downloaded at run time:
+the tokenizer the v0.5 token budget needs ships inside the package
+(`app/data/`). `docker/requirements.lock` pins the versions the release image
+was tested with (`pip install -c docker/requirements.lock .[server]`).
+
+`VLM_MODEL` must equal the name the model server serves the model under
+(vLLM `--served-model-name`); the server does not depend on the name otherwise.
+
+System packages: **LibreOffice** (writer, calc, impress) converts office
+documents and spreadsheets and is needed only for those inputs (the server
+calls the `libreoffice` binary); fonts for the scripts in your documents
+(for example Liberation and a CJK font) so those conversions render the right
+glyphs. PDF rendering (pdfium) and OpenCV come from the Python wheels.
+
+**Alpine / musl.** Every dependency has a musl wheel or is pure Python except
+`opencv-python-headless`. Use Alpine's own OpenCV instead and skip that one
+dependency:
+
+```bash
+apk add python3 py3-pip py3-opencv libstdc++ libgcc \
+        libreoffice-writer libreoffice-calc libreoffice-impress ttf-liberation
+python3 -m venv --system-site-packages /venv
+/venv/bin/pip install -c docker/requirements.lock \
+    requests Pillow "pypdfium2>=5.6,<6" beautifulsoup4 markdownify olefile openpyxl \
+    numpy tokenizers fastapi "uvicorn[standard]" python-multipart sse-starlette
+/venv/bin/pip install --no-deps .
+VLM_URL=http://<model server>:8000 VLM_MODEL=<served name> /venv/bin/shrew serve
+```
+
+Checked on Alpine 3.21 (Python 3.12, system OpenCV 4.10.0 in place of the
+pinned 5.0 wheel): the test suite passes, office conversion works, and the
+page preprocessing — the model's input — is byte-identical to the release
+image on 24 of 24 test pages across buckets B1-B3. The server uses OpenCV
+only there (resize, CLAHE, blur, adaptive threshold, connected components);
+if you use a different OpenCV build, compare the prepared page images before
+trusting scores. The server writes only under the temp directory (`TMPDIR`):
+uploads, per-request work files, `shrew-concurrency/` and `shrew-telemetry/`.
 
 ### Docker
 
@@ -208,6 +263,17 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_DOC_SUMMARY_BLOCK_CHARS` | `contract_sos` block size in characters (the model's trained text-page bound; larger values are clamped to the context capacity and logged) | `11000` |
 | `SHREW_DOC_SUMMARY_CONCURRENCY` | `contract_sos` block calls in flight per level | `4` |
 | `SHREW_DOC_SUMMARY_LONG_DOC_PAGES` | Above this many pages, `deterministic` uses abstract-labelled pages only (reference manuals label body pages "introduction") | `30` |
+| `SHREW_CONTRACT` | Model contract: `v0.5` or `v0.4` (the model's release line). Also a per-request form field `contract` — see "Model contracts" | `v0.5` |
+| `SHREW_CONTRACT_ALIASES` | Extra names accepted for a contract, e.g. `old=v0.4,new=v0.5` (for older tooling) | — |
+| `SHREW_FIGURE_CHECK` | v0.5: ask the model whether each figure crop is a real figure or a page artifact, and drop artifacts | `1` |
+| `SHREW_HEADING_FIX` | v0.5: let the model repair heading levels over the document outline | `1` |
+| `SHREW_LATEX_WRAP` | v0.5: wrap bare LaTeX in math delimiters (`SHREW_LATEX_WRAP_MIXED=inline\|display`) | `1` |
+| `SHREW_V05_TOKEN_BUDGET` | v0.5: prompt + image + output tokens per request (the model's trained budget) | `30000` |
+| `SHREW_V05_TEXT_PAGE_TOKENS` | v0.5: text-page bound in tokens (next to the 11,000-character bound) | `3500` |
+| `SHREW_V05_OUTPUT_TOKEN_CUT` | v0.5: runaway cut in output tokens, JSON by tile bucket, e.g. `{"B1": 25500}` | `{"B0":6500,"B1":25500,"B2":29500,"B3":26500,"text":7000}` |
+| `SHREW_V05_STREAM_USAGE` | v0.5: ask the model server for token usage on the stream (`0` = cut by characters only) | `1` |
+| `SHREW_V05_STRIP_DATA_URIS` | v0.5: replace embedded base64 `data:` payloads in text input with `[payload removed]` | `1` |
+| `SHREW_RAW_DUMP_DIR` | v0.5: append every raw model completion to `<dir>/<doc_id>.jsonl` (diagnostics; off when unset) | — |
 | `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0.4` |
 | `SHREW_TRY1_PP` | Presence penalty of the first pass | `0.3` |
 | `SHREW_TRY2_TEMP` | Sampling temperature of the retry (0 = greedy) | `0.4` |
@@ -250,7 +316,35 @@ model answers free-form prompts in its structured JSON contract. They are
 useful only with a general-purpose model; a separate summary-model URL is not
 supported yet.
 
-**Decode recipe (structured mode, v0.4.0 defaults).** Each page gets two model
+**Model contracts.** A contract is what the server sends the model and what it
+expects back; it is named after the model's release line.
+
+| | `v0.5` (default) | `v0.4` |
+|---|---|---|
+| Models | shrew-ocr-preview v0.5 | shrew-ocr-preview v0.4, v0.4.1 |
+| System turn | the bare command (`structured_extraction`, `classify_figure`, `fix_headings`) | the `structured_extraction` sentinel |
+| Table / figure `bbox` | four corners `[[x,y],[x,y],[x,y],[x,y]]` (top-left, top-right, bottom-right, bottom-left; 0-1000) | `[x0, y0, x1, y1]` |
+| Extra output | `tables[].description`, `images[].chart_data`, `processing_log.pages[]` | — |
+| Document passes | figure check, heading fix, LaTeX wrap | — |
+| `max_tokens` | 30,000 − exact prompt and image tokens, per request | fixed (`SHREW_MAX_TOKENS`, default 20,000) |
+| Loop guard | content-aware guards + cut in output tokens | 2,000-char window |
+
+`v0.4` requests, responses and `/health` are byte-identical to shrew-server
+0.4.1. The contract can be set per request (`-F contract=v0.4`), so one server
+can serve both. **Upgrading with a v0.4 model: set `SHREW_CONTRACT=v0.4`**
+(a full version such as `v0.4.1` is accepted and means `v0.4`).
+Clients that read `bbox` must handle the four-corner form under `v0.5`.
+Under `v0.5` the summary modes `model` and `summary_of_summaries` run as
+`contract_sos` (the report carries `requested_mode`), because every v0.5
+prompt is a command.
+
+More v0.5 knobs, rarely needed: `SHREW_V05_MAX_TOKENS` (cap on `max_tokens`),
+`SHREW_V05_TOKENIZER` (path to another tokenizer file),
+`SHREW_V05_LOOP_*` (loop-guard thresholds), `SHREW_FIGURE_CHECK_TIMEOUT`,
+`SHREW_HEADING_FIX_TIMEOUT`, `SHREW_HEADING_WINDOW_LINES`,
+`SHREW_HEADING_WINDOW_CHARS`.
+
+**Decode recipe (structured mode, v0.4.0 defaults; both contracts).** Each page gets two model
 attempts, then the fallback client when one is configured. Try 1 samples at
 temperature 0.4 with presence penalty 0.3; on any failure (parse, schema,
 repetition abort) try 2 runs the same un-enforced contract at 0.4 / 0.3 with a
@@ -323,8 +417,11 @@ Convert a document to markdown + structured JSON.
 | `format` | str | `json` | `json` (full response) or `markdown` (text/markdown body of the structured markdown only) |
 | `skip_extraction` | bool | `false` | Skip structured extraction (metadata/summary/chunking). `skip_stage3` is a deprecated alias. |
 | `high_dpi` | int | `200` | DPI for page images sent to VLM |
+| `contract` | str | server default | `v0.5` or `v0.4` — see "Model contracts" |
+| `figure_check`, `heading_fix` | bool | on | v0.5 document passes (turning one on under `v0.4` is a 400) |
 
-**Response** (JSON, structured pipeline — the default):
+**Response** (JSON, structured pipeline — the default; boxes are shown in the
+`v0.4` form, under `v0.5` each `bbox` is four corners):
 ```json
 {
   "markdown": "<page 1>\n# Document Title\n\n...",

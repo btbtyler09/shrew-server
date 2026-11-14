@@ -6,10 +6,13 @@ WORKDIR /models
 
 # shrew-ocr-preview Q8_0 (LM) + f16 vision projector, pulled from the official
 # GGUF repo. Q8_0 is the 12GB-class artifact validated at parity with the
-# GPTQ-8bit vLLM serve (see the model card's Versions section).
-ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/main/shrew-ocr-preview-Q8_0.gguf \
+# GPTQ-8bit vLLM serve (see the model card's Versions section). Pinned to the
+# v0.5 files: docker-compose.ocr.yml runs shrew-server with SHREW_CONTRACT=v0.5.
+# For a v0.4.1 model change both URLs to resolve/v0.4.1/ and set v0.4 there.
+# The NP/KV_QUANT envelope below was measured with the v0.4.1 files.
+ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/v0.5/shrew-ocr-preview-Q8_0.gguf \
     /models/shrew-ocr-preview-Q8_0.gguf
-ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/main/shrew-ocr-preview-mmproj-f16.gguf \
+ADD https://huggingface.co/btbtyler09/shrew-ocr-preview-GGUF/resolve/v0.5/shrew-ocr-preview-mmproj-f16.gguf \
     /models/shrew-ocr-preview-mmproj-f16.gguf
 
 HEALTHCHECK CMD ["curl", "-f", "http://localhost:8000/health"]

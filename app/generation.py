@@ -53,7 +53,7 @@ _STAGE_PARAMS = {
     # plus presence_penalty 0.3 and NOTHING else — no top_p/top_k/min_p, no
     # frequency/repetition penalties, no structured-output enforcement, no
     # template kwargs. The penalty was adopted from a 900-run decode matrix on
-    # the production stack (shrew-server-private#4): one-shot 0.887 vs 0.880
+    # the production stack: one-shot 0.887 vs 0.880
     # penalty-free, table-page one-shot 1.000 vs 0.975, content/table fidelity
     # and chunk order flat — and it breaks the deterministic-loop rut that
     # greedy re-enters on retry. First-pass ENFORCEMENT was measured and

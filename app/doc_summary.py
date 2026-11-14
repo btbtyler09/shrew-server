@@ -471,17 +471,25 @@ class _SummaryCapture:
         return self.repetition(chunk, accumulated)
 
 
-def _contract_call(text: str, client) -> tuple[str | None, dict]:
+def _contract_call(text: str, client, contract: str = "v0.4") -> tuple[str | None, dict]:
     """ONE text-page-contract call over ``text``; returns (summary_or_None, info)."""
     info = {"input_chars": len(text), "output_chars": 0, "seconds": 0.0, "error": None}
-    messages = build_text_messages(text)
-    params = get_generation_params(client.model, "structured_page")
+    messages = build_text_messages(text, contract)
+    params = get_generation_params(client.model, "structured_page")   # same for both contracts
+    max_tokens = MAX_TOKENS
+    if contract == "v0.5":
+        from .contract import CMD_EXTRACT, V05BudgetError, v05_max_tokens
+        try:
+            max_tokens = v05_max_tokens(CMD_EXTRACT, text=text)
+        except V05BudgetError as e:
+            info["error"] = str(e)
+            return None, info
     t0 = time.time()
     try:
         if hasattr(client, "chat_completion_stream"):
             capture = _SummaryCapture(RepetitionGuard(attempt="doc summary"))
             result = client.chat_completion_stream(
-                messages, max_tokens=MAX_TOKENS, temperature=params["temperature"],
+                messages, max_tokens=max_tokens, temperature=params["temperature"],
                 extra_params=params["extra_params"], on_delta=capture,
                 wall_clock_s=STREAM_WALL_CLOCK_S)
             choice = result["choices"][0]
@@ -498,7 +506,7 @@ def _contract_call(text: str, client) -> tuple[str | None, dict]:
                     value = parsed.get("summary")
         else:
             result = client.chat_completion(
-                messages, max_tokens=MAX_TOKENS, temperature=params["temperature"],
+                messages, max_tokens=max_tokens, temperature=params["temperature"],
                 extra_params=params["extra_params"])
             out = result["choices"][0]["message"].get("content") or ""
             parsed, _ = parse_json_lenient(out)
@@ -525,20 +533,30 @@ def _contract_call(text: str, client) -> tuple[str | None, dict]:
     return value, info
 
 
-def _pack_blocks(items: list[str], cap: int) -> list[str]:
+def _pack_blocks(items: list[str], cap: int, max_tokens: int | None = None) -> list[str]:
     """Pack ``items`` in order into newline-joined blocks of at most ``cap``
-    chars. An item longer than ``cap`` on its own is cut at a line/char bound
-    (page summaries are ~300 chars; this only guards a pathological one)."""
-    blocks, cur, size = [], [], 0
+    chars (and, v0.5, ``max_tokens`` tokens: the text-page bound). An item
+    longer than the bound on its own is cut (page summaries are ~300 chars;
+    this only guards a pathological one)."""
+    if max_tokens:
+        from . import v05_tokens
+    blocks, cur, size, toks = [], [], 0, 0
     for it in items:
         it = it[:cap]
+        tok = 0
+        if max_tokens:
+            tok = v05_tokens.text_tokens(it)
+            while tok > max_tokens:                      # pathological single item
+                it = it[:max(1, int(len(it) * max_tokens / tok * 0.95))]
+                tok = v05_tokens.text_tokens(it)
         add = len(it) + (1 if cur else 0)
-        if cur and size + add > cap:
+        if cur and (size + add > cap or (max_tokens and toks + tok + 1 > max_tokens)):
             blocks.append("\n".join(cur))
-            cur, size = [], 0
+            cur, size, toks = [], 0, 0
             add = len(it)
         cur.append(it)
         size += add
+        toks += tok + 1
     if cur:
         blocks.append("\n".join(cur))
     return blocks
@@ -554,7 +572,8 @@ ROOT_PREFIX = os.environ.get("SHREW_DOC_SUMMARY_ROOT_PREFIX", "")
 
 def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None = None,
                            doc_id: str | None = None,
-                           root_prefix: str | None = None) -> tuple[str | None, dict]:
+                           root_prefix: str | None = None,
+                           contract: str = "v0.4") -> tuple[str | None, dict]:
     """Mode ``contract_sos``: HIERARCHICAL summary through the model's NORMAL
     text-page contract (sentinel system prompt, raw text user turn,
     structured_page decode params); each call's ``summary`` key is taken and
@@ -591,7 +610,9 @@ def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None
     report["block_chars"] = block_chars
     level = 0
     while True:
-        blocks = _pack_blocks(items, block_chars)
+        from .contract import V05_TEXT_PAGE_MAX_TOKENS
+        blocks = _pack_blocks(items, block_chars,
+                              V05_TEXT_PAGE_MAX_TOKENS if contract == "v0.5" else None)
         is_root = len(blocks) == 1
         prefix = ROOT_PREFIX if root_prefix is None else root_prefix
         if is_root and level > 0 and prefix:
@@ -599,7 +620,7 @@ def summarize_via_contract(page_summaries: str, client, *, max_chars: int | None
             report["root_prefix"] = prefix.strip()
         workers = max(1, min(DOC_SUMMARY_CONCURRENCY, len(blocks)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(pool.map(lambda b: _contract_call(b, client), blocks))
+            results = list(pool.map(lambda b: _contract_call(b, client, contract), blocks))
         report["calls"] += len(blocks)
         ok = [v for v, _ in results if v is not None]
         errors = [info["error"] for v, info in results if v is None]
@@ -654,7 +675,8 @@ def _joined_page_summaries(doc: dict) -> str:
 
 
 def apply_document_summary(doc: dict, markdown: str, client, *,
-                           max_chars: int | None = None, mode: str | None = None) -> dict:
+                           max_chars: int | None = None, mode: str | None = None,
+                           contract: str = "v0.4") -> dict:
     """Replace the joined per-page summary on a multi-page ``doc`` in place.
 
     Single-page documents (exactly one extracted page) keep their page summary
@@ -667,6 +689,12 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
     mode = DOC_SUMMARY_MODE if mode is None else validate_mode(mode)
     if max_chars is not None:
         max_chars = validate_max_chars(max_chars)
+    substituted = None
+    if contract == "v0.5" and mode in ("model", "summary_of_summaries"):
+        # v0.5: prompts are commands. These two modes send a prose system
+        # prompt, so they run as contract_sos — the structured_extraction text
+        # command — and the report says so.
+        substituted, mode = mode, "contract_sos"
     if mode == "off":
         doc["doc_summary"] = None
         return {"status": "disabled", "mode": "off", "chars": 0}
@@ -676,7 +704,8 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
         report["mode"] = "model"
     elif mode == "contract_sos":
         summary, report = summarize_via_contract(_joined_page_summaries(doc), client,
-                                                 max_chars=max_chars, doc_id=doc.get("doc_id"))
+                                                 max_chars=max_chars, doc_id=doc.get("doc_id"),
+                                                 contract=contract)
         report["mode_used"] = "contract_sos"
         if summary is None:
             # The tree failed (logged at ERROR above). Fall back to the zero-call
@@ -696,6 +725,8 @@ def apply_document_summary(doc: dict, markdown: str, client, *,
     else:
         summary, report = compose_document_summary(doc, max_chars=max_chars)
     report.setdefault("mode_used", report.get("mode") or mode)
+    if substituted:
+        report["requested_mode"] = substituted
     if summary is None:
         report["mode_used"] = "none"
     doc["doc_summary"] = summary

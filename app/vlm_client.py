@@ -269,8 +269,16 @@ class VLMClient:
         extra_params: Optional[dict] = None,
         on_delta: Optional[Callable[[str, str], Optional[str]]] = None,
         wall_clock_s: Optional[float] = None,
+        on_usage: Optional[Callable[[dict, str], Optional[str]]] = None,
     ) -> dict:
         """Streaming chat completion, assembled into the non-streaming response shape.
+
+        ``on_usage(usage, accumulated)``: when given, the request asks the
+        server for token usage on every stream chunk (``stream_options``:
+        ``include_usage`` + vLLM's ``continuous_usage_stats``) and the callback
+        gets each ``usage`` object; like ``on_delta`` it may return a string to
+        abort. The last usage seen is returned under ``"usage"``. A server
+        that sends no usage simply never calls it.
 
         ``wall_clock_s`` bounds the stream duration FROM THE FIRST BYTE —
         scheduler queue wait must not convert healthy pages into aborts when
@@ -297,12 +305,15 @@ class VLMClient:
             "temperature": temperature,
             "stream": True,
         }
+        if on_usage is not None:
+            payload["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
         if extra_params:
             payload.update(extra_params)
 
         t = timeout or self.default_timeout
         start = time.time()
         first_byte_at: Optional[float] = None
+        usage: Optional[dict] = None
         parts: list[str] = []
         finish_reason = None
         aborted = None
@@ -347,6 +358,12 @@ class VLMClient:
                                 aborted = on_delta(piece, "".join(parts))
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
+                    if isinstance(evt.get("usage"), dict):
+                        usage = evt["usage"]
+                        # Not once the generation has finished: the page is
+                        # complete, there is nothing left to cut.
+                        if on_usage is not None and not aborted and finish_reason is None:
+                            aborted = on_usage(usage, "".join(parts))
                     if aborted:
                         # Abandon the response body; the context manager closes
                         # the connection, which cancels the generation server-side.
@@ -374,6 +391,7 @@ class VLMClient:
                 "message": {"role": "assistant", "content": text},
                 "finish_reason": finish_reason,
             }],
+            "usage": usage,
         }
 
     def simple_completion(

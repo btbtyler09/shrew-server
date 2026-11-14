@@ -43,7 +43,10 @@ from .models import PipelineResult
 from .pipeline import CancelledException
 from .preprocess import glyph_height, prepare_image, prepare_image_bucketed
 from .rasterizer import classify_file, prepare_pages
-from .structured_page import DecodePolicy, extract_page, extract_text_page, paginate_text
+from . import v05_tools
+from .latex_wrap import wrap_bare_latex
+from .contract import V05, V04, normalize_v05
+from .structured_page import DecodePolicy, extract_page, extract_text_page, paginate_text, parse_bool
 from .text_extract import extract_text
 from .vlm_client import VLMClient
 
@@ -116,6 +119,10 @@ def _page_result(page_no: int, res: dict, bucket: str | None = None) -> dict:
         "attempts": res.get("attempts"),
         "model_calls": res.get("model_calls", res.get("attempts")),
         "bucket": bucket,
+        # v0.5 per-page telemetry (processing_log.pages): the error text and the
+        # per-call trail. Internal under v0.4 (never serialized there).
+        "error": res.get("error"),
+        "trail": res.get("trail") or [],
     }
 
 
@@ -189,6 +196,7 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
                        input_class: str = "pdf", fallback_client=None, decode=None,
                        doc_id=None) -> dict:
     """Prepare the model input image for one page and run extraction on it."""
+    _t0 = time.time()
     pages_dir = os.path.join(output_dir, "pages")
     os.makedirs(pages_dir, exist_ok=True)
 
@@ -211,7 +219,7 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     try:
         result = _page_result(page_no, extract_page(model_png, client,
                                                     page_no=page_no, decode=decode,
-                                                    doc_id=doc_id), bucket)
+                                                    doc_id=doc_id, bucket=bucket), bucket)
         _note_transport(client, ok=True)
     except Exception as e:
         _note_transport(client, ok=False)
@@ -235,6 +243,10 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
             output_path=os.path.join(pages_dir, f"page_{page_no:04d}_fallback.png"),
             page_no=page_no,
         )
+        if data is not None and decode is not None and decode.contract == V05:
+            # The fallback speaks the v0.4 teacher schema (2-point boxes); v0.5
+            # ships one box shape, so convert before it joins the document.
+            normalize_v05(data)
         if data is not None:
             shrew_calls = result.get("model_calls") or 0
             result = _page_result(page_no, {
@@ -244,22 +256,25 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
             result["fallback"] = True
             result["rescued_by"] = "fallback"
             result["model_calls"] = shrew_calls + 1     # the shrew rungs + the fallback call
+    result["seconds"] = round(time.time() - _t0, 2)
     return result
 
 
 def _process_one_text_page(page_no: int, text: str, client, decode=None, doc_id=None) -> dict:
     """Run extraction on one paginated block of extracted text."""
+    _t0 = time.time()
     try:
         r = _page_result(page_no, extract_text_page(text, client, page_no=page_no,
                                                     decode=decode, doc_id=doc_id))
         _note_transport(client, ok=True)
-        return r
     except Exception as e:
         _note_transport(client, ok=False)
-        return _page_result(page_no, {
+        r = _page_result(page_no, {
             "ok": False, "data": None, "status": "transport_error",
             "error": f"{type(e).__name__}: {e}", "attempts": 0, "raw_len": 0,
         })
+    r["seconds"] = round(time.time() - _t0, 2)
+    return r
 
 
 def _note_transport(client, ok: bool) -> None:
@@ -331,8 +346,10 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict,
         composite.save(hires_path)
 
         model_png = os.path.join(crops_dir, f"{prev['table_id']}_stitched_model.png")
+        bucket = None
         if IMAGE_TRANSFORM == "bucket":
-            prepare_image_bucketed(composite, glyph)[0].save(model_png)
+            enh, bucket = prepare_image_bucketed(composite, glyph)
+            enh.save(model_png)
         else:
             # Legacy: the canvas inherits the source page's pixel size, so a
             # 400-DPI scan gives a 3400x4400 canvas. Normalize by long edge
@@ -350,7 +367,8 @@ def make_table_refiner(hires_images: dict, output_dir: str, client, stats: dict,
             # page_no identifies the FIRST page represented by the stitched
             # cross-page composite.
             res = extract_page(model_png, client, timeout=_REFINE_TIMEOUT_S,
-                               page_no=prev.get("page"), decode=decode, doc_id=doc_id)
+                               page_no=prev.get("page"), decode=decode, doc_id=doc_id,
+                               bucket=bucket)
         except Exception:
             return None
         if not res["ok"] or not res["data"]:
@@ -392,9 +410,14 @@ def _validate_document(doc: dict) -> None:
         seen.add(fid)
 
 
-def build_structured_json(doc: dict, total_pages: int) -> dict:
+def build_structured_json(doc: dict, total_pages: int, contract: str = V04) -> dict:
     """Build the back-compat structured.json shape (plus a new `tables` key)
     from a doc record produced by assemble_document.
+
+    v0.5 differences, all confined to contract="v0.5" so a v0.4 response
+    stays byte-identical: tables[].bbox / images[].bbox are the model's 4-corner
+    quad; tables[] gain ``description``; images[] gain ``chart_data`` when the
+    model emitted one.
     """
     metadata = dict(doc["metadata"])
     metadata["type"] = doc["metadata"].get("doc_type")
@@ -428,6 +451,8 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
             "format": "png" if data else None,
             "data": data,
         })
+        if contract == V05:
+            tables[-1]["description"] = t.get("description")
 
     images = []
     for i, f in enumerate(doc["figures"], start=1):
@@ -443,6 +468,8 @@ def build_structured_json(doc: dict, total_pages: int) -> dict:
             "page": f["page"],
             "bbox": f["bbox"],
         })
+        if contract == V05 and f.get("chart_data") is not None:
+            images[-1]["chart_data"] = f["chart_data"]
 
     return {
         "metadata": metadata,
@@ -743,6 +770,24 @@ def attempt_counts(page_results: list[dict]) -> dict:
     return {"attempts": dict(sorted(hist.items())), "model_calls": calls}
 
 
+_PAGE_FIELDS = ("page", "ok", "status", "bucket", "rescued_by", "model_calls",
+                "repetition_abort", "degenerate", "json_close", "schema_coerced",
+                "seconds", "error", "trail")
+
+
+def page_telemetry(page_results: list[dict]) -> list[dict]:
+    """processing_log.pages (v0.5): one record per page, in page order — status,
+    rescue rung, exact model calls, loop-guard outcome, wall seconds, and the
+    per-call trail (rung, finish_reason, verdict, chars, abort_at_chars,
+    max_window_ratio, seconds). Benchmarks read loop/retry behaviour from here."""
+    out = []
+    for pr in page_results:
+        rec = {k: pr.get(k) for k in _PAGE_FIELDS}
+        rec["fallback"] = bool(pr.get("fallback"))
+        out.append(rec)
+    return out
+
+
 def gate_metrics(page_results: list[dict]) -> dict:
     """§3/§5 health signals, per document.
 
@@ -854,7 +899,7 @@ def _extract_and_caption_media(file_path, output_dir, client, decode=None,
                 enh, _bucket = prepare_image_bucketed(img.convert("RGB"))
             prepped = m["path"] + ".prepped.png"
             enh.save(prepped)
-            res = extract_page(prepped, client, decode=decode, doc_id=doc_id)
+            res = extract_page(prepped, client, decode=decode, doc_id=doc_id, bucket=_bucket)
             if res.get("ok") and res.get("data"):
                 sj = res["data"]
                 figs = [f for f in (sj.get("figures") or [])
@@ -886,7 +931,7 @@ def _select_text_blocks(blocks, page_range):
 
 
 def _extract_text_pages(file_path, output_dir, config, input_class, client, progress,
-                        decode=None, doc_id=None):
+                        decode=None, doc_id=None, pagination: dict | None = None):
     """Text modality: deterministic extractor -> paginate -> per-page model call.
 
     Honors config.page_range (1-indexed inclusive) exactly like the image
@@ -901,8 +946,19 @@ def _extract_text_pages(file_path, output_dir, config, input_class, client, prog
         progress.emit(5, f"Reading {input_class} input...")
 
     text = extract_text(file_path, input_class, output_dir)
-    blocks = paginate_text(text)
+    from .contract import V05, V05_TEXT_PAGE_MAX_TOKENS
+    from .structured_page import DecodePolicy as _DecodePolicy
+    is_v05 = (decode or _DecodePolicy.from_env()).contract == V05
+    blocks = paginate_text(text, max_tokens=V05_TEXT_PAGE_MAX_TOKENS if is_v05 else None,
+                           stats=pagination)
     total_pages = len(blocks)
+    if is_v05 and pagination is not None:
+        pagination.update(pages=total_pages, max_tokens=V05_TEXT_PAGE_MAX_TOKENS,
+                          split_oversize_line=pagination.get("split_oversize_line", 0),
+                          data_uri_payloads_removed=pagination.get("data_uri_payloads_removed", 0))
+        if pagination["split_oversize_line"]:
+            logger.info("text pagination: %d line(s) over the page bound were split "
+                        "(split_oversize_line)", pagination["split_oversize_line"])
 
     # Bound model work to the requested range BEFORE anything is submitted.
     selected = _select_text_blocks(blocks, config.page_range)
@@ -994,8 +1050,10 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
 
     if input_class in TEXT_CLASSES:
         trace.phase("transcribe_start")
+        text_pagination: dict = {}
         page_results, total_pages, _ = _extract_text_pages(
             file_path, output_dir, config, input_class, client, progress, decode, doc_id,
+            pagination=text_pagination,
         )
         trace.mark_pages_done(len(page_results))
         trace.phase("transcribe_done")
@@ -1089,6 +1147,34 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         table_refiner=table_refiner,
     )
 
+    # v0.5 post-process : wrap bare LaTeX in math delimiters, chunk text
+    # only, deterministic. v0.5 contract only (v0.4 stays byte-identical); on by default,
+    # SHREW_LATEX_WRAP=0 turns it off, SHREW_LATEX_WRAP_MIXED=display|inline picks how an
+    # environment inside a prose line is wrapped.
+    latex_wrap_report = None
+    from .latex_wrap import env_settings as _latex_env
+    _latex_on, mixed = _latex_env()
+    if decode.contract == V05 and _latex_on:
+        changed = 0
+        for chunk in doc["chunks"]:
+            new_content = wrap_bare_latex(chunk.get("content"), mixed=mixed)
+            if new_content != chunk.get("content"):
+                chunk["content"] = new_content
+                changed += 1
+        latex_wrap_report = {"chunks_changed": changed, "mixed": mixed}
+
+    # v0.5 tool passes: on by default in v0.5, switchable.
+    # Before the media append: only model-transcribed figures are classified.
+    figure_check_report = heading_fix_report = None
+    if decode.contract == V05 and decode.figure_check:
+        trace.phase("figure_check")
+        figure_check_report = v05_tools.figure_check(doc, client,
+                                                     concurrency=config.vlm_concurrency,
+                                                     decode=decode)
+    if decode.contract == V05 and decode.heading_fix:
+        trace.phase("heading_fix")
+        heading_fix_report = v05_tools.heading_fix(doc, client, decode=decode)
+
     if input_class in TEXT_CLASSES and spreadsheet_media:
         # Embedded workbook pictures ride the figures list so the response
         # projection ships them in images[] with their crop data. bbox stays
@@ -1123,7 +1209,8 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
     # concatenation. Single-page documents are untouched.
     trace.phase("doc_summary")
     doc_summary_report = apply_document_summary(doc, synthesize_markdown(doc), client,
-                                                mode=summary_mode, max_chars=summary_max_chars)
+                                                mode=summary_mode, max_chars=summary_max_chars,
+                                                contract=decode.contract)
 
     trace.phase("json_build")
     if raw:
@@ -1132,7 +1219,7 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         clean_markdown = render_raw_text(doc)
         structured_json = {}
     else:
-        structured_json = build_structured_json(doc, total_pages)
+        structured_json = build_structured_json(doc, total_pages, decode.contract)
         clean_markdown = synthesize_markdown(doc)
 
     if progress is not None:
@@ -1156,6 +1243,17 @@ def run_structured_pipeline(file_path, output_dir, config, *, progress=None,
         },
     }
 
+    if decode.contract == V05:
+        processing_log["pages"] = page_telemetry(page_results)
+        if input_class in TEXT_CLASSES and text_pagination:
+            # split_oversize_line: lines over the page bound that were split, not refused
+            processing_log["text_pagination"] = text_pagination
+    if figure_check_report is not None:
+        processing_log["figure_check"] = figure_check_report
+    if heading_fix_report is not None:
+        processing_log["heading_fix"] = heading_fix_report
+    if latex_wrap_report is not None:
+        processing_log["latex_wrap"] = latex_wrap_report
     processing_log["doc_summary"] = doc_summary_report
     if fidelity_report is not None:
         processing_log["fidelity"] = fidelity_report

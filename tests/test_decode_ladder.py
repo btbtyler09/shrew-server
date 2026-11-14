@@ -1,4 +1,4 @@
-"""Decode ladder (§3 revised 2026-08-16, shrew-server-private#4):
+"""Decode ladder (§3 revised 2026-08-16, issue #4):
 try 1 = greedy + presence_penalty 0.3, retry = enforcement + presence_penalty
 0.6. Enforcement on the first pass was measured and rejected (table-page
 one-shot 0.225 vs 0.975)."""

@@ -21,5 +21,15 @@ RUN python -c "from transformers import RTDetrV2ForObjectDetection, RTDetrImageP
 
 ENV HF_HUB_OFFLINE=1
 
+# Which source this image was built from:
+#   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg VERSION=0.5.0 ...
+ARG GIT_SHA=unknown
+ARG VERSION=unknown
+LABEL org.opencontainers.image.title="shrew-server" \
+      org.opencontainers.image.source="https://github.com/btbtyler09/shrew-server" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="MIT"
+
 EXPOSE 8080
 CMD ["shrew", "serve"]

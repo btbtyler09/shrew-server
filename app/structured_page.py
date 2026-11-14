@@ -23,14 +23,19 @@ is flagged ``schema_coerced`` so downstream can filter or de-rank it.
 
 import json
 import hashlib
+import inspect
 from dataclasses import dataclass, replace
 import logging
 import os
 import re
 import threading
+import time
 import zlib
 from pathlib import Path
 
+from . import contract as _ct
+from . import loop_content
+from .contract import V05, V04
 from .generation import get_generation_params
 from .section_types import SECTION_SET, canonical
 from .vlm_client import make_image_content
@@ -49,6 +54,9 @@ SENTINEL = "structured_extraction"
 MAX_TOKENS = int(os.environ.get("SHREW_MAX_TOKENS", "20000"))
 # §4 serving recipe: vllm serve ... --max-model-len 32768
 MAX_MODEL_LEN = int(os.environ.get("SHREW_MAX_MODEL_LEN", "32768"))
+# v0.5: max_tokens is the context budget minus the prompt (contract.v05_max_tokens);
+# this optional cap (0 = none) only ever lowers it.
+V05_MAX_TOKENS_CAP = int(os.environ.get("SHREW_V05_MAX_TOKENS", "0")) or None
 
 # §2.1 image-token cost per tile bucket, and the measured prompt-text overhead
 # (sentinel + chat template + image placeholder scaffolding). Used to verify the
@@ -359,7 +367,13 @@ ENFORCEMENT_SCHEMA = {
 RETRY_PP = float(os.environ.get("SHREW_RETRY_PP", "0.3"))
 
 
-def enforcement_params() -> dict:
+# v0.5 decodes with the SAME recipe and knobs as v0.4: greedy decoding is never
+# a production default. Only the enforcement schema differs, for
+# when an operator opts into the enforced retry: v0.5 boxes are quads.
+ENFORCEMENT_SCHEMA_V05 = _ct.enforcement_schema_v05(SECTION_ENUM)
+
+
+def enforcement_params(contract: str = V04) -> dict:
     """extra_params for the one flagged retry (§3 retry tier).
 
     Emits BOTH schema-enforcement dialects so the retry actually constrains
@@ -377,13 +391,15 @@ def enforcement_params() -> dict:
     backend rejects the unknown field.
     """
     dialect = os.environ.get("SHREW_ENFORCE_DIALECT", "both").lower()
+    schema = ENFORCEMENT_SCHEMA_V05 if contract == V05 else ENFORCEMENT_SCHEMA
+    pp = RETRY_PP
     out: dict = {}
     if dialect in ("both", "vllm"):
-        out["structured_outputs"] = {"json": ENFORCEMENT_SCHEMA}
+        out["structured_outputs"] = {"json": schema}
     if dialect in ("both", "llamacpp"):
-        out["json_schema"] = ENFORCEMENT_SCHEMA
-    if RETRY_PP:
-        out["presence_penalty"] = RETRY_PP
+        out["json_schema"] = schema
+    if pp:
+        out["presence_penalty"] = pp
     return out
 
 
@@ -461,9 +477,24 @@ class DecodePolicy:
     try2_temp: float = 0.4
     seed_policy: object = "fixed"          # "fixed" | "random" | int
     try2_enforce: bool = False
+    contract: str = V04                    # "v0.4" | "v0.5" (contract.py)
+    figure_check: bool = False             # v0.5: classify_figure on every figure crop
+    heading_fix: bool = False              # v0.5: fix_headings over the document outline
 
     @classmethod
-    def from_env(cls) -> "DecodePolicy":
+    def from_env(cls, contract: str | None = None) -> "DecodePolicy":
+        """Env defaults for ``contract`` (None = SHREW_CONTRACT).
+
+        BOTH contracts decode with v0.4.0's shipped recipe from the same knobs
+        (SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY /
+        SHREW_TRY2_ENFORCE, stage "structured_page"). Greedy is never a
+        default: it is an explicit opt-in only (temperature=0 per request, or
+        the env knobs). v0.5 adds figure_check and heading_fix, on by default."""
+        contract = _ct.validate_contract(contract) if contract is not None else _ct.default_contract()
+        if contract == V05:
+            return replace(cls.from_env(V04), contract=V05,
+                           figure_check=parse_bool(os.environ.get("SHREW_FIGURE_CHECK", "1"), "SHREW_FIGURE_CHECK"),
+                           heading_fix=parse_bool(os.environ.get("SHREW_HEADING_FIX", "1"), "SHREW_HEADING_FIX"))
         return cls(
             try1_temp=parse_temperature(os.environ.get("SHREW_TRY1_TEMP", "0.4"), "SHREW_TRY1_TEMP"),
             try2_temp=parse_temperature(os.environ.get("SHREW_TRY2_TEMP", "0.4"), "SHREW_TRY2_TEMP"),
@@ -471,11 +502,31 @@ class DecodePolicy:
             try2_enforce=parse_bool(os.environ.get("SHREW_TRY2_ENFORCE", "0"), "SHREW_TRY2_ENFORCE"),
         )
 
+    @property
+    def stage(self) -> str:
+        return "structured_page"            # one sampling recipe for both contracts
+
     def with_overrides(self, *, temperature=None, retry_temperature=None,
-                       seed_policy=None, retry_enforce=None) -> "DecodePolicy":
-        """Per-request overrides; None keeps the value already in force."""
+                       seed_policy=None, retry_enforce=None, contract=None,
+                       figure_check=None, heading_fix=None) -> "DecodePolicy":
+        """Per-request overrides; None keeps the value already in force.
+
+        A ``contract`` different from the one in force first resets every knob
+        to that contract's env defaults; the other overrides then apply."""
+        base = self
+        if contract is not None:
+            c = _ct.validate_contract(contract)
+            if c != self.contract:
+                base = DecodePolicy.from_env(c)
+        self = base
+        fc = self.figure_check if figure_check is None else parse_bool(figure_check, "figure_check")
+        hf = self.heading_fix if heading_fix is None else parse_bool(heading_fix, "heading_fix")
+        if self.contract != V05 and (fc or hf):
+            raise ValueError("figure_check / heading_fix require contract=v0.5")
         return replace(
             self,
+            figure_check=fc,
+            heading_fix=hf,
             try1_temp=self.try1_temp if temperature is None else parse_temperature(temperature),
             try2_temp=(self.try2_temp if retry_temperature is None
                        else parse_temperature(retry_temperature, "retry_temperature")),
@@ -498,7 +549,7 @@ class DecodePolicy:
         the first-pass extras overlaid with enforcement_params() — the shipped
         merge. Un-enforced: the same overlay minus the schema-enforcement keys,
         i.e. the first-pass contract at the retry presence penalty."""
-        merged = {**(first_pass_extra or {}), **enforcement_params()}
+        merged = {**(first_pass_extra or {}), **enforcement_params(self.contract)}
         if not self.try2_enforce:
             merged.pop("structured_outputs", None)
             merged.pop("json_schema", None)
@@ -507,12 +558,17 @@ class DecodePolicy:
     def describe(self) -> dict:
         """The whole per-document recipe, so a log check can verify it."""
         from .generation import get_generation_params
-        fp = get_generation_params("", "structured_page")["extra_params"] or {}
-        return {"try1_temperature": self.try1_temp, "try2_temperature": self.try2_temp,
-                "seed_policy": self.seed_policy,
-                "try1_pp": fp.get("presence_penalty", 0.0),
-                "retry_pp": RETRY_PP,
-                "try2_enforce": self.try2_enforce}
+        fp = get_generation_params("", self.stage)["extra_params"] or {}
+        out = {"try1_temperature": self.try1_temp, "try2_temperature": self.try2_temp,
+               "seed_policy": self.seed_policy,
+               "try1_pp": fp.get("presence_penalty", 0.0),
+               "retry_pp": RETRY_PP,
+               "try2_enforce": self.try2_enforce}
+        if self.contract == V05:
+            # v0.4 keeps the v0.4.1 keys exactly; v0.5 names itself.
+            out.update(contract=V05, max_tokens="budget", token_budget=_ct.V05_TOKEN_BUDGET,
+                       figure_check=self.figure_check, heading_fix=self.heading_fix)
+        return out
 
 
 def page_input_key(messages: list[dict]) -> str:
@@ -557,6 +613,25 @@ def zlib_ratio(raw: str) -> float:
 
 def is_degenerate(raw: str, gate: float = ZLIB_GATE_RATIO) -> bool:
     return zlib_ratio(raw) > gate
+
+
+def content_zlib_ratio(raw: str) -> float:
+    """``zlib_ratio`` of the completion with its markup removed."""
+    return zlib_ratio(loop_content.content(raw))
+
+
+def is_degenerate_v05(raw: str, gate: float = ZLIB_GATE_RATIO) -> bool:
+    """The §5.1 gate for v0.5 pages: degenerate only when the completion
+    compresses past the gate both as emitted and with its markup removed.
+
+    v0.5 tables are HTML, and a correct dense table is mostly ``<tr><td>``: of
+    the 12 normally-finished completions over 7.0 in the 2026-11-14 replay
+    corpus (40,741 texts), 6 were correct tables (OmniDocBench page-213e6a57
+    at 7.8-8.0, a 67-row tRNA table at 7.0-7.5) whose content alone compresses
+    3.7-3.8; the 6 others stay above 7 either way. The second condition can
+    only pass a page the raw gate fails, never fail one it passes.
+    """
+    return zlib_ratio(raw) > gate and content_zlib_ratio(raw) > gate
 
 
 # --------------------------------------------------------------------------- §5.2 streaming repetition guard
@@ -618,7 +693,45 @@ class RepetitionGuard:
                  consecutive: int = STREAM_GUARD_CONSECUTIVE,
                  page_no: int | None = None,
                  attempt: str | None = None,
-                 doc_id: str | None = None):
+                 doc_id: str | None = None,
+                 long_window: int | None = None,
+                 long_threshold: float | None = None,
+                 length_cap_chars: int | None = None,
+                 periodic_chars: int | None = None,
+                 repeat_chars: int | None = None,
+                 numeric_repeats: int | None = None,
+                 counter_chars: int | None = None,
+                 token_cap: int | None = None,
+                 tail_chars: int = 0):
+        # v0.5 extensions (None = off, the v0.4 guard exactly): a long trailing
+        # window for long-period loops, and an output-length cap for slow loops
+        # no compression window can see. Derived offline, see V05_LOOP_* below.
+        self.long_window = long_window
+        self.long_threshold = long_threshold
+        self.length_cap_chars = length_cap_chars
+        self.long_violations = 0
+        self.long_max_ratio = 0.0
+        self.abort_guard = None
+        # v0.5 content guards (None = off), see loop_content.py and V05_LOOP_*.
+        self.periodic_chars = periodic_chars
+        self.repeat_chars = repeat_chars
+        self.numeric_repeats = numeric_repeats
+        # A periodic run of numbered rows (loop_content.periodic) is held to its
+        # own, higher threshold; None = the periodic threshold.
+        self.counter_chars = counter_chars
+        # v0.5 runaway cut in output TOKENS, from the usage the server reports on
+        # the stream (``usage()``). While usage arrives it replaces the
+        # character cap; a stream that never reports usage keeps the cap.
+        self.token_cap = token_cap
+        self.completion_tokens = 0
+        self.prompt_tokens = None
+        self.usage_seen = False
+        self.tail_chars = tail_chars
+        self.periodic_max = 0
+        self.counter_max = 0
+        self.repeat_max = 0
+        self.numeric_max = 0.0
+        self.evidence = None
         self.window = window
         self.check_every = check_every
         self.threshold = threshold
@@ -643,22 +756,129 @@ class RepetitionGuard:
         if n < self._next_check:
             return None
         self._next_check = n + self.check_every
+        if (self.length_cap_chars and n >= self.length_cap_chars
+                and not (self.token_cap and self.usage_seen)):
+            return self._fire(n, "length_cap", accumulated)
         self.ratio = zlib_ratio(accumulated[-self.window:])
         self.max_ratio = max(self.max_ratio, self.ratio)
-        if self.ratio <= self.threshold:
+        if self.ratio > self.threshold:
+            self.violations += 1
+            if self.violations >= self.consecutive:
+                return self._fire(n, "window", accumulated)
+        else:
             self.violations = 0
+        if self.long_window and n >= self.long_window:
+            lr = zlib_ratio(accumulated[-self.long_window:])
+            self.long_max_ratio = max(self.long_max_ratio, lr)
+            if lr > self.long_threshold:
+                self.long_violations += 1
+                if self.long_violations >= self.consecutive:
+                    self.ratio = lr
+                    return self._fire(n, "long_window", accumulated)
+            else:
+                self.long_violations = 0
+        if self.periodic_chars or self.numeric_repeats:
+            per = loop_content.periodic(accumulated)
+            limit = self.periodic_chars
+            if per["numbered_rows"]:
+                self.counter_max = max(self.counter_max, per["score"])
+                limit = self.counter_chars or limit
+            else:
+                self.periodic_max = max(self.periodic_max, per["score"])
+            self.numeric_max = max(self.numeric_max, per["numeric_repeats"])
+            if self.periodic_chars and per["score"] >= limit:
+                return self._fire(n, "periodic", accumulated, score=per["score"],
+                                  threshold=limit, detail=per)
+            if self.numeric_repeats and per["numeric_repeats"] >= self.numeric_repeats:
+                return self._fire(n, "numeric", accumulated, score=per["numeric_repeats"],
+                                  threshold=self.numeric_repeats, detail=per)
+        if self.repeat_chars:
+            dup = loop_content.repeated(accumulated)
+            self.repeat_max = max(self.repeat_max, dup["score"])
+            if dup["score"] >= self.repeat_chars:
+                return self._fire(n, "repeated", accumulated, score=dup["score"],
+                                  threshold=self.repeat_chars, detail=dup)
+        return None
+
+    def usage(self, usage: dict, accumulated: str = ""):
+        """``on_usage`` callback: the server's running token usage for this stream."""
+        done = usage.get("completion_tokens")
+        if not isinstance(done, int):
             return None
-        self.violations += 1
-        if self.violations < self.consecutive:
-            return None
+        self.usage_seen = True
+        self.completion_tokens = max(self.completion_tokens, done)
+        if isinstance(usage.get("prompt_tokens"), int):
+            self.prompt_tokens = usage["prompt_tokens"]
+        # ">" and not ">=": a page that ends on exactly the cut is complete, and
+        # when the cut is the call's max_tokens the server ends it ("length").
+        if self.token_cap and done > self.token_cap and not self.fired:
+            return self._fire(len(accumulated), "token_cap", accumulated, score=done,
+                              threshold=self.token_cap)
+        return None
+
+    def _fire(self, n: int, which: str, accumulated: str = "", score=None, threshold=None,
+              detail: dict | None = None):
+        self.abort_guard = which
         self.fired = True
         self.position = n
         context = self.log_context()
-        logger.warning(
-            "%srepetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
-            "for %d consecutive windows",
-            context, n, self.ratio, self.threshold, self.violations,
-        )
+        if self.tail_chars:
+            # Evidence: every abort carries what fired, by how
+            # much, and the text it fired on, so a false abort can be proven.
+            if which == "window":
+                score, threshold, window = round(self.ratio, 2), self.threshold, self.window
+            elif which == "long_window":
+                score, threshold, window = round(self.ratio, 2), self.long_threshold, self.long_window
+            elif which == "length_cap":
+                score, threshold, window = n, self.length_cap_chars, None
+            elif which == "token_cap":
+                window = None
+            else:
+                window = (detail or {}).get("window_chars")
+            self.evidence = {"guard": which, "score": score, "threshold": threshold,
+                             "window_chars": window, "at_chars": n,
+                             "tail": accumulated[-self.tail_chars:]}
+            if which in ("periodic", "numeric"):
+                self.evidence.update(period_chars=detail["period_chars"], repeats=detail["repeats"],
+                                     numbered_rows=detail["numbered_rows"], unit=detail["unit"][:300])
+            elif which == "repeated":
+                self.evidence.update(novel_share=detail["novel"], top_units=detail["top"])
+        if which == "token_cap":
+            logger.warning("%srepetition_abort at %d chars: %d output tokens >= the %d-token "
+                           "runaway cut (v0.5 token cap)", context, n, score, threshold)
+            return REPETITION_ABORT
+        if which == "periodic":
+            logger.warning("%srepetition_abort at %d chars: periodic tail re-emits %d content chars >= %d "
+                           "(period %d chars x %.1f%s) (v0.5 periodic guard)", context, n, score,
+                           threshold, detail["period_chars"], detail["repeats"],
+                           ", numbered rows" if detail["numbered_rows"] else "")
+            return REPETITION_ABORT
+        if which == "numeric":
+            logger.warning("%srepetition_abort at %d chars: a run of numbers with no letters "
+                           "repeats %.1f times >= %d (period %d chars) (v0.5 numeric guard)", context,
+                           n, score, threshold, detail["period_chars"])
+            return REPETITION_ABORT
+        if which == "repeated":
+            logger.warning("%srepetition_abort at %d chars: %d of the last %d content chars are "
+                           "units already emitted %d+ times >= %d (v0.5 repeated guard)", context, n,
+                           score, detail["window_chars"], loop_content.REPEAT_MIN_PRIOR, threshold)
+            return REPETITION_ABORT
+        if which == "window":            # the v0.4 guard's line, verbatim
+            logger.warning(
+                "%srepetition_abort at %d chars: trailing-window zlib ratio %.1f > %.1f "
+                "for %d consecutive windows",
+                context, n, self.ratio, self.threshold, self.violations,
+            )
+        elif which == "long_window":
+            logger.warning(
+                "%srepetition_abort at %d chars: %d-char window zlib ratio %.1f > %.1f "
+                "for %d consecutive windows (v0.5 long-window guard)",
+                context, n, self.long_window, self.ratio, self.long_threshold,
+                self.long_violations,
+            )
+        else:
+            logger.warning("%srepetition_abort at %d chars: output passed the %d-char "
+                           "length cap (v0.5 runaway guard)", context, n, self.length_cap_chars)
         return REPETITION_ABORT
 
     def log_context(self) -> str:
@@ -680,6 +900,17 @@ class RepetitionGuard:
             "position_chars": self.position,
             "threshold": self.threshold,
             "window_chars": self.window,
+            **({"abort_guard": self.abort_guard,
+                "long_max_window_ratio": round(self.long_max_ratio, 2)}
+               if (self.long_window or self.length_cap_chars or self.periodic_chars
+                   or self.repeat_chars or self.numeric_repeats) else {}),
+            **({"max_periodic_chars": self.periodic_max, "max_counter_chars": self.counter_max,
+                "max_repeat_chars": self.repeat_max, "max_numeric_repeats": self.numeric_max,
+                "completion_tokens": self.completion_tokens if self.usage_seen else None,
+                "prompt_tokens": self.prompt_tokens, "token_cap": self.token_cap,
+                "usage_seen": self.usage_seen,
+                "abort_evidence": self.evidence}
+               if (self.periodic_chars or self.repeat_chars or self.numeric_repeats) else {}),
         }
 
 
@@ -798,6 +1029,9 @@ class StreamGuards:
                 return reason
         return self.repetition(chunk, accumulated)
 
+    def usage(self, usage: dict, accumulated: str = ""):
+        return self.repetition.usage(usage, accumulated)
+
     # RepetitionGuard attributes the gate and the ladder read directly.
     @property
     def ratio(self):
@@ -822,20 +1056,41 @@ class StreamGuards:
 # --------------------------------------------------------------------------- message construction
 
 
-def build_image_messages(image_path: str | Path) -> list[dict]:
+def v05_image_part(image_path: str | Path) -> dict:
+    """v0.5 image part: the shape the model was trained and benchmarked with (no ``detail``)."""
+    part = make_image_content(image_path)
+    return {"type": "image_url", "image_url": {"url": part["image_url"]["url"]}}
+
+
+def build_command_messages(command: str, *, image_path=None, text=None) -> list[dict]:
+    """v0.5: system = the bare command; user = image-only or ONE text part."""
+    if (image_path is None) == (text is None):
+        raise ValueError("exactly one of image_path / text")
+    part = (v05_image_part(image_path) if image_path is not None
+            else {"type": "text", "text": text})
+    return [{"role": "system", "content": command},
+            {"role": "user", "content": [part]}]
+
+
+def build_image_messages(image_path: str | Path, contract: str = V04) -> list[dict]:
     """§2 image modality: sentinel system prompt, user content = image ONLY."""
+    if contract == V05:
+        return build_command_messages(_ct.CMD_EXTRACT, image_path=image_path)
     return [
         {"role": "system", "content": SENTINEL},
         {"role": "user", "content": [make_image_content(image_path)]},
     ]
 
 
-def build_text_messages(text: str) -> list[dict]:
+def build_text_messages(text: str, contract: str = V04) -> list[dict]:
     """§2 text modality: sentinel system prompt, user content = the raw string.
 
-    Note the content is a plain string, not a content-part list — that is the
-    shape the text arm was trained and Gate-F'd on.
+    v0.4: the content is a plain string, not a content-part list — that is the
+    shape the v0.4 text arm was trained and Gate-F'd on. v0.5 trains on a list
+    holding ONE text part.
     """
+    if contract == V05:
+        return build_command_messages(_ct.CMD_EXTRACT, text=text)
     return [
         {"role": "system", "content": SENTINEL},
         {"role": "user", "content": text},
@@ -975,7 +1230,8 @@ def normalize_section_types(parsed) -> list[str]:
     return stray
 
 
-def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" = None):
+def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" = None,
+          contract: str = V04):
     """Run the §5 gates over one completion.
 
     Returns (parsed, verdict, error) where verdict is one of
@@ -988,6 +1244,11 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
         # the §5.1 gate — so re-deriving would silently count it clean.
         obs = guard.ratio if guard else 0.0
         pos = guard.position if guard else len(text)
+        which = getattr(guard, "abort_guard", None)
+        if which in ("periodic", "repeated", "numeric", "length_cap", "token_cap"):
+            ev = guard.evidence
+            how = f" {ev['score']} >= {ev['threshold']}" if ev else ""
+            return None, "degenerate", f"repetition_abort: {which} guard{how} at {pos} chars"
         return None, "degenerate", (f"repetition_abort: trailing-window zlib ratio "
                                     f"{obs:.1f} at {pos} chars")
     if finish_reason == "length":
@@ -1001,7 +1262,7 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     # Degeneration is checked on the RAW string before parsing — a loop often
     # still parses (a chunk list repeating the same block) and would otherwise
     # sail through the schema gate.
-    if is_degenerate(text):
+    if is_degenerate_v05(text) if contract == V05 else is_degenerate(text):
         return None, "degenerate", f"zlib ratio {zlib_ratio(text):.2f} > {ZLIB_GATE_RATIO}"
     parsed, perr = parse_json_lenient(text)
     if parsed is None:
@@ -1010,7 +1271,12 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     # signal, not a failed page. Normalize BEFORE validate_schema so the
     # vendored gate stays byte-identical to the eval copy and never sees it.
     normalize_section_types(parsed)
-    schema_ok, serrs = validate_schema(parsed)
+    if contract == V05:
+        for note in _ct.normalize_v05(parsed):
+            logger.info("v0.5 output repaired: %s", note)
+        schema_ok, serrs = _ct.validate_schema_v05(parsed)
+    else:
+        schema_ok, serrs = validate_schema(parsed)
     if schema_ok:
         # Presence passed; now the field TYPES the downstream assembly relies
         # on (GitLab #23). Same verdict, same ladder.
@@ -1021,8 +1287,126 @@ def _gate(text: str, finish_reason: str | None, guard: "RepetitionGuard | None" 
     return parsed, "ok", None
 
 
+# v0.5-only loop guard extensions (2026-11-09). DERIVED, not picked:
+# replayed offline over 6,606 clean pages (OmniDocBench 1,639 + a second parse
+# benchmark 4,635 + 332 v0.5 pages) and 18 v0.5 cap-hit loops. Clean page
+# max 8,000-char-window zlib ratio = 9.5 -> threshold 12 (26% margin); clean
+# max output = 41,003 chars -> cap 60,000 (46% margin). Result: 0/6,606 clean
+# false aborts; 18/18 loops caught (11 by the 2k window, 6 by the 8k window at
+# 9.2-18k chars, 1 by the cap). v0.4 never uses them.
+#
+# 2026-11-14: the guard was rebuilt. The 8k zlib window is OFF by
+# default: it aborted a correct 68-row table (OmniDocBench page-213e6a57, ratio
+# 12.2 — <td> markup and short cell values compress like a loop). It is
+# replaced by three content guards (loop_content.py) that score what is being
+# re-emitted instead of how well the markup compresses. The knobs stay so the
+# old guard can be replayed (SHREW_V05_LOOP_LONG_WINDOW=8000).
+#
+# DERIVED by replay (scripts/loopguard_replay.py) over 41,441 saved outputs
+# (v0.5 raw dumps and guard-free runs, the 6,606-page pool above, rebuilt
+# benchmark responses), 324 of them labelled by reading the
+# text. Rule: the threshold sits at >= 2x the largest score of any text read
+# as legitimate; loops have no upper bound (they grow until cut), so the loop
+# side fixes only how many characters a loop costs before the abort.
+#   periodic  content chars re-emitted by an exactly-repeating tail
+#             legitimate max 1,431 (a contract paragraph x3; 1,266 for numbered
+#             line items, 715 for 40 "[illegible signature]" lines) -> 3,000
+#   counter   the same score when the tail is numbered rows (a number counts
+#             and each repeat re-emits < 200 content chars): a payment schedule,
+#             an answer sheet and a looping list are one shape. Corpus
+#             legitimate max 552 (a 10-K exhibit list), so 2x would be ~1,100;
+#             but constructed pages score higher: a 120-row payment
+#             schedule 3,753, a 300-question answer sheet 3,572, 60 schedule
+#             rows with a 43-letter description 3,016 -> 6,000 (1.6x the
+#             built max, 11x the corpus max; not a full 2x over the built
+#             pages: ~190 such rows on one page abort). This conservative
+#             value was kept over 4,500 because it saves good pages; it costs
+#             real numbered-row loops 0.1-3.6k chars more
+#             than the old guard before the abort.
+#   repeated  chars of the last 8,000 in units already emitted 3+ times, while
+#             <= 10% of the window is new
+#             legitimate max 1,191 (0 on a page of 13 foreclosure notices that
+#             share their boilerplate) -> 4,000
+#   numeric   cycles of a run of numbers with no letters, or of numbered rows
+#             legitimate max in the corpus 39 (a numbered form); built: a
+#             "300 chart" number grid 283, 300 answer lines 276 -> 600
+# Result on the labelled set (325 texts): clean 0/152 aborted (old guard 2/152,
+# both the page above); loops 135/140 (old 126/140); the 5 not reached are dump
+# texts the old guard had cut at 9-12k chars while the score was still rising.
+# The numbered-row false aborts above were found by constructing such pages;
+# they are tests now (test_numbered_rows_of_a_real_page_are_not_a_loop).
+#
+# The §5.1 whole-document gate has the same blind spot and failed the same
+# page after it finished normally: see is_degenerate_v05.
+V05_LOOP_LONG_WINDOW = int(os.environ.get("SHREW_V05_LOOP_LONG_WINDOW", "0"))
+V05_LOOP_LONG_RATIO = float(os.environ.get("SHREW_V05_LOOP_LONG_RATIO", "12.0"))
+V05_LOOP_MAX_CHARS = int(os.environ.get("SHREW_V05_LOOP_MAX_CHARS", "60000"))
+V05_LOOP_PERIODIC_CHARS = int(os.environ.get("SHREW_V05_LOOP_PERIODIC_CHARS", "3000"))
+V05_LOOP_REPEAT_CHARS = int(os.environ.get("SHREW_V05_LOOP_REPEAT_CHARS", "4000"))
+V05_LOOP_COUNTER_CHARS = int(os.environ.get("SHREW_V05_LOOP_COUNTER_CHARS", "6000"))
+V05_LOOP_NUMERIC_REPEATS = int(os.environ.get("SHREW_V05_LOOP_NUMERIC_REPEATS", "600"))
+V05_LOOP_TAIL_CHARS = int(os.environ.get("SHREW_V05_LOOP_TAIL_CHARS", "2000"))
+
+
+# Runaway cut in output tokens (2026-11-14). The 60,000-character cap above
+# says nothing about tokens (CJK text is ~1 token per character, English ~4), so
+# the cut is taken on the completion tokens vLLM reports on the stream. The
+# values are per bucket / per text command, from the training labels: see
+# V05_OUTPUT_TOKEN_CUT in contract.py. A server that reports no usage keeps the
+# character cap, and that is visible: /health `loop_guard_v05.runaway_cut` and
+# the startup log say which cut is active and count the streams without usage.
+V05_STREAM_USAGE = os.environ.get("SHREW_V05_STREAM_USAGE", "1") not in ("0", "false", "no", "off")
+_V05_CUT_LOCK = threading.Lock()
+_V05_CUT = {"streams": 0, "streams_with_usage": 0, "streams_without_usage": 0,
+            "token_cut_aborts": 0, "char_cap_aborts_without_usage": 0}
+
+
+def _note_v05_stream(guard: "RepetitionGuard", by_tokens: bool) -> None:
+    with _V05_CUT_LOCK:
+        _V05_CUT["streams"] += 1
+        _V05_CUT["streams_with_usage" if guard.usage_seen else "streams_without_usage"] += 1
+        if guard.abort_guard == "token_cap":
+            _V05_CUT["token_cut_aborts"] += 1
+        elif guard.abort_guard == "length_cap":
+            _V05_CUT["char_cap_aborts_without_usage"] += 1
+        if not guard.usage_seen and _V05_CUT["streams_without_usage"] in (1, 10, 100, 1000):
+            logger.warning("v0.5 runaway cut: the server sent no token usage on a stream (%d so far); "
+                           "the %d-character cap is the active cut for those calls",
+                           _V05_CUT["streams_without_usage"], V05_LOOP_MAX_CHARS)
+
+
+def v05_runaway_cut_status() -> dict:
+    """Which runaway cut is configured and which one the streams actually got."""
+    with _V05_CUT_LOCK:
+        c = dict(_V05_CUT)
+    configured = "tokens" if V05_STREAM_USAGE else "chars"
+    if configured == "chars" or (c["streams_without_usage"] and not c["streams_with_usage"]):
+        observed = "chars"
+    elif c["streams_with_usage"] and not c["streams_without_usage"]:
+        observed = "tokens"
+    elif c["streams_with_usage"]:
+        observed = "mixed"
+    else:
+        observed = "unknown (no v0.5 stream yet)"
+    return {"configured": configured, "observed": observed,
+            "token_cut": dict(_ct.V05_OUTPUT_TOKEN_CUT), "char_cap": V05_LOOP_MAX_CHARS or None, **c}
+
+
+def v05_guard_params() -> dict:
+    """RepetitionGuard keyword arguments of the v0.5 contract (0 = that guard off)."""
+    return {"long_window": V05_LOOP_LONG_WINDOW or None,
+            "long_threshold": V05_LOOP_LONG_RATIO,
+            "length_cap_chars": V05_LOOP_MAX_CHARS or None,
+            "periodic_chars": V05_LOOP_PERIODIC_CHARS or None,
+            "repeat_chars": V05_LOOP_REPEAT_CHARS or None,
+            "numeric_repeats": V05_LOOP_NUMERIC_REPEATS or None,
+            "counter_chars": V05_LOOP_COUNTER_CHARS or None,
+            "tail_chars": V05_LOOP_TAIL_CHARS}
+
+
 def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
-          page_no=None, attempt=None, doc_id=None):
+          page_no=None, attempt=None, doc_id=None, contract: str = V04,
+          token_cap: int | None = None):
     """One model call, streamed when the §5.2 guard is on.
 
     Streaming changes nothing about sampling — greedy is greedy — so the eval
@@ -1039,13 +1423,22 @@ def _call(messages, client, *, max_tokens, temperature, extra_params, timeout,
         choice = result["choices"][0]
         return choice["message"].get("content") or "", choice.get("finish_reason"), None
 
-    rep = RepetitionGuard(page_no=page_no, attempt=attempt, doc_id=doc_id)
+    v05_ext = v05_guard_params() if contract == V05 else {}
+    # Only a client that can pass usage on (VLMClient); any other keeps the character cap.
+    by_tokens = (contract == V05 and V05_STREAM_USAGE and bool(token_cap)
+                 and "on_usage" in inspect.signature(client.chat_completion_stream).parameters)
+    if by_tokens:
+        v05_ext["token_cap"] = min(token_cap, max_tokens)
+    rep = RepetitionGuard(page_no=page_no, attempt=attempt, doc_id=doc_id, **v05_ext)
     guard = StreamGuards(rep, JsonCloseGuard()) if JSON_CLOSE_GUARD_ENABLED else rep
+    more = {"on_usage": guard.usage} if by_tokens else {}
     result = client.chat_completion_stream(
         messages, max_tokens=max_tokens, temperature=temperature,
         extra_params=extra_params, timeout=timeout, on_delta=guard,
-        wall_clock_s=STREAM_WALL_CLOCK_S,
+        wall_clock_s=STREAM_WALL_CLOCK_S, **more,
     )
+    if contract == V05 and token_cap:
+        _note_v05_stream(rep, by_tokens)
     choice = result["choices"][0]
     text = choice["message"].get("content") or ""
     finish_reason = choice.get("finish_reason")
@@ -1085,30 +1478,96 @@ COERCED_MIN_CHARS = int(os.environ.get("SHREW_COERCED_MIN_CHARS", "300"))
 COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
 
+# Opt-in raw-completion dump: v0.5 only, off unless the caller
+# sets a directory. One JSON line per model call, appended to <dir>/<doc_id>.jsonl,
+# so benchmark sweeps capture loop texts for offline guard replay. Never in v0.4.
+RAW_DUMP_DIR = os.environ.get("SHREW_RAW_DUMP_DIR", "").strip() or None
+_dump_lock = threading.Lock()
+
+
+def _dump_raw(contract, doc_id, page_no, rung, text, finish_reason, verdict) -> None:
+    if not RAW_DUMP_DIR or contract != V05:
+        return
+    try:
+        os.makedirs(RAW_DUMP_DIR, exist_ok=True)
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(doc_id or "nodoc"))[:80] + ".jsonl"
+        line = json.dumps({"doc_id": doc_id, "page": page_no, "rung": rung,
+                           "finish_reason": finish_reason, "verdict": verdict,
+                           "chars": len(text), "text": text}, ensure_ascii=False)
+        with _dump_lock, open(os.path.join(RAW_DUMP_DIR, name), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:  # noqa: BLE001 — a diagnostic dump never fails a page
+        logger.warning("raw dump failed: %s", e)
+
+
+def _rung(trail, rung, t0, text, finish_reason, verdict, guard, max_tokens, temperature,
+          dump=None):
+    """One attempt's record for the per-page trail (processing_log.pages, v0.5)."""
+    if dump:
+        _dump_raw(dump[0], dump[1], dump[2], rung, text, finish_reason, verdict)
+    st = guard.stats() if guard is not None and hasattr(guard, "stats") else {}
+    trail.append({
+        "rung": rung, "finish_reason": finish_reason, "verdict": verdict,
+        "chars": len(text), "max_tokens": max_tokens, "temperature": temperature,
+        "seconds": round(time.monotonic() - t0, 2),
+        "abort_at_chars": (st.get("position_chars") if finish_reason == REPETITION_ABORT else None),
+        "abort_guard": (st.get("abort_guard") or "window") if finish_reason == REPETITION_ABORT else None,
+        "max_window_ratio": st.get("max_window_ratio"),
+        "long_max_window_ratio": st.get("long_max_window_ratio"),
+        "max_periodic_chars": st.get("max_periodic_chars"),
+        "max_counter_chars": st.get("max_counter_chars"),
+        "max_repeat_chars": st.get("max_repeat_chars"),
+        "max_numeric_repeats": st.get("max_numeric_repeats"),
+        # tokens the server reported on the stream (None: it reported none)
+        "prompt_tokens": st.get("prompt_tokens"), "completion_tokens": st.get("completion_tokens"),
+        "token_cap": st.get("token_cap"),
+        # guard, score vs threshold, window and the trailing text of the abort
+        "abort_evidence": st.get("abort_evidence") if finish_reason == REPETITION_ABORT else None,
+    })
+
+
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
              min_content_chars: int = 0, page_no: int | None = None,
-             decode: "DecodePolicy | None" = None, doc_id: str | None = None) -> dict:
+             decode: "DecodePolicy | None" = None, doc_id: str | None = None,
+             token_cap: int | None = None) -> dict:
+    """The ladder below, plus ``trail``: one record per model call (rung,
+    finish_reason, verdict, chars, abort position, seconds)."""
+    trail: list = []
+    res = _extract_ladder(messages, client, max_tokens=max_tokens, timeout=timeout,
+                          min_content_chars=min_content_chars, page_no=page_no,
+                          decode=decode, doc_id=doc_id, trail=trail, token_cap=token_cap)
+    res["trail"] = trail
+    return res
+
+
+def _extract_ladder(messages: list[dict], client, *, max_tokens: int, timeout=None,
+                    min_content_chars: int = 0, page_no: int | None = None,
+                    decode: "DecodePolicy | None" = None, doc_id: str | None = None,
+                    trail: list, token_cap: int | None = None) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry.
 
     ``decode`` carries the temperature/seed knobs (env defaults when None);
     at the defaults every request is identical to the pre-knob ladder."""
-    params = get_generation_params(client.model, "structured_page")
     decode = decode or DecodePolicy.from_env()
+    params = get_generation_params(client.model, decode.stage)
     input_key = page_input_key(messages)
     t1, x1 = _sampling(params["temperature"], params["extra_params"],
                        decode.try1_temp, decode, input_key, 0)
 
     # ── First pass: minimal params, no enforcement ──────────────────────────
+    _t0 = time.monotonic()
     text, finish_reason, guard = _call(
         messages, client,
         max_tokens=max_tokens,
         temperature=t1,
         extra_params=x1,
         timeout=timeout,
-        doc_id=doc_id,
+        doc_id=doc_id, contract=decode.contract, token_cap=token_cap,
         page_no=page_no, attempt="attempt 1/2, first pass",
     )
-    parsed, verdict, error = _gate(text, finish_reason, guard)
+    parsed, verdict, error = _gate(text, finish_reason, guard, decode.contract)
+    _dump = (decode.contract, doc_id, page_no)
+    _rung(trail, "first", _t0, text, finish_reason, verdict, guard, max_tokens, t1, _dump)
     _note_completion(verdict == "empty")
     aborted = finish_reason == REPETITION_ABORT
 
@@ -1147,16 +1606,18 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
         # fixed seed policy the attempt index makes it a different sample.
         rt, rx = _sampling(params["temperature"], params["extra_params"],
                            decode.try1_temp, decode, input_key, attempt - 1)
+        _t0 = time.monotonic()
         text, finish_reason, guard = _call(
             messages, client,
             max_tokens=max_tokens,
             temperature=rt,
             extra_params=rx,
             timeout=timeout,
-            doc_id=doc_id,
+            doc_id=doc_id, contract=decode.contract, token_cap=token_cap,
             page_no=page_no, attempt=f"attempt {attempt}, re-roll (same config)",
         )
-        parsed, verdict, error = _gate(text, finish_reason, guard)
+        parsed, verdict, error = _gate(text, finish_reason, guard, decode.contract)
+        _rung(trail, "reroll", _t0, text, finish_reason, verdict, guard, max_tokens, rt, _dump)
         _note_completion(verdict == "empty")
         aborted = finish_reason == REPETITION_ABORT
         if verdict == "ok":
@@ -1172,17 +1633,20 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 
     t2, x2 = _sampling(params["temperature"], decode.retry_extra(params["extra_params"]),
                        decode.try2_temp, decode, input_key, attempt)
+    _t0 = time.monotonic()
     rtext, rfinish, rguard = _call(
         messages, client,
         max_tokens=max_tokens,
         temperature=t2,
         extra_params=x2,
         timeout=timeout,
-        doc_id=doc_id,
+        doc_id=doc_id, contract=decode.contract, token_cap=token_cap,
         page_no=page_no, attempt=("attempt 2/2, enforced retry" if decode.try2_enforce
                                   else "attempt 2/2, un-enforced retry"),
     )
-    rparsed, rverdict, rerror = _gate(rtext, rfinish, rguard)
+    rparsed, rverdict, rerror = _gate(rtext, rfinish, rguard, decode.contract)
+    _rung(trail, "retry_enforced" if decode.try2_enforce else "retry_unenforced",
+          _t0, rtext, rfinish, rverdict, rguard, max_tokens, t2, _dump)
     _note_completion(rverdict == "empty")
     aborted = aborted or rfinish == REPETITION_ABORT
     stats = (rguard or guard).stats() if (rguard or guard) else None
@@ -1236,9 +1700,10 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 # --------------------------------------------------------------------------- public API
 
 
-def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS,
+def extract_page(image_path: str | Path, client, *, max_tokens: int | None = None,
                   timeout=None, page_no: int | None = None,
-                  decode: "DecodePolicy | None" = None, doc_id: str | None = None) -> dict:
+                  decode: "DecodePolicy | None" = None, doc_id: str | None = None,
+                  bucket: str | None = None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
     ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
@@ -1253,13 +1718,34 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int = MAX_TOKENS
     # that needed the enforcement retry AND produced almost no content is the
     # hallucination-slop signature. Text pages are exempt — a tiny text segment
     # legitimately coerces to a tiny result.
-    return _extract(build_image_messages(image_path), client,
+    decode = decode or DecodePolicy.from_env()
+    token_cap = None
+    if decode.contract == V05:
+        # The size is read from the very file that is sent, so the image-token
+        # count is exact on every image path (pages, cross-page composites).
+        # It is unknown only when that file cannot be opened, and then the call
+        # is charged the largest image there is (contract.v05_plan).
+        size = None
+        try:
+            from PIL import Image as _Image
+            with _Image.open(image_path) as _im:          # header only, no decode
+                size = _im.size
+        except Exception as e:
+            logger.warning("v0.5 budget: cannot read the size of %s (%s); charging the "
+                           "maximum image-token count", image_path, type(e).__name__)
+        plan = _ct.v05_plan(_ct.CMD_EXTRACT, size=size,
+                            cap=min(filter(None, (max_tokens, V05_MAX_TOKENS_CAP)), default=None))
+        max_tokens = plan["max_tokens"]
+        token_cap = _ct.v05_output_token_cut("image", bucket, plan["image_tokens"])
+    elif max_tokens is None:
+        max_tokens = MAX_TOKENS
+    return _extract(build_image_messages(image_path, decode.contract), client,
                     max_tokens=max_tokens, timeout=timeout,
                     min_content_chars=COERCED_MIN_CHARS, page_no=page_no, decode=decode,
-                    doc_id=doc_id)
+                    doc_id=doc_id, token_cap=token_cap)
 
 
-def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
+def extract_text_page(text: str, client, *, max_tokens: int | None = None,
                        max_model_len: int = MAX_MODEL_LEN,
                        max_chars: int = TEXT_PAGE_MAX_CHARS, timeout=None,
                        page_no: int | None = None,
@@ -1272,16 +1758,44 @@ def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
     this only fires on a single unsplittable line (one enormous CSV record, a
     minified HTML blob).
     """
-    limit = min(max_chars, context_limit_chars(max_model_len, max_tokens))
+    decode = decode or DecodePolicy.from_env()
+    if decode.contract == V05:
+        # The v0.5 budget is derived per call from the text itself, so the only
+        # size bound is the distribution one (TEXT_PAGE_MAX_CHARS).
+        limit = max_chars
+    else:
+        if max_tokens is None:
+            max_tokens = MAX_TOKENS
+        limit = min(max_chars, context_limit_chars(max_model_len, max_tokens))
     if len(text) > limit:
         est = int(len(text) / CHARS_PER_TOKEN)
         return _result(False, None, "oversize",
                        f"{len(text)} chars (~{est} tok) exceeds the {limit}-char "
                        f"text-page bound; filtered rather than truncated",
                        0, len(text))
-    return _extract(build_text_messages(text), client,
+    token_cap = None
+    if decode.contract == V05:
+        from . import v05_tokens
+        n_tok = v05_tokens.text_tokens(text)
+        if n_tok > _ct.V05_TEXT_PAGE_MAX_TOKENS:
+            return _result(False, None, "oversize",
+                           f"{n_tok} tokens exceeds the {_ct.V05_TEXT_PAGE_MAX_TOKENS}-token "
+                           f"text-page bound; filtered rather than truncated", 0, len(text))
+        try:
+            plan = _ct.v05_plan(_ct.CMD_EXTRACT, text=text,
+                                cap=min(filter(None, (max_tokens, V05_MAX_TOKENS_CAP)), default=None))
+        except _ct.V05BudgetError as e:
+            return _result(False, None, "oversize",
+                           f"{e}; filtered rather than truncated", 0, len(text))
+        max_tokens = plan["max_tokens"]
+        token_cap = _ct.v05_output_token_cut("text")
+        tag = v05_tokens.template_tag(text)
+        if tag:
+            logger.warning("v0.5 text page %s (doc %s) contains the chat-template task tag <%s>: the served "
+                           "template replaces the whole page text by that task's prompt", page_no, doc_id, tag)
+    return _extract(build_text_messages(text, decode.contract), client,
                     max_tokens=max_tokens, timeout=timeout, page_no=page_no, decode=decode,
-                    doc_id=doc_id)
+                    doc_id=doc_id, token_cap=token_cap)
 
 
 # --------------------------------------------------------------------------- text pagination
@@ -1293,38 +1807,129 @@ def extract_text_page(text: str, client, *, max_tokens: int = MAX_TOKENS,
 _PARA_SPLIT = re.compile(r"\n\s*\n")
 
 
-def paginate_text(text: str, max_chars: int = TEXT_PAGE_MAX_CHARS) -> list[str]:
+# An embedded data: URI (docling markdown: ``![Image](data:image/png;base64,...)``)
+# is a binary payload, not text. In the v0.5 training set 210 text prompts carry
+# one and their labels transcribe the text around it and leave the payload out.
+# Split into token-sized pages it would be a dozen pages of base64 sent to the
+# model, so under v0.5 the payload is replaced by a marker before pagination and
+# counted (``text_pagination.data_uri_payloads_removed``). SHREW_V05_STRIP_DATA_URIS=0
+# sends it as it is.
+V05_STRIP_DATA_URIS = os.environ.get("SHREW_V05_STRIP_DATA_URIS", "1") not in ("0", "false", "no", "off")
+# The payload is one unbroken base64 run: no whitespace in the class, or the
+# match would run on through the prose that follows.
+_DATA_URI = re.compile(r"(data:[\w.+-]+/[\w.+-]+(?:;[\w=.+-]+)*;base64,)[A-Za-z0-9+/]{200,}={0,2}")
+DATA_URI_MARKER = "[payload removed]"
+
+# Where an over-long line may be cut, best first: after a sentence end, then at
+# whitespace. CJK sentence marks end a sentence anywhere; ". ! ? ;" only before
+# whitespace, so "3.14" and "e.g.x" stay whole.
+_SENTENCE_END = re.compile(r"(?<=[。！？；…])|(?<=[.!?;:])(?=\s)")
+_WORD_END = re.compile(r"(?<=\s)(?=\S)")
+
+
+def strip_data_uris(text: str) -> tuple[str, int]:
+    """(text with base64 data-URI payloads replaced by a marker, how many)."""
+    return _DATA_URI.subn(lambda m: m.group(1) + DATA_URI_MARKER, text)
+
+
+def _split_long_line(line: str, max_chars: int, max_tokens: int) -> list[str]:
+    """Split one line that is over the page bound into pieces that fit: at
+    sentence ends, then at whitespace, then on token boundaries. The pieces
+    join back to ``line`` exactly — nothing is dropped or rewritten."""
+    from . import v05_tokens
+
+    def fits(piece: str) -> bool:
+        return len(piece) <= max_chars and v05_tokens.text_tokens(piece) <= max_tokens
+
+    def pack(parts: list[str]) -> list[str]:
+        out, cur, cur_tok = [], "", 0
+        for part in parts:
+            tok = v05_tokens.text_tokens(part) + 1            # +1: a join can add a token
+            if cur and (len(cur) + len(part) > max_chars or cur_tok + tok > max_tokens):
+                out.append(cur)
+                cur, cur_tok = "", 0
+            cur, cur_tok = cur + part, cur_tok + tok
+        return out + ([cur] if cur else [])
+
+    def split(piece: str, level: int) -> list[str]:
+        if fits(piece):
+            return [piece]
+        if level < 2:
+            rx = _SENTENCE_END if level == 0 else _WORD_END
+            cuts = [0] + [m.start() for m in rx.finditer(piece) if 0 < m.start() < len(piece)] + [len(piece)]
+            parts = [piece[a:b] for a, b in zip(cuts, cuts[1:]) if a < b]
+            if len(parts) > 1:
+                return pack([q for part in parts for q in split(part, level + 1)])
+            return split(piece, level + 1)
+        return by_tokens(piece)
+
+    def by_tokens(piece: str) -> list[str]:
+        out = []
+        for start in range(0, len(piece), max_chars):
+            out.extend(v05_tokens.split_by_tokens(piece[start:start + max_chars], max_tokens))
+        return out
+
+    # The packed counts are sums of parts; the exact count of every piece is
+    # checked here, and a piece that still lands over is cut on token boundaries.
+    return [q for piece in split(line, 0) for q in ([piece] if fits(piece) else by_tokens(piece))]
+
+
+def paginate_text(text: str, max_chars: int = TEXT_PAGE_MAX_CHARS,
+                  max_tokens: int | None = None, stats: dict | None = None) -> list[str]:
     """Split extracted text into page-sized blocks for the text modality.
 
     "One request = one page" (§2): the text arm only ever saw page-sized input
     (see TEXT_PAGE_MAX_CHARS for the measured envelope), so a spreadsheet dump
     or a long markdown file is paginated rather than sent whole. Paragraphs are
-    packed greedily; a paragraph over the bound is broken on line boundaries; a
-    single line over the bound is emitted as its own page, which
-    ``extract_text_page`` then filters and reports (§5.4 — never truncate).
+    packed greedily; a paragraph over the bound is broken on line boundaries.
+
+    A single line over the bound: under v0.4 (no ``max_tokens``) it is emitted as
+    its own page, which ``extract_text_page`` filters and reports (§5.4). Under
+    v0.5 it is SPLIT, never refused (text extracted from a PDF often arrives as
+    one long line): at sentence ends, then whitespace, then on
+    token boundaries (``_split_long_line``).
+
+    ``max_tokens`` (v0.5: contract.V05_TEXT_PAGE_MAX_TOKENS) adds a bound in
+    tokens of the served tokenizer; a page satisfies both. Units are counted
+    once and summed with an allowance per joiner. ``stats`` (a dict) receives
+    ``split_oversize_line`` and ``data_uri_payloads_removed``.
     """
     if not text.strip():
         return []
+    from . import v05_tokens
+    if max_tokens and V05_STRIP_DATA_URIS:
+        text, removed = strip_data_uris(text)
+        if stats is not None and removed:
+            stats["data_uri_payloads_removed"] = stats.get("data_uri_payloads_removed", 0) + removed
+    cost = (lambda u: v05_tokens.text_tokens(u)) if max_tokens else (lambda u: 0)
+    limit = max_tokens or 0
 
     def _pack(units: list[str], joiner: str) -> list[str]:
         pages: list[str] = []
-        cur = ""
+        cur, cur_tok = "", 0
         for u in units:
+            # A unit over the character bound is split below whatever it costs.
+            tok = cost(u) if len(u) <= max_chars else limit + 1
             candidate = u if not cur else cur + joiner + u
-            if len(candidate) <= max_chars:
-                cur = candidate
+            cand_tok = tok if not cur else cur_tok + len(joiner) + tok
+            if len(candidate) <= max_chars and (not max_tokens or cand_tok <= limit):
+                cur, cur_tok = candidate, cand_tok
                 continue
             if cur:
                 pages.append(cur)
-            if len(u) <= max_chars:
-                cur = u
+            if len(u) <= max_chars and (not max_tokens or tok <= limit):
+                cur, cur_tok = u, tok
             else:
                 # Too big even alone — break it down a level.
                 if joiner == "\n\n":
                     pages.extend(_pack(u.split("\n"), "\n"))
+                elif max_tokens:
+                    pages.extend(_split_long_line(u, max_chars, limit))
+                    if stats is not None:
+                        stats["split_oversize_line"] = stats.get("split_oversize_line", 0) + 1
                 else:
                     pages.append(u)  # single oversize line: filtered downstream
-                cur = ""
+                cur, cur_tok = "", 0
         if cur:
             pages.append(cur)
         return pages

@@ -12,6 +12,9 @@ services:
     environment:
       - VLM_URL=http://shrew-ocr:8000
       - VLM_MODEL=shrew-ocr-preview
+      # The bundled GGUF is the v0.5 model (see Dockerfile.ocr-cuda), so this
+      # stack always runs the v0.5 contract, whatever docker/.env says.
+      - SHREW_CONTRACT=v0.5
     depends_on:
       shrew-ocr:
         condition: service_healthy

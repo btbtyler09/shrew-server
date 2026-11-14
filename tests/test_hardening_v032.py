@@ -1,7 +1,7 @@
 """v0.3.2 hardening batch — regression tests for audit issues #5–#14.
 
 Each test pins one fix from the 2026-08-25 robustness audit (GitLab
-shrew-server-private issues #5–#14). The archetype for the batch was the
+the server issues #5–#14). The archetype for the batch was the
 production PDFium exit-139: protections that silently weren't there.
 """
 import os

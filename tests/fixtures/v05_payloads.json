@@ -1,0 +1,18 @@
+{
+ "classify_figure": [
+  "{\"max_tokens\": 8, \"messages\": [{\"content\": \"classify_figure\", \"role\": \"system\"}, {\"content\": [{\"image_url\": {\"url\": \"data:image/png;base64,<PNG>\"}, \"type\": \"image_url\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 460418065, \"temperature\": 0.4}"
+ ],
+ "fix_headings": [
+  "{\"max_tokens\": 4096, \"messages\": [{\"content\": \"fix_headings\", \"role\": \"system\"}, {\"content\": [{\"text\": \"## A\\n## B\", \"type\": \"text\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 1130679271, \"temperature\": 0.4}"
+ ],
+ "page_B1_clean": [
+  "{\"max_tokens\": 28062, \"messages\": [{\"content\": \"structured_extraction\", \"role\": \"system\"}, {\"content\": [{\"image_url\": {\"url\": \"data:image/png;base64,<PNG>\"}, \"type\": \"image_url\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 1211740492, \"stream\": true, \"stream_options\": {\"continuous_usage_stats\": true, \"include_usage\": true}, \"temperature\": 0.4}"
+ ],
+ "page_B1_parse_then_retry": [
+  "{\"max_tokens\": 28062, \"messages\": [{\"content\": \"structured_extraction\", \"role\": \"system\"}, {\"content\": [{\"image_url\": {\"url\": \"data:image/png;base64,<PNG>\"}, \"type\": \"image_url\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 1211740492, \"stream\": true, \"stream_options\": {\"continuous_usage_stats\": true, \"include_usage\": true}, \"temperature\": 0.4}",
+  "{\"max_tokens\": 28062, \"messages\": [{\"content\": \"structured_extraction\", \"role\": \"system\"}, {\"content\": [{\"image_url\": {\"url\": \"data:image/png;base64,<PNG>\"}, \"type\": \"image_url\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 1212734310, \"stream\": true, \"stream_options\": {\"continuous_usage_stats\": true, \"include_usage\": true}, \"temperature\": 0.4}"
+ ],
+ "text_clean": [
+  "{\"max_tokens\": 29977, \"messages\": [{\"content\": \"structured_extraction\", \"role\": \"system\"}, {\"content\": [{\"text\": \"A short text page.\", \"type\": \"text\"}], \"role\": \"user\"}], \"model\": \"shrew-ocr-preview\", \"presence_penalty\": 0.3, \"seed\": 879340010, \"stream\": true, \"stream_options\": {\"continuous_usage_stats\": true, \"include_usage\": true}, \"temperature\": 0.4}"
+ ]
+}

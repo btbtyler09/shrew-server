@@ -39,6 +39,7 @@ from .rasterizer import (
     classify_file,
 )
 from .progress import ProgressReporter
+from .contract import V05, V05_TOKEN_BUDGET, default_contract
 from .structured_page import (
     DecodePolicy,
     EMPTY_200_ALERT_THRESHOLD,
@@ -48,6 +49,8 @@ from .structured_page import (
     STREAM_GUARD_ENABLED,
     STREAM_GUARD_RATIO,
     STREAM_GUARD_WINDOW_CHARS,
+    v05_guard_params,
+    v05_runaway_cut_status,
     check_output_budget,
     empty_200_streak,
     warn_if_budget_unreachable,
@@ -157,6 +160,8 @@ async def lifespan(app: FastAPI):
     # SHREW_TRY2_ENFORCE
     # rather than on the first page of the first request.
     logger.info("decode policy: %s", DecodePolicy.from_env().describe())
+    from .latex_wrap import env_settings as _latex_env
+    _latex_env()                                   # same: a bad SHREW_LATEX_WRAP* stops the boot
     _sweep_stale_tmp()
 
     # Every throttle in this process (VLM gate, rasterize lock, pipeline
@@ -203,7 +208,36 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to query VLM /v1/models: {e}")
 
-    warn_if_budget_unreachable(_served_max_model_len or MAX_MODEL_LEN)
+    _c = default_contract()
+    logger.warning("=" * 72)
+    logger.warning("ACTIVE MODEL CONTRACT: %s  (%s)", _c,
+                   "for the shrew-ocr-preview v0.5 model" if _c == V05 else
+                   "for the shrew-ocr-preview v0.4 / v0.4.1 models; the v0.5 model needs SHREW_CONTRACT=v0.5")
+    logger.warning("A model served under the wrong contract returns failed or empty pages. "
+                   "Set SHREW_CONTRACT=v0.4|v0.5, or send the form field 'contract' per request.")
+    logger.warning("=" * 72)
+    if _c == V05:
+        if (_served_max_model_len or MAX_MODEL_LEN) < V05_TOKEN_BUDGET:
+            logger.error("v0.5 contract: served max_model_len %s is below the %s-token "
+                         "in-distribution budget; long pages will truncate",
+                         _served_max_model_len or MAX_MODEL_LEN, V05_TOKEN_BUDGET)
+        from .contract import v05_budget_status
+        b, cut = v05_budget_status(), v05_runaway_cut_status()
+        tk = b["tokenizer"]
+        (logger.info if tk["exact"] else logger.error)(
+            "v0.5 budget: %s tokens; prompt counts are %s (tokenizer %s, sha256 %s)",
+            b["token_budget"], "EXACT" if tk["exact"] else "a UTF-8 BYTE UPPER BOUND, not exact",
+            tk["source"], (tk["sha256"] or "?")[:12])
+        if cut["configured"] == "tokens":
+            logger.info("v0.5 runaway cut: OUTPUT TOKENS %s from the usage vLLM reports on the "
+                        "stream; a stream with no usage falls back to the %s-character cap "
+                        "(counted in /health loop_guard_v05.runaway_cut)",
+                        cut["token_cut"], cut["char_cap"])
+        else:
+            logger.warning("v0.5 runaway cut: CHARACTERS (%s); the token cut is off "
+                           "(SHREW_V05_STREAM_USAGE=0)", cut["char_cap"])
+    else:
+        warn_if_budget_unreachable(_served_max_model_len or MAX_MODEL_LEN)
 
     logger.info("=" * 60)
     logger.info("SHREW SERVER STARTING")
@@ -308,7 +342,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.4.1",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -449,7 +483,15 @@ async def health():
     # those pages will be truncated silently, and the truncation looks exactly
     # like a loop downstream. That is a misconfiguration, not a runtime fault,
     # so it degrades the probe too.
-    capacity = check_output_budget(_served_max_model_len or MAX_MODEL_LEN)
+    served = _served_max_model_len or MAX_MODEL_LEN
+    v05_default = default_contract() == V05
+    if v05_default:
+        # v0.5 bounds each call by its own prompt inside the 30,000-token
+        # in-distribution budget; the serve must hold that whole budget.
+        capacity = {"contract": V05, "max_model_len": served,
+                    "token_budget": V05_TOKEN_BUDGET, "ok": served >= V05_TOKEN_BUDGET}
+    else:
+        capacity = check_output_budget(served)
     body = {
         "status": "ok",
         "empty_200_streak": streak,
@@ -466,6 +508,11 @@ async def health():
         "transport_errors": transport,
         "concurrency": concurrency,
     }
+    if v05_default:
+        body["contract"] = V05        # v0.4 keeps the v0.4.1 body exactly
+        body["loop_guard_v05"] = {**v05_guard_params(), "runaway_cut": v05_runaway_cut_status()}
+        from .contract import v05_budget_status
+        body["budget_v05"] = v05_budget_status()
     if not capacity["ok"]:
         body["status"] = "degraded"
         return JSONResponse(status_code=503, content=body)
@@ -610,19 +657,22 @@ def _tel_sample_s() -> float:
 
 
 def _validate_decode_params(temperature, retry_temperature, seed_policy,
-                            retry_enforce=None):
+                            retry_enforce=None, contract=None, figure_check=None,
+                            heading_fix=None):
     """Per-request decode overrides: first-pass ``temperature``,
     ``retry_temperature``, ``seed_policy`` and ``retry_enforce`` — same rules as
     SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY / SHREW_TRY2_ENFORCE;
     all None = env defaults. An invalid value is a client error (400), never a
     silent fallback."""
     if (temperature is None and retry_temperature is None and seed_policy is None
-            and retry_enforce is None):
+            and retry_enforce is None and contract is None and figure_check is None
+            and heading_fix is None):
         return None
     try:
         return DecodePolicy.from_env().with_overrides(
             temperature=temperature, retry_temperature=retry_temperature,
-            seed_policy=seed_policy, retry_enforce=retry_enforce)
+            seed_policy=seed_policy, retry_enforce=retry_enforce,
+            contract=contract, figure_check=figure_check, heading_fix=heading_fix)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
@@ -658,6 +708,9 @@ async def convert(
     retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
     seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
     retry_enforce: Optional[str] = Form(None),       # per-request SHREW_TRY2_ENFORCE (400 if invalid)
+    contract: Optional[str] = Form(None),            # per-request SHREW_CONTRACT: v0.4 | v0.5 (400 if invalid)
+    figure_check: Optional[str] = Form(None),        # v0.5 only: SHREW_FIGURE_CHECK (default on)
+    heading_fix: Optional[str] = Form(None),         # v0.5 only: SHREW_HEADING_FIX (default on)
 ):
     if format not in ("json", "markdown"):
         raise HTTPException(422, "format must be 'json' or 'markdown'")
@@ -666,7 +719,8 @@ async def convert(
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
-    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce,
+                                     contract, figure_check, heading_fix)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -872,13 +926,17 @@ async def convert_stream(
     retry_temperature: Optional[str] = Form(None),   # per-request SHREW_TRY2_TEMP (400 if invalid)
     seed_policy: Optional[str] = Form(None),         # per-request SHREW_SEED_POLICY (400 if invalid)
     retry_enforce: Optional[str] = Form(None),       # per-request SHREW_TRY2_ENFORCE (400 if invalid)
+    contract: Optional[str] = Form(None),            # per-request SHREW_CONTRACT: v0.4 | v0.5 (400 if invalid)
+    figure_check: Optional[str] = Form(None),        # v0.5 only: SHREW_FIGURE_CHECK (default on)
+    heading_fix: Optional[str] = Form(None),         # v0.5 only: SHREW_HEADING_FIX (default on)
 ):
     skip_extraction = skip_extraction or skip_stage3  # skip_stage3: deprecated alias
     """Convert a document with SSE streaming progress."""
     if _config is None:
         raise HTTPException(status_code=503, detail="Server not ready")
     summary_mode, summary_max_chars = _validate_summary_params(summary_mode, summary_max_chars)
-    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce)
+    decode = _validate_decode_params(temperature, retry_temperature, seed_policy, retry_enforce,
+                                     contract, figure_check, heading_fix)
 
     vlm_url, vlm_model, api_key = _resolve_model(model)
 
@@ -1045,7 +1103,9 @@ def _build_response(result: PipelineResult, skip_stage3: bool) -> dict:
     # decode: the per-document decode recipe + rescued_by / attempts / model_calls
     # tallies; table_stitch and doc_summary are small scalar reports. fidelity is
     # left out: its "flagged" list grows with the document.
-    for key in ("modality", "gates", "failed_pages", "decode", "table_stitch", "doc_summary"):
+    # figure_check / heading_fix: v0.5 only (absent under v0.4, so v0.4 is unchanged).
+    for key in ("modality", "gates", "failed_pages", "decode", "table_stitch", "doc_summary",
+                "figure_check", "heading_fix", "latex_wrap", "pages", "text_pagination"):
         if key in result.processing_log:
             response["processing_log"][key] = result.processing_log[key]
 
