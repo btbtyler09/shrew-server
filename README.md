@@ -163,9 +163,10 @@ Checked on Alpine 3.21 (Python 3.12, system OpenCV 4.10.0 in place of the
 pinned 5.0 wheel): the test suite passes, office conversion works, and the
 page preprocessing — the model's input — is byte-identical to the release
 image on 24 of 24 test pages across buckets B1-B3. The server uses OpenCV
-only there (resize, CLAHE, blur, adaptive threshold, connected components);
-if you use a different OpenCV build, compare the prepared page images before
-trusting scores. The server writes only under the temp directory (`TMPDIR`):
+only there (resize, CLAHE, blur, adaptive threshold, connected components)
+and in the v0.5 near-blank check, which reuses the same adaptive threshold
+(its ink values matched to six decimals on Alpine); if you use a different
+OpenCV build, compare the prepared page images before trusting scores. The server writes only under the temp directory (`TMPDIR`):
 uploads, per-request work files, `shrew-concurrency/` and `shrew-telemetry/`.
 
 ### Docker
@@ -274,6 +275,7 @@ Configure in `docker/.env` or pass with `-e`:
 | `SHREW_V05_STREAM_USAGE` | v0.5: ask the model server for token usage on the stream (`0` = cut by characters only) | `1` |
 | `SHREW_V05_STRIP_DATA_URIS` | v0.5: replace embedded base64 `data:` payloads in text input with `[payload removed]` | `1` |
 | `SHREW_RAW_DUMP_DIR` | v0.5: append every raw model completion to `<dir>/<doc_id>.jsonl` (diagnostics; off when unset) | — |
+| `SHREW_BLANK_INK_MAX` | v0.5: ink bound (fraction of the page darker than its local background) under which a short retry on a near-blank page is accepted rather than failed as slop — see "Decode recipe" | `0.0048` |
 | `SHREW_TRY1_TEMP` | Sampling temperature of the structured first pass and its same-config re-roll (0 = greedy) — see below | `0.4` |
 | `SHREW_TRY1_PP` | Presence penalty of the first pass | `0.3` |
 | `SHREW_TRY2_TEMP` | Sampling temperature of the retry (0 = greedy) | `0.4` |
@@ -371,6 +373,11 @@ Each page records `rescued_by` — `none`, `reroll`, `retry_enforced`,
 "rescued by the retry tier" for historical reasons, enforced or not, and
 `attempts` keeps its historical value; `processing_log.decode` tallies
 `rescued_by`, `attempts` and `model_calls` per document.
+A retry that returns almost nothing after a long failed first pass is counted
+failed (`coerced_empty`) — the signature of a hallucinated rescue — unless,
+under `v0.5`, the page itself is near-blank: when the page's ink is below
+`SHREW_BLANK_INK_MAX` the short answer is accepted as `ok_coerced` and the page
+record carries `near_blank` (`{ink, max, content_chars}`).
 
 **Using OpenRouter** instead of a local VLM:
 ```bash

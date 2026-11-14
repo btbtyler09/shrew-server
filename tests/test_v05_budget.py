@@ -571,7 +571,7 @@ def test_embedded_media_cut_follows_the_bucket_not_the_image_cost():
     assert ct.v05_output_token_cut("image", "B2", 732) == ct.V05_OUTPUT_TOKEN_CUT["B2"]
     import inspect
     from app import structured_pipeline as pl
-    assert "extract_page(prepped, client, decode=decode, doc_id=doc_id, bucket=_bucket)" in inspect.getsource(pl)
+    assert "extract_page(prepped, client, decode=decode, doc_id=doc_id, bucket=_bucket," in inspect.getsource(pl)
 
 
 def test_split_pieces_are_checked_by_their_exact_count():

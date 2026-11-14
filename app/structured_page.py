@@ -1477,6 +1477,57 @@ def _content_chars(sj: dict) -> int:
 COERCED_MIN_CHARS = int(os.environ.get("SHREW_COERCED_MIN_CHARS", "300"))
 COERCED_MIN_RATIO = float(os.environ.get("SHREW_COERCED_MIN_RATIO", "0.02"))
 
+# Near-blank exemption from the coercion-density gate (v0.5 contract only).
+# On a blank page the first pass can hallucinate until the loop guard aborts
+# it; the retry then correctly returns almost nothing, and the ratio above
+# measures that against the hallucination — the gate failed real blank pages.
+# A short retry is believable when the page carries too little ink to hold
+# COERCED_MIN_CHARS of text. Measured with page_ink() on the native renders of
+# OHR-Bench (8,561 pages) and OmniDocBench (1,651 pages) against ground-truth
+# text: no page with >= 300 chars of real text is below 0.0048 (lowest 0.00484,
+# OHR; OmniDocBench lowest 0.0070), while visually blank pages — tinted, aged,
+# creased or hole-punched paper — reach 0.0044. The bound is that text floor.
+BLANK_INK_MAX = float(os.environ.get("SHREW_BLANK_INK_MAX", "0.0048"))
+if not 0.0 <= BLANK_INK_MAX < 1.0:   # also rejects nan, which would exempt every page
+    raise ValueError(f"SHREW_BLANK_INK_MAX must be a fraction in [0, 1), got "
+                     f"{os.environ.get('SHREW_BLANK_INK_MAX')!r}")
+
+
+def page_ink(img) -> float:
+    """Ink on a page image: the fraction of pixels darker than their local
+    background, with glyph_height's detector (adaptive Gaussian threshold,
+    31 px window, C=10, measured at <= 2600 px on the long side). Paper tint,
+    yellowing and gradual shading read as background; text, rules and drawings
+    read as ink. ``img`` is a PIL image or a path; measure the NATIVE render,
+    not the enhanced model image (contrast enhancement lifts paper grain)."""
+    import cv2 as _cv
+    import numpy as _np
+    from PIL import Image as _Image
+    if not isinstance(img, _Image.Image):
+        with _Image.open(img) as _im:
+            return page_ink(_im.convert("L"))
+    im = img.convert("L")
+    w, h = im.size
+    s = min(1.0, 2600 / max(w, h))
+    if s < 1.0:
+        im = im.resize((int(w * s), int(h * s)), _Image.BOX)
+    g = _cv.adaptiveThreshold(_np.asarray(im), 255, _cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              _cv.THRESH_BINARY_INV, 31, 10)
+    return float(_np.count_nonzero(g)) / g.size
+
+
+def _blank_page_ink(ink_source) -> float | None:
+    """page_ink of ``ink_source``, or None when there is none or it can't be read
+    (the gate then applies unchanged)."""
+    if ink_source is None:
+        return None
+    try:
+        return page_ink(ink_source)
+    except Exception as e:  # noqa: BLE001 — never fail a page on the measurement
+        logger.warning("near-blank check: cannot measure ink on %s (%s)", ink_source,
+                       type(e).__name__)
+        return None
+
 
 # Opt-in raw-completion dump: v0.5 only, off unless the caller
 # sets a directory. One JSON line per model call, appended to <dir>/<doc_id>.jsonl,
@@ -1529,13 +1580,14 @@ def _rung(trail, rung, t0, text, finish_reason, verdict, guard, max_tokens, temp
 def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
              min_content_chars: int = 0, page_no: int | None = None,
              decode: "DecodePolicy | None" = None, doc_id: str | None = None,
-             token_cap: int | None = None) -> dict:
+             token_cap: int | None = None, ink_source=None) -> dict:
     """The ladder below, plus ``trail``: one record per model call (rung,
     finish_reason, verdict, chars, abort position, seconds)."""
     trail: list = []
     res = _extract_ladder(messages, client, max_tokens=max_tokens, timeout=timeout,
                           min_content_chars=min_content_chars, page_no=page_no,
-                          decode=decode, doc_id=doc_id, trail=trail, token_cap=token_cap)
+                          decode=decode, doc_id=doc_id, trail=trail, token_cap=token_cap,
+                          ink_source=ink_source)
     res["trail"] = trail
     return res
 
@@ -1543,7 +1595,7 @@ def _extract(messages: list[dict], client, *, max_tokens: int, timeout=None,
 def _extract_ladder(messages: list[dict], client, *, max_tokens: int, timeout=None,
                     min_content_chars: int = 0, page_no: int | None = None,
                     decode: "DecodePolicy | None" = None, doc_id: str | None = None,
-                    trail: list, token_cap: int | None = None) -> dict:
+                    trail: list, token_cap: int | None = None, ink_source=None) -> dict:
     """Run the §3 first pass + at most one flagged enforcement retry.
 
     ``decode`` carries the temperature/seed knobs (env defaults when None);
@@ -1664,25 +1716,37 @@ def _extract_ladder(messages: list[dict], client, *, max_tokens: int, timeout=No
         # honest sparse pages (handwriting photos, diagram-only pages) fail
         # first-pass on FORM, not volume, and rescue to proportionate content.
         _cc = _content_chars(rparsed)
+        near_blank = None
         if (min_content_chars and _cc < min_content_chars
                 and _cc < COERCED_MIN_RATIO * len(text)):
-            return _result(False, None, "coerced_empty",
-                           f"coerced output carries {_cc} content chars "
-                           f"(< {min_content_chars} floor and < {COERCED_MIN_RATIO:.0%} "
-                           f"of the {len(text)}-char first-pass emission) "
-                           f"— hallucination-slop signature, counted failed",
-                           2, len(rtext), schema_coerced=True,
-                           degenerate=(first_verdict == "degenerate"),
-                           repetition_abort=aborted, loop_guard=stats,
-                           model_calls=attempt + 1)
+            # v0.5: a page too bare to hold min_content_chars of text honestly
+            # rescues to almost nothing (BLANK_INK_MAX). Measured only here.
+            ink = _blank_page_ink(ink_source) if decode.contract == V05 else None
+            if ink is None or ink >= BLANK_INK_MAX:
+                ink_note = ("" if ink is None else
+                            f"; page ink {ink:.4f} >= {BLANK_INK_MAX:g} near-blank bound")
+                return _result(False, None, "coerced_empty",
+                               f"coerced output carries {_cc} content chars "
+                               f"(< {min_content_chars} floor and < {COERCED_MIN_RATIO:.0%} "
+                               f"of the {len(text)}-char first-pass emission{ink_note}) "
+                               f"— hallucination-slop signature, counted failed",
+                               2, len(rtext), schema_coerced=True,
+                               degenerate=(first_verdict == "degenerate"),
+                               repetition_abort=aborted, loop_guard=stats,
+                               model_calls=attempt + 1)
+            near_blank = {"ink": round(ink, 6), "max": BLANK_INK_MAX,
+                          "content_chars": _cc}
         # Well-formed but outside the validated distribution — flag it so
         # downstream can filter or de-rank.
-        return _result(True, rparsed, "ok_coerced", None, 2, len(rtext),
-                       schema_coerced=True, degenerate=(first_verdict == "degenerate"),
-                       repetition_abort=aborted, loop_guard=stats,
-                       rescued_by=("retry_enforced" if decode.try2_enforce
-                                   else "retry_unenforced"),
-                       model_calls=attempt + 1)
+        res = _result(True, rparsed, "ok_coerced", None, 2, len(rtext),
+                      schema_coerced=True, degenerate=(first_verdict == "degenerate"),
+                      repetition_abort=aborted, loop_guard=stats,
+                      rescued_by=("retry_enforced" if decode.try2_enforce
+                                  else "retry_unenforced"),
+                      model_calls=attempt + 1)
+        if near_blank:
+            res["near_blank"] = near_blank
+        return res
 
     # Still failing → page-level failure record; the doc-level pipeline continues.
     status = {
@@ -1703,7 +1767,7 @@ def _extract_ladder(messages: list[dict], client, *, max_tokens: int, timeout=No
 def extract_page(image_path: str | Path, client, *, max_tokens: int | None = None,
                   timeout=None, page_no: int | None = None,
                   decode: "DecodePolicy | None" = None, doc_id: str | None = None,
-                  bucket: str | None = None) -> dict:
+                  bucket: str | None = None, ink_source=None) -> dict:
     """Run structured extraction on one page image (§2 image modality).
 
     ``image_path`` must already be ``preprocess.prepare_image_bucketed`` output
@@ -1711,8 +1775,13 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int | None = Non
     else (a raw render, the legacy fixed DPI downscale) changes the model's
     output distribution and voids the eval numbers.
 
+    ``ink_source`` (v0.5): the NATIVE page render (path or PIL image) the
+    near-blank exemption measures when the coercion-density gate would fail a
+    short retry (see BLANK_INK_MAX). None keeps the gate unconditional.
+
     Returns {"ok", "data", "status", "error", "attempts", "raw_len",
-             "schema_coerced", "degenerate", "repetition_abort", "loop_guard"}.
+             "schema_coerced", "degenerate", "repetition_abort", "loop_guard"}
+    (+ "near_blank" when the exemption accepted the page).
     """
     # The coercion-density floor applies to image pages only: a rendered page
     # that needed the enforcement retry AND produced almost no content is the
@@ -1742,7 +1811,7 @@ def extract_page(image_path: str | Path, client, *, max_tokens: int | None = Non
     return _extract(build_image_messages(image_path, decode.contract), client,
                     max_tokens=max_tokens, timeout=timeout,
                     min_content_chars=COERCED_MIN_CHARS, page_no=page_no, decode=decode,
-                    doc_id=doc_id, token_cap=token_cap)
+                    doc_id=doc_id, token_cap=token_cap, ink_source=ink_source)
 
 
 def extract_text_page(text: str, client, *, max_tokens: int | None = None,

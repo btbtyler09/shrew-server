@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.1 — 2026-11-14
+
+Fix: blank pages no longer fail under the v0.5 contract.
+
+- On a blank page the first pass could hallucinate until the loop guard
+  stopped it; the retry then correctly returned almost nothing, and the
+  coercion-density gate (< 300 content chars and < 2% of the first pass)
+  failed that correct answer as slop. Under `v0.5` the gate now measures the
+  page's ink on the page render — the fraction of pixels darker than their
+  local background, so paper tint, yellowing and shading do not count — and
+  accepts the short retry as `ok_coerced` when ink is below
+  `SHREW_BLANK_INK_MAX` (default `0.0048`). Pages with ink keep the gate.
+- The bound is measured, not chosen: across OHR-Bench (8,561 pages) and
+  OmniDocBench (1,651 pages), no page carrying 300 or more characters of real
+  text is below 0.0048, while blank tinted, aged and hole-punched pages reach
+  0.0044. Replaying a saved OHR-Bench run of the v0.5 model: 42 failed pages
+  become 39 (three blank pages); OmniDocBench results are unchanged.
+- New, additive: `processing_log.pages[].near_blank` (`{ink, max,
+  content_chars}`, `null` unless the exemption applied).
+- `v0.4` is unchanged. No new dependency (the measurement uses OpenCV and
+  NumPy, already required). No configuration change is needed; an
+  out-of-range `SHREW_BLANK_INK_MAX` stops the server at startup.
+
 ## v0.5.0 — 2026-11-14
 
 Server for the **shrew-ocr-preview v0.5** model. The server now speaks two

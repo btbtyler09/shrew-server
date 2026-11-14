@@ -123,6 +123,9 @@ def _page_result(page_no: int, res: dict, bucket: str | None = None) -> dict:
         # per-call trail. Internal under v0.4 (never serialized there).
         "error": res.get("error"),
         "trail": res.get("trail") or [],
+        # v0.5: set when a short retry was accepted because the page is
+        # near-blank ({ink, max, content_chars}); None otherwise.
+        "near_blank": res.get("near_blank"),
     }
 
 
@@ -219,7 +222,8 @@ def _process_one_page(page_no: int, hires_path, config, output_dir: str, client,
     try:
         result = _page_result(page_no, extract_page(model_png, client,
                                                     page_no=page_no, decode=decode,
-                                                    doc_id=doc_id, bucket=bucket), bucket)
+                                                    doc_id=doc_id, bucket=bucket,
+                                                    ink_source=hires_path), bucket)
         _note_transport(client, ok=True)
     except Exception as e:
         _note_transport(client, ok=False)
@@ -772,7 +776,7 @@ def attempt_counts(page_results: list[dict]) -> dict:
 
 _PAGE_FIELDS = ("page", "ok", "status", "bucket", "rescued_by", "model_calls",
                 "repetition_abort", "degenerate", "json_close", "schema_coerced",
-                "seconds", "error", "trail")
+                "seconds", "error", "trail", "near_blank")
 
 
 def page_telemetry(page_results: list[dict]) -> list[dict]:
@@ -899,7 +903,8 @@ def _extract_and_caption_media(file_path, output_dir, client, decode=None,
                 enh, _bucket = prepare_image_bucketed(img.convert("RGB"))
             prepped = m["path"] + ".prepped.png"
             enh.save(prepped)
-            res = extract_page(prepped, client, decode=decode, doc_id=doc_id, bucket=_bucket)
+            res = extract_page(prepped, client, decode=decode, doc_id=doc_id, bucket=_bucket,
+                               ink_source=m["path"])
             if res.get("ok") and res.get("data"):
                 sj = res["data"]
                 figs = [f for f in (sj.get("figures") or [])
