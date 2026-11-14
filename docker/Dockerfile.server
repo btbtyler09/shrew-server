@@ -1,4 +1,4 @@
-FROM python:3.12.15-slim-trixie
+FROM python:3.12.16-slim-trixie
 
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
@@ -11,7 +11,7 @@ COPY pyproject.toml README.md LICENSE ./
 COPY docker/requirements.lock ./
 COPY app/ app/
 
-RUN pip install --no-cache-dir pip==26.2.2 \
+RUN pip install --no-cache-dir pip==26.3 \
     && pip install --no-cache-dir -c requirements.lock .[server,figures]
 
 # Pre-download heron-101 layout model for figure detection
@@ -22,7 +22,7 @@ RUN python -c "from transformers import RTDetrV2ForObjectDetection, RTDetrImageP
 ENV HF_HUB_OFFLINE=1
 
 # Which source this image was built from:
-#   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg VERSION=0.5.1 ...
+#   docker build --build-arg GIT_SHA=$(git rev-parse HEAD) --build-arg VERSION=0.5.2 ...
 ARG GIT_SHA=unknown
 ARG VERSION=unknown
 LABEL org.opencontainers.image.title="shrew-server" \

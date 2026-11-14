@@ -152,6 +152,7 @@ dependency:
 apk add python3 py3-pip py3-opencv libstdc++ libgcc \
         libreoffice-writer libreoffice-calc libreoffice-impress ttf-liberation
 python3 -m venv --system-site-packages /venv
+/venv/bin/pip install pip==26.3          # the release image's pip (security fixes)
 /venv/bin/pip install -c docker/requirements.lock \
     requests Pillow "pypdfium2>=5.6,<6" beautifulsoup4 markdownify olefile openpyxl \
     numpy tokenizers fastapi "uvicorn[standard]" python-multipart sse-starlette

@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.5.2 — 2026-11-14
+
+Security update: dependency pins only. No code, API or output changes:
+the same documents send byte-identical requests to the model and return the
+same responses as 0.5.1 (checked on 8 PDFs, 54 pages, with a recording mock).
+
+**Python packages (image and `pip install`):**
+- `pip` (image tooling) 26.2.2 → **26.3**. pip's private copies of
+  `urllib3` (2.7.0 → 2.8.0; 2 high, 1 medium) and `msgpack` (1.1.2 → 1.2.4;
+  2 high) are fixed in this release. The installed `urllib3` was already 2.8.0.
+- `soupsieve` 2.10 → **4.0.1** (2 high, 1 medium; 4.0 is the first release
+  that fixes both highs). `beautifulsoup4` 4.15.0 supports it unchanged.
+- **Alpine / minimal installs:** upgrade pip in the venv too
+  (`pip install pip==26.3`, now in the README recipe) — distribution pip
+  packages carry the vulnerable copies (Alpine 3.21 ships pip 25.0.1).
+
+**Base image:** `python:3.12.15-slim-trixie` → `python:3.12.16-slim-trixie`,
+rebuilt so `apt-get upgrade` picks up Debian's fixes for `apt` / `libapt-pkg`
+(1 high) and `zlib1g` (2 high). Every remaining Debian finding has no fix
+published yet.
+
+**Known, not fixable by an upgrade yet:** pip 26.3 still vendors a copy of
+`pkg_resources` from `setuptools` 70.3.0, which scanners report as setuptools
+70.3.0 (1 high, 1 medium, 1 low). The high (CVE-2025-47273) is in
+setuptools' package-index module, which pip does not ship. The installed
+`setuptools` is 84.1.0. No pip release vendors a newer copy.
+
+| Image scan (trivy) | v0.5.1 | v0.5.2 |
+|---|---|---|
+| Python packages | 11 (7 high), all fixable | 3 pip-vendored setuptools (1 high), no fix released |
+| Debian packages | 674 (1 critical, 141 high), 27 fixable | 647 (1 critical, 137 high), 0 fixable |
+
 ## v0.5.1 — 2026-11-14
 
 Fix: blank pages no longer fail under the v0.5 contract.
