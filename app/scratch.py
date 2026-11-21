@@ -160,6 +160,9 @@ def status() -> dict:
     fst = fs_type(d)
     in_mem = fst in _IN_MEMORY_MOUNT_TYPES
     out.update(fs=fst, in_memory=in_mem, ok=in_mem or out["allow_disk"])
+    rd = raw_dump_status()
+    if rd:
+        out["raw_dump"] = rd
     try:
         sv = os.statvfs(d)
         out["total_bytes"] = sv.f_blocks * sv.f_frsize
@@ -169,9 +172,34 @@ def status() -> dict:
     return out
 
 
+def _nearest_existing(path: str) -> str:
+    p = os.path.abspath(path)
+    while not os.path.exists(p) and p != os.path.dirname(p):
+        p = os.path.dirname(p)
+    return p
+
+
+def raw_dump_status() -> dict | None:
+    """SHREW_RAW_DUMP_DIR (debug) appends raw model output — document
+    content — to files there. Same in-memory rule as the scratch dir."""
+    d = (os.environ.get("SHREW_RAW_DUMP_DIR") or "").strip()
+    if not d:
+        return None
+    fst = fs_type(_nearest_existing(d))
+    return {"dir": os.path.abspath(d), "fs": fst, "in_memory": fst in _IN_MEMORY_MOUNT_TYPES}
+
+
 def enforce() -> dict:
     """Refuse to start unless the scratch dir is in memory (or disk is explicitly allowed)."""
     configure()
+    rd = raw_dump_status()
+    if rd and not rd["in_memory"]:
+        msg = (f"SHREW_RAW_DUMP_DIR={rd['dir']} is on '{rd['fs']}', not tmpfs/ramfs; it receives "
+               f"raw model output (document content).")
+        if not allow_disk():
+            raise RuntimeError(f"shrew-server refuses to start: {msg} Unset it, point it at a "
+                               f"tmpfs, or set SHREW_ALLOW_DISK_SCRATCH=1.")
+        logger.warning(f"SHREW_ALLOW_DISK_SCRATCH=1: {msg}")
     st = status()
     if st.get("error"):
         raise RuntimeError(f"shrew-server refuses to start: {st['error']}")

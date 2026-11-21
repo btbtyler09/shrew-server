@@ -361,6 +361,8 @@ app = FastAPI(
     version="0.5.3",
     lifespan=lifespan,
 )
+from starlette.exceptions import HTTPException as _StarletteHTTPException  # noqa: E402
+app.add_exception_handler(_StarletteHTTPException, _body_parse_full_handler)
 
 
 @app.middleware("http")

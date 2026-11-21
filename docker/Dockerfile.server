@@ -4,7 +4,8 @@ RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
     libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
     fonts-liberation \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f   # warm at build: LibreOffice otherwise writes font caches to the rootfs at runtime
 
 WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./

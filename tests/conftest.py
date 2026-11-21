@@ -1,7 +1,15 @@
 """Pytest configuration: make `app/` importable as a top-level package
 without requiring an editable install."""
 
+import os
 import sys
+import tempfile
+
+# app.server redirects tempfile into the RAM-only scratch dir at import
+# (app/scratch.py). Keep pytest's own tmp_path tree in the system temp dir:
+# scratch is often mounted noexec (Docker's /dev/shm is), and several tests
+# exec fake binaries from tmp_path.
+os.environ.setdefault("PYTEST_DEBUG_TEMPROOT", tempfile.gettempdir())
 
 import pytest
 from pathlib import Path
