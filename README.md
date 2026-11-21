@@ -518,8 +518,11 @@ used only while documents are in flight. A document that does not fit gets a 507
 of a disk fallback.
 
 The real cost of a large file is its page count. Every page is one or more model calls, so
-conversion time scales with pages, not megabytes. Budget a 1,000-page upload in model time
-before raising `MAX_UPLOAD_MB`. Any proxy or gateway in front of shrew-server also needs
+conversion time scales with pages, not megabytes. For scale: about 600 pages/hour on a single
+16 GB consumer GPU (AMD Radeon RX 9070, v0.5 BF16 weights, `VLM_CONCURRENCY=4`, a mixed
+real-world document batch). That figure is approximate, and your documents and hardware will
+differ. At that rate a 1,000-page upload takes well over an hour in one request, so check
+every client and proxy timeout along the way before raising `MAX_UPLOAD_MB`. Any proxy or gateway in front of shrew-server also needs
 its own body-size limit and read timeouts raised to match.
 
 ## API
