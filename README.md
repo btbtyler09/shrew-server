@@ -230,7 +230,9 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.vulkan.yml 
 ```bash
 # Build and run server only
 docker build -f docker/Dockerfile.server -t shrew-server .
-docker run -p 8080:8080 \
+docker run -p 8080:8080 --read-only \
+  --tmpfs /scratch:size=4g,mode=1777 --tmpfs /tmp:size=64m \
+  -e SHREW_SCRATCH_DIR=/scratch/shrew \
   -e VLM_URL=http://host.docker.internal:8000 \
   -e VLM_MODEL=shrew-ocr-preview \
   shrew-server
@@ -392,6 +394,9 @@ VLM_API_KEY=sk-or-...
 Parameters you can adjust in the Dockerfiles for your hardware:
 
 **Server container** (`Dockerfile.server`):
+- `SHREW_SCRATCH_DIR` — RAM-only scratch dir for uploaded documents and everything derived from them. Default `/dev/shm/shrew`. Must be tmpfs/ramfs or the server refuses to start (see [Data handling](#data-handling)).
+- `SHREW_ALLOW_DISK_SCRATCH` — `1` lets the server start with a scratch dir (or `SHREW_RAW_DUMP_DIR`) that is not in memory. Default off.
+- `MAX_UPLOAD_MB` — Largest accepted upload, default `100`. Size the scratch tmpfs to match ([Sizing scratch RAM](#sizing-scratch-ram)).
 - `VLM_CONCURRENCY` — Max in-flight VLM calls **across all uvicorn workers combined**. The model server has a fixed number of serving slots, so this is a machine-wide gate (crash-safe flock slot files under `SHREW_CONCURRENCY_DIR`) — `SHREW_WORKERS` does **not** multiply it. Size it to your VLM server's slot count. Default `4`. (Before v0.3.8 the gate was accidentally per-worker: real load was `SHREW_WORKERS ×` the configured value.)
 - `PIPELINE_CONCURRENCY` — How many documents process simultaneously **per uvicorn worker**; effective capacity is `SHREW_WORKERS × PIPELINE_CONCURRENCY`. One gate covers both `/v1/convert` and `/v1/convert/stream` (they never had separate capacity from v0.3.7 on). Default `3`. `/health`'s `concurrency` section reports both the per-worker and effective limits plus live running/queued conversion counts.
 - `VLM_TIMEOUT_MARGIN` — Multiplier for the adaptive timeout. Shrew tracks per-page VLM response times and flags pages that exceed `max_observed * margin` as outliers for retry. Default `1.5` (50% above max). Increase if your VLM has high latency variance under load.
@@ -408,6 +413,101 @@ Parameters you can adjust in the Dockerfiles for your hardware:
 | `--parallel 1 --ctx-size 25000` (minimal) | ~4 GB |
 | `--parallel 4 --ctx-size 100000` (default) | ~7 GB |
 | `--parallel 8 --ctx-size 200000` (high throughput) | ~12 GB |
+
+## Data handling
+
+Uploaded documents can be sensitive. Since v0.5.3, shrew-server keeps a document's bytes,
+and everything derived from them, in memory only:
+
+- **One scratch dir for everything.** The upload, the multipart upload buffer, rendered page
+  images, LibreOffice output and its per-call profile, figure crops and the per-request
+  output dir all live under `SHREW_SCRATCH_DIR` (default `/dev/shm/shrew`). At startup the
+  server points Python's `tempfile` module and `TMPDIR`/`TMP`/`TEMP` at it, so third-party
+  libraries and child processes (LibreOffice, PDF tools) write there too. LibreOffice also
+  gets `HOME`/`XDG_*` set to its per-call profile, so it keeps no user state on disk.
+- **It must be in RAM.** At startup the server checks with `statfs` that the scratch dir is
+  tmpfs or ramfs and **refuses to start** otherwise. `SHREW_ALLOW_DISK_SCRATCH=1` overrides
+  this. Only set it where disk scratch is acceptable. The same rule applies to the debug
+  `SHREW_RAW_DUMP_DIR`, which receives raw model output.
+- **Reported in `/health`.** The `scratch` object gives `dir`, `fs`, `in_memory`,
+  `allow_disk`, `total_bytes` and `free_bytes`.
+- **Full scratch fails that request with 507.** It never falls back to disk. On
+  `/v1/convert` the body has `"reason": "scratch_full"`; on `/v1/convert/stream` the error
+  event starts with `scratch_full:`. Other requests continue.
+- **Cleanup.** Each request's files are deleted when it finishes, fails or is cancelled.
+  Leftovers from a killed worker are swept at the next start, and a tmpfs is empty after a
+  restart anyway.
+- **What still touches disk** (no document content): run telemetry and VLM-slot lease files
+  (in the system temp dir, see [Run diagnostics](#run-diagnostics-telemetry)), the
+  `page_metrics.json` counters next to the code, and font/package caches. The supplied
+  compose file runs the container with a **read-only root filesystem**, so even these fail
+  harmlessly. A write that bypassed the scratch dir would fail loudly instead of landing on
+  disk.
+- **Swap.** tmpfs pages can be swapped out. Run the container with swap disabled
+  (`memswap_limit` equal to `mem_limit`, or `--memory-swap` equal to `--memory`), or on a
+  host without swap.
+- **Logs.** Telemetry records no document content and never the upload's file name (the
+  on-disk name is random). Error messages from parsers or LibreOffice can quote fragments
+  of a malformed document; treat container logs accordingly.
+
+### Docker: give the scratch dir a tmpfs
+
+Docker's default `/dev/shm` is only 64 MB, too small for large uploads. The compose file
+mounts a dedicated tmpfs:
+
+```yaml
+    read_only: true
+    environment:
+      - SHREW_SCRATCH_DIR=/scratch/shrew
+    tmpfs:
+      - /scratch:size=${SHREW_SCRATCH_SIZE:-4g},mode=1777
+      - /tmp:size=64m,mode=1777
+```
+
+With plain `docker run`: `--read-only --tmpfs /scratch:size=4g,mode=1777 --tmpfs /tmp:size=64m -e SHREW_SCRATCH_DIR=/scratch/shrew`.
+
+### Sizing scratch RAM
+
+Scratch grows with the document's **pages**, not just its bytes. Rendered page images are kept
+until the request finishes. Peak scratch use measured with v0.5.3 at one pipeline slot (the
+upload and its buffer copy are included):
+
+| Input | Example | Peak scratch | Per input MB | Per page |
+|---|---|---|---|---|
+| Scanned PDF (~2 MB/page JPEG scans) | 89 MB, 43 pages | 872 MB | 9.8× | 20.3 MB |
+| Scanned PDF | 449 MB, 216 pages | 4,379 MB | 9.8× | 20.3 MB |
+| DOCX (image-heavy) | 80 MB, 60 pages | 748 MB | 9.4× | 12.5 MB |
+| Born-digital PDF (text) | 19.5 MB, 803 pages | 1,018 MB | 52× | 1.3 MB |
+| XLSX | 15 MB | 30 MB | 2.0× | not rendered |
+
+Scaling is linear: the 449 MB scan used 5.0× the scratch of the 89 MB one for 5.0× the pages.
+
+```
+scratch ≈ PIPELINE_CONCURRENCY × SHREW_WORKERS × peak_per_doc
+        + waiting_uploads × 2 × MAX_UPLOAD_MB
+peak_per_doc ≈ k × MAX_UPLOAD_MB      k = 9.8 scanned PDF, 9.4 DOCX, 2.0 XLSX
+             ≈ 1.3 MB × pages         born-digital PDF (bytes say little about its pages)
+```
+
+Requests waiting for a pipeline slot already hold their upload (about 2× its size). The
+examples below allow one waiting upload per slot. Worked examples for scanned PDFs,
+`SHREW_WORKERS=1`:
+
+| MAX_UPLOAD_MB | PIPELINE_CONCURRENCY=3 | PIPELINE_CONCURRENCY=1 |
+|---|---|---|
+| 100 (default) | 3 × 980 + 3 × 200 = 3.5 GB → `4g` | 980 + 200 = 1.2 GB |
+| 500 | 3 × 4,900 + 3 × 1,000 = 17.7 GB | 4,900 + 1,000 = 5.9 GB |
+| 1024 | 3 × 10,035 + 3 × 2,048 = 36.2 GB | 10,035 + 2,048 = 12.1 GB |
+
+Add the server process itself on top. Container memory peaked at about 8.5 GB at one pipeline
+slot, scratch and page cache included. A tmpfs `size=` is a cap, not a reservation: RAM is
+used only while documents are in flight. A document that does not fit gets a 507 instead
+of a disk fallback.
+
+The real cost of a large file is its page count. Every page is one or more model calls, so
+conversion time scales with pages, not megabytes. Budget a 1,000-page upload in model time
+before raising `MAX_UPLOAD_MB`. Any proxy or gateway in front of shrew-server also needs
+its own body-size limit and read timeouts raised to match.
 
 ## API
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.3 — unreleased
+
+Uploaded documents stay in memory only (README "Data handling").
+
+- All temp files (the upload, the multipart buffer, rendered pages, LibreOffice output and
+  profile, crops, output dir) go to `SHREW_SCRATCH_DIR` (default `/dev/shm/shrew`).
+  `tempfile` and `TMPDIR` are redirected process-wide, so libraries and child processes
+  follow.
+- The server refuses to start unless the scratch dir is tmpfs/ramfs.
+  `SHREW_ALLOW_DISK_SCRATCH=1` overrides this. The same rule covers `SHREW_RAW_DUMP_DIR`.
+  `/health` reports a `scratch` object.
+- A full scratch dir fails that request with HTTP 507 (`reason: scratch_full`), never a disk
+  fallback.
+- LibreOffice runs with `HOME`/`XDG_*` in its per-call profile. Font caches are warmed at
+  image build.
+- Compose: read-only root filesystem, tmpfs `/scratch` (sized from measured peaks) and `/tmp`.
+- Run telemetry and VLM-slot leases stay in the system temp dir (no document content).
+
 ## v0.5.2 — 2026-11-14
 
 Security update: dependency pins only. No code, API or output changes:
