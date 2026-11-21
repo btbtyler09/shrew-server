@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5.3 — unreleased
+## v0.5.3 — 2026-11-21
 
 Uploaded documents stay in memory only (README "Data handling").
 
