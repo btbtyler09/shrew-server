@@ -23,6 +23,8 @@ from pathlib import Path
 import pypdfium2
 from PIL import Image
 
+from . import scratch as _scratch
+
 logger = logging.getLogger("shrew.rasterizer")
 
 # PDFium (pypdfium2's C core) is not thread-safe, and its Python-side
@@ -197,9 +199,11 @@ def run_libreoffice(convert_to: str, src_path: str, outdir: str,
            "--convert-to", convert_to, "--outdir", outdir, src_path]
     try:
         try:
+            # HOME/XDG -> the per-call profile dir: LibreOffice otherwise
+            # writes dconf/config state under the real HOME on disk.
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True)
+                text=True, start_new_session=True, env=_scratch.child_env(home=profile))
         except FileNotFoundError:
             raise RuntimeError(
                 "LibreOffice is not installed. "

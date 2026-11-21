@@ -26,6 +26,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from sse_starlette.sse import EventSourceResponse
 
 from . import concurrency as _leases
+from . import scratch as _scratch
+
+# Route EVERY temp file (our uploads/output dirs, Starlette's multipart spool,
+# third-party tempfile users, child processes via TMPDIR) into the RAM-only
+# scratch dir before anything can create one. lifespan() then refuses to start
+# if that dir is not tmpfs/ramfs (see app/scratch.py, README "Data handling").
+_scratch.configure()
 from . import telemetry as _tel
 from .cli import parse_page_range
 from .models import PipelineConfig, PipelineResult
@@ -154,6 +161,7 @@ async def lifespan(app: FastAPI):
         handler.setFormatter(logging.Formatter("%(name)s  %(message)s"))
         shrew_logger.addHandler(handler)
 
+    _scratch.enforce()          # refuse to start unless uploads stay in RAM
     start = time.time()
     _config = ServerConfig.from_env()
     # Fail fast on a malformed SHREW_TRY1_TEMP / SHREW_TRY2_TEMP / SHREW_SEED_POLICY /
@@ -339,10 +347,18 @@ async def lifespan(app: FastAPI):
 
 # ── App ──────────────────────────────────────────────────────────────────────
 
+async def _body_parse_full_handler(request: Request, exc: HTTPException):
+    from fastapi.exception_handlers import http_exception_handler
+    if exc.status_code == 400 and exc.__cause__ is not None and _scratch.is_full_error(exc.__cause__):
+        return JSONResponse(status_code=507,
+                            content={"detail": _scratch.FULL_DETAIL, "reason": "scratch_full"})
+    return await http_exception_handler(request, exc)
+
+
 app = FastAPI(
     title="Shrew",
     description="Document to markdown + structured JSON",
-    version="0.5.2",
+    version="0.5.3",
     lifespan=lifespan,
 )
 
@@ -439,6 +455,7 @@ def _concurrency_health() -> dict:
 @app.get("/health")
 async def health():
     concurrency = _concurrency_health()
+    scratch = _scratch.status()
     unavailable = []
     vlm = VLMClient(base_url=_config.vlm_url, model=_config.vlm_model, api_key=_config.api_key)
     if not vlm.is_ready():
@@ -458,12 +475,12 @@ async def health():
                 content={"status": "degraded", "unavailable": unavailable,
                          "detail": (f"model backend unreachable: {transport.get('consecutive')} "
                                     "consecutive transport errors and the socket probe failed"),
-                         "transport_errors": transport, "concurrency": concurrency},
+                         "transport_errors": transport, "concurrency": concurrency, "scratch": scratch},
             )
         return JSONResponse(
             status_code=503,
             content={"status": "unhealthy", "unavailable": unavailable,
-                     "transport_errors": transport, "concurrency": concurrency},
+                     "transport_errors": transport, "concurrency": concurrency, "scratch": scratch},
         )
 
     # §5.3 empty-200 watch: consecutive blank completions returned with HTTP
@@ -475,7 +492,7 @@ async def health():
             status_code=503,
             content={"status": "degraded", "empty_200_streak": streak,
                      "detail": "consecutive empty completions — restart the model server",
-                     "concurrency": concurrency},
+                     "concurrency": concurrency, "scratch": scratch},
         )
 
     # Serving-contract config. `capacity.ok` false means the served
@@ -507,6 +524,7 @@ async def health():
         "vlm_readiness": vlm.readiness_snapshot(),
         "transport_errors": transport,
         "concurrency": concurrency,
+        "scratch": scratch,
     }
     if v05_default:
         body["contract"] = V05        # v0.4 keeps the v0.4.1 body exactly
@@ -605,7 +623,12 @@ def _save_upload(upload: UploadFile) -> str:
             detail=f"Unsupported file type: {suffix}",
         )
     # shrew_up_ prefix makes stale uploads sweepable at startup (issue #11).
-    fd, path = tempfile.mkstemp(prefix="shrew_up_", suffix=suffix)
+    try:
+        fd, path = tempfile.mkstemp(prefix="shrew_up_", suffix=suffix)
+    except OSError as e:
+        if _scratch.is_full_error(e):
+            raise HTTPException(status_code=507, detail=_scratch.FULL_DETAIL) from e
+        raise
     total = 0
     try:
         while True:
@@ -620,9 +643,11 @@ def _save_upload(upload: UploadFile) -> str:
                             f"set MAX_UPLOAD_MB to raise)"),
                 )
             os.write(fd, chunk)
-    except Exception:
+    except Exception as e:
         os.close(fd)
         os.unlink(path)
+        if not isinstance(e, HTTPException) and _scratch.is_full_error(e):
+            raise HTTPException(status_code=507, detail=_scratch.FULL_DETAIL) from e
         raise
     else:
         os.close(fd)
@@ -752,8 +777,10 @@ async def convert(
     tmp_path = _save_upload(file)
     try:
         output_dir = tempfile.mkdtemp(prefix="shrew_")
-    except Exception:
+    except Exception as e:
         os.unlink(tmp_path)
+        if _scratch.is_full_error(e):
+            raise HTTPException(status_code=507, detail=_scratch.FULL_DETAIL) from e
         raise
 
     skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
@@ -893,9 +920,15 @@ async def convert(
             content={"error": str(e), "reason": "model_backend_unavailable"},
         )
     except Exception as e:
-        logger.error(f"Pipeline error: {e}", exc_info=True)
         trace_status = "failed"
         trace.died(trace.current_phase, e)  # phase + category, never content
+        if _scratch.is_full_error(e):
+            logger.error("Scratch full mid-conversion; request failed with 507 (no disk fallback)")
+            return JSONResponse(
+                status_code=507,
+                content={"error": _scratch.FULL_DETAIL, "reason": "scratch_full"},
+            )
+        logger.error(f"Pipeline error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={"error": str(e)},
@@ -968,8 +1001,10 @@ async def convert_stream(
     tmp_path = _save_upload(file)
     try:
         output_dir = tempfile.mkdtemp(prefix="shrew_")
-    except Exception:
+    except Exception as e:
         os.unlink(tmp_path)
+        if _scratch.is_full_error(e):
+            raise HTTPException(status_code=507, detail=_scratch.FULL_DETAIL) from e
         raise
 
     skip_chunking = classify_file(tmp_path) in _SKIP_CHUNKING_CLASSES
@@ -1033,10 +1068,14 @@ async def convert_stream(
             trace_status = "failed"
             progress.emit_error(f"model_backend_unavailable: {e}")
         except Exception as e:
-            logger.error(f"Pipeline error: {e}", exc_info=True)
             trace_status = "failed"
             trace.died(trace.current_phase, e)  # phase + category, never content
-            progress.emit_error(str(e))
+            if _scratch.is_full_error(e):
+                logger.error("Scratch full mid-conversion; stream failed (no disk fallback)")
+                progress.emit_error(f"scratch_full: {_scratch.FULL_DETAIL}")
+            else:
+                logger.error(f"Pipeline error: {e}", exc_info=True)
+                progress.emit_error(str(e))
         finally:
             trace.close(trace_status)
             _pipeline_gate.release()

@@ -34,9 +34,11 @@ import errno
 import json
 import logging
 import os
-import tempfile
+import tempfile  # noqa: F401  (tests patch tempfile.gettempdir)
 import threading
 import time
+
+from . import scratch as _scratch
 
 logger = logging.getLogger("shrew.telemetry")
 
@@ -65,7 +67,7 @@ _OPEN_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC
 def _dir(override: str | None = None) -> str:
     return override or os.environ.get(
         "SHREW_TELEMETRY_DIR",
-        os.path.join(tempfile.gettempdir(), "shrew-telemetry"))
+        os.path.join(_scratch.system_tmp(), "shrew-telemetry"))
 
 
 def _category(exc: BaseException) -> str:

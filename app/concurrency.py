@@ -33,9 +33,11 @@ import fcntl
 import logging
 import os
 import stat
-import tempfile
+import tempfile  # noqa: F401  (tests patch tempfile.gettempdir)
 import time
 import uuid
+
+from . import scratch as _scratch
 
 logger = logging.getLogger("shrew.concurrency")
 
@@ -46,7 +48,7 @@ _OPEN_FLAGS = os.O_NOFOLLOW | os.O_CLOEXEC
 def _dir() -> str:
     return os.environ.get(
         "SHREW_CONCURRENCY_DIR",
-        os.path.join(tempfile.gettempdir(), "shrew-concurrency"))
+        os.path.join(_scratch.system_tmp(), "shrew-concurrency"))
 
 
 def ensure_dir() -> str:
