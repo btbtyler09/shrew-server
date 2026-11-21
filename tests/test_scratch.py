@@ -102,6 +102,15 @@ def test_is_full_error_walks_the_chain():
         assert scratch.is_full_error(outer)
     assert scratch.is_full_error(OSError(errno.EDQUOT, "quota"))
     assert not scratch.is_full_error(None)
+    # relayed from the rasterizer child / LibreOffice: errno lost, text kept
+    assert scratch.is_full_error(RuntimeError("rasterize failed: [Errno 28] No space left on device"))
+    assert not scratch.is_full_error(RuntimeError("bad xref table"))
+    assert not scratch.is_full_error(ValueError("x"))
+
+
+def test_full_body_is_uniform():
+    b = scratch.full_body()
+    assert b["reason"] == "scratch_full" and b["error"] == b["detail"]
 
 
 def test_child_env_points_tmp_and_home_at_scratch():
@@ -157,6 +166,10 @@ def test_upload_mkstemp_enospc_is_507(monkeypatch):
     with pytest.raises(HTTPException) as ei:
         server._save_upload(_Upload(b"x"))
     assert ei.value.status_code == 507
+    from starlette.requests import Request
+    req = Request({"type": "http", "method": "POST", "path": "/v1/convert", "headers": []})
+    r = asyncio.run(server._body_parse_full_handler(req, ei.value))
+    assert r.status_code == 507 and b'"reason":"scratch_full"' in r.body
 
 
 def test_body_parse_enospc_maps_to_507_other_400s_unchanged():

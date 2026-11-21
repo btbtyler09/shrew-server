@@ -25,6 +25,9 @@ services:
       # Uploaded documents and everything derived from them live ONLY here
       # (README "Data handling"); the server refuses to start if it is not tmpfs.
       - SHREW_SCRATCH_DIR=/scratch/shrew
+      # Run telemetry (content-free) on a volume: survives restarts and is not
+      # capped by the small /tmp tmpfs.
+      - SHREW_TELEMETRY_DIR=/var/lib/shrew/telemetry
     # Nothing is written to the container filesystem: a write that bypassed the
     # scratch dir would fail loudly instead of landing on disk.
     read_only: true
@@ -34,14 +37,19 @@ services:
       # Measured peak per document (v0.5.3): scanned PDF 9.8 x its size, DOCX
       # 9.4x, XLSX 2.0x, born-digital PDF ~1.3 MB per PAGE (see README).
       # Defaults (100 MB, 3 slots, 1 worker, 3 waiting): 3 x 980 + 3 x 200 =
-      # 3,540 MB -> 4g. A full scratch dir fails that request with 507, never
+      # 3,540 MB -> 4g (scanned PDF / DOCX at the cap; a page-heavy born-digital
+      # PDF needs ~1.3 MB per page). A full scratch dir fails that request with 507, never
       # falls back to disk. tmpfs is a cap, not a reservation: RAM is used only
       # while documents are in flight.
       - /scratch:size=${SHREW_SCRATCH_SIZE:-4g},mode=1777
       # Backstop for anything that ignores TMPDIR; measured peak use 0.1 MB.
       - /tmp:size=64m,mode=1777
+    volumes:
+      - shrew-telemetry:/var/lib/shrew
     # tmpfs pages can be swapped to disk. Disable swap for the container by
     # setting both limits to the same value (or run on a host without swap):
     # mem_limit: 16g
     # memswap_limit: 16g
 
+volumes:
+  shrew-telemetry:

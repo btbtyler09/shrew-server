@@ -217,7 +217,7 @@ class RunTrace:
         self._emit("sample",
                    rss_mb=_rss_mb(), open_fds=_open_fds(),
                    threads=threading.active_count(),
-                   disk_free_mb=_disk_free_mb(self._dir),
+                   disk_free_mb=_disk_free_mb(self._dir), scratch_free_mb=_disk_free_mb(_scratch.current_dir()),
                    pages_done=self._pages_done, total_pages=self.total_pages)
         self.publish_live()
 
@@ -226,7 +226,8 @@ class RunTrace:
         self._emit("died_at", phase=str(phase)[:40],
                    exc_type=type(exc).__name__[:40], category=_category(exc),
                    pages_done=self._pages_done, total_pages=self.total_pages,
-                   rss_mb=_rss_mb(), disk_free_mb=_disk_free_mb(self._dir))
+                   rss_mb=_rss_mb(), disk_free_mb=_disk_free_mb(self._dir),
+                   scratch_free_mb=_disk_free_mb(_scratch.current_dir()))
 
     def publish_live(self) -> None:
         """Write the compact in-flight state for /health to read cross-process.

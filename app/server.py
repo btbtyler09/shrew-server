@@ -30,7 +30,8 @@ from . import scratch as _scratch
 
 # Route EVERY temp file (our uploads/output dirs, Starlette's multipart spool,
 # third-party tempfile users, child processes via TMPDIR) into the RAM-only
-# scratch dir before anything can create one. lifespan() then refuses to start
+# scratch dir before any request can create one (`shrew serve` also calls
+# configure() before importing the pipeline). lifespan() then refuses to start
 # if that dir is not tmpfs/ramfs (see app/scratch.py, README "Data handling").
 _scratch.configure()
 from . import telemetry as _tel
@@ -349,9 +350,9 @@ async def lifespan(app: FastAPI):
 
 async def _body_parse_full_handler(request: Request, exc: HTTPException):
     from fastapi.exception_handlers import http_exception_handler
-    if exc.status_code == 400 and exc.__cause__ is not None and _scratch.is_full_error(exc.__cause__):
-        return JSONResponse(status_code=507,
-                            content={"detail": _scratch.FULL_DETAIL, "reason": "scratch_full"})
+    if exc.status_code == 507 or (exc.status_code == 400 and exc.__cause__ is not None
+                                  and _scratch.is_full_error(exc.__cause__)):
+        return JSONResponse(status_code=507, content=_scratch.full_body())
     return await http_exception_handler(request, exc)
 
 
@@ -926,10 +927,7 @@ async def convert(
         trace.died(trace.current_phase, e)  # phase + category, never content
         if _scratch.is_full_error(e):
             logger.error("Scratch full mid-conversion; request failed with 507 (no disk fallback)")
-            return JSONResponse(
-                status_code=507,
-                content={"error": _scratch.FULL_DETAIL, "reason": "scratch_full"},
-            )
+            return JSONResponse(status_code=507, content=_scratch.full_body())
         logger.error(f"Pipeline error: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,

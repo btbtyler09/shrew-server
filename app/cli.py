@@ -79,6 +79,8 @@ def _run_convert(args):
 
 def _run_serve(args):
     """Start the Shrew HTTP server."""
+    from . import scratch as _scratch
+    _scratch.configure()   # before any import can create a temp file (README "Data handling")
     try:
         import uvicorn
     except ImportError:

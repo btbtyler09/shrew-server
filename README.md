@@ -167,8 +167,9 @@ image on 24 of 24 test pages across buckets B1-B3. The server uses OpenCV
 only there (resize, CLAHE, blur, adaptive threshold, connected components)
 and in the v0.5 near-blank check, which reuses the same adaptive threshold
 (its ink values matched to six decimals on Alpine); if you use a different
-OpenCV build, compare the prepared page images before trusting scores. The server writes only under the temp directory (`TMPDIR`):
-uploads, per-request work files, `shrew-concurrency/` and `shrew-telemetry/`.
+OpenCV build, compare the prepared page images before trusting scores. Document bytes (uploads, per-request work files) go only to the RAM-only
+`SHREW_SCRATCH_DIR`; `shrew-concurrency/` and `shrew-telemetry/` (no document content) go to
+the system temp dir or `SHREW_TELEMETRY_DIR`. See [Data handling](#data-handling).
 
 ### Docker
 
@@ -431,18 +432,25 @@ and everything derived from them, in memory only:
   `SHREW_RAW_DUMP_DIR`, which receives raw model output.
 - **Reported in `/health`.** The `scratch` object gives `dir`, `fs`, `in_memory`,
   `allow_disk`, `total_bytes` and `free_bytes`.
-- **Full scratch fails that request with 507.** It never falls back to disk. On
-  `/v1/convert` the body has `"reason": "scratch_full"`; on `/v1/convert/stream` the error
-  event starts with `scratch_full:`. Other requests continue.
+- **Full scratch fails that request with 507.** It never falls back to disk. The body is
+  `{"error": ..., "detail": ..., "reason": "scratch_full"}`. On `/v1/convert/stream` that
+  JSON 507 is returned when the upload itself doesn't fit. If scratch fills mid-conversion,
+  the stream's error event starts with `scratch_full:`. Other requests continue.
+  `MAX_UPLOAD_MB` is checked against `Content-Length`. A chunked upload without one is
+  counted as it is saved, so it can fill scratch (and 507 concurrent requests) until the
+  count trips. Put a proxy with a body limit in front if clients may send chunked uploads.
 - **Cleanup.** Each request's files are deleted when it finishes, fails or is cancelled.
-  Leftovers from a killed worker are swept at the next start, and a tmpfs is empty after a
-  restart anyway.
-- **What still touches disk** (no document content): run telemetry and VLM-slot lease files
-  (in the system temp dir, see [Run diagnostics](#run-diagnostics-telemetry)), the
-  `page_metrics.json` counters next to the code, and font/package caches. The supplied
-  compose file runs the container with a **read-only root filesystem**, so even these fail
-  harmlessly. A write that bypassed the scratch dir would fail loudly instead of landing on
+  A container restart empties the tmpfs. Files left by a killed worker inside a running
+  container are swept at startup once older than `SHREW_TMP_MAX_AGE_H` (default 24 h).
+- **What still touches disk** (no document content): run telemetry (see
+  [Run diagnostics](#run-diagnostics-telemetry); the compose file keeps it on a small
+  volume) and VLM-slot lease files in the system temp dir. Also the `page_metrics.json`
+  counters next to the code, and font/package caches. The supplied compose file runs the
+  container with a **read-only root filesystem**: the counters and caches then fail
+  harmlessly, and a write that bypassed the scratch dir fails loudly instead of landing on
   disk.
+- **Scope.** This applies to the HTTP server (`shrew serve`). The local `shrew convert` CLI
+  uses your normal temp dir.
 - **Swap.** tmpfs pages can be swapped out. Run the container with swap disabled
   (`memswap_limit` equal to `mem_limit`, or `--memory-swap` equal to `--memory`), or on a
   host without swap.
@@ -459,9 +467,12 @@ mounts a dedicated tmpfs:
     read_only: true
     environment:
       - SHREW_SCRATCH_DIR=/scratch/shrew
+      - SHREW_TELEMETRY_DIR=/var/lib/shrew/telemetry
     tmpfs:
       - /scratch:size=${SHREW_SCRATCH_SIZE:-4g},mode=1777
       - /tmp:size=64m,mode=1777
+    volumes:
+      - shrew-telemetry:/var/lib/shrew   # content-free run traces
 ```
 
 With plain `docker run`: `--read-only --tmpfs /scratch:size=4g,mode=1777 --tmpfs /tmp:size=64m -e SHREW_SCRATCH_DIR=/scratch/shrew`.
@@ -499,7 +510,9 @@ examples below allow one waiting upload per slot. Worked examples for scanned PD
 | 500 | 3 × 4,900 + 3 × 1,000 = 17.7 GB | 4,900 + 1,000 = 5.9 GB |
 | 1024 | 3 × 10,035 + 3 × 2,048 = 36.2 GB | 10,035 + 2,048 = 12.1 GB |
 
-Add the server process itself on top. Container memory peaked at about 8.5 GB at one pipeline
+Born-digital PDFs are sized by pages (1.3 MB each): a 100 MB, 4,000-page PDF needs about
+5.2 GB on its own, so raise `SHREW_SCRATCH_SIZE` if you expect those. Add the server process
+itself on top. Container memory peaked at about 8.5 GB at one pipeline
 slot, scratch and page cache included. A tmpfs `size=` is a cap, not a reservation: RAM is
 used only while documents are in flight. A document that does not fit gets a 507 instead
 of a disk fallback.

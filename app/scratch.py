@@ -43,9 +43,9 @@ _RAMFS_MAGIC = 0x858458F6
 _IN_MEMORY_MAGICS = {_TMPFS_MAGIC: "tmpfs", _RAMFS_MAGIC: "ramfs"}
 _IN_MEMORY_MOUNT_TYPES = {"tmpfs", "ramfs"}
 
-# Free space below this is treated as "full" when classifying a failure whose
-# exception chain lost the ENOSPC errno (e.g. a child process that died writing).
-_FULL_FREE_BYTES = 1 << 20
+# Failures that crossed a process boundary (the rasterizer child, LibreOffice)
+# arrive as message text, not an OSError; match the libc strings for ENOSPC/EDQUOT.
+_FULL_TEXT = ("[Errno 28]", "No space left on device", "[Errno 122]", "Disk quota exceeded")
 
 _configured_dir: str | None = None
 # The system temp dir as it was before configure() redirected tempfile.
@@ -59,6 +59,10 @@ def scratch_dir() -> str:
     return (os.environ.get("SHREW_SCRATCH_DIR") or "").strip() or DEFAULT_SCRATCH_DIR
 
 
+def current_dir() -> str:
+    return _configured_dir or os.path.abspath(scratch_dir())
+
+
 def system_tmp() -> str:
     return _SYSTEM_TMP
 
@@ -68,8 +72,9 @@ def child_env(home: str | None = None) -> dict:
     to the scratch dir; with ``home``, HOME/XDG dirs point there too so the
     child keeps no per-user state on disk."""
     env = dict(os.environ)
-    d = _configured_dir or os.path.abspath(scratch_dir())
-    env.update(TMPDIR=d, TMP=d, TEMP=d)
+    if _configured_dir:          # server process; the plain CLI keeps the caller's TMPDIR
+        d = _configured_dir
+        env.update(TMPDIR=d, TMP=d, TEMP=d)
     if home:
         env.update(HOME=home, XDG_CONFIG_HOME=home, XDG_CACHE_HOME=home, XDG_DATA_HOME=home)
     return env
@@ -218,22 +223,25 @@ def enforce() -> dict:
 
 
 def is_full_error(exc: BaseException | None) -> bool:
-    """True if ``exc`` (or anything in its cause/context chain) is a full-disk
-    error, or the scratch dir is effectively full right now."""
+    """True if ``exc`` or anything in its cause/context chain is a full-disk
+    error: an OSError with ENOSPC/EDQUOT, or a message carrying that error's
+    text (failures relayed from a child process lose the errno)."""
     seen = set()
     e = exc
     while e is not None and id(e) not in seen:
         seen.add(id(e))
         if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
             return True
+        msg = str(e)
+        if any(t in msg for t in _FULL_TEXT):
+            return True
         e = e.__cause__ or e.__context__
-    if exc is None:
-        return False
-    try:
-        sv = os.statvfs(_configured_dir or scratch_dir())
-        return sv.f_bavail * sv.f_frsize < _FULL_FREE_BYTES
-    except OSError:
-        return False
+    return False
+
+
+def full_body() -> dict:
+    """The one 507 body every scratch-full path returns."""
+    return {"error": FULL_DETAIL, "detail": FULL_DETAIL, "reason": "scratch_full"}
 
 
 FULL_DETAIL = ("scratch space full: uploaded documents are held in memory only and the "
